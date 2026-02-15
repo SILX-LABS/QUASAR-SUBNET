@@ -98,6 +98,7 @@ class SpeedSubmission(Base):
     benchmarks = Column(String, nullable=True)  # JSON string of benchmarks
     signature = Column(String)
     validated = Column(Boolean, default=False)  # Track if submission has been validated
+    score = Column(Float, nullable=True)  # Validation score (0.0 to 1.0, normalized)
     created_at = Column(DateTime, default=datetime.utcnow)
     
     # New fields for round-based competition

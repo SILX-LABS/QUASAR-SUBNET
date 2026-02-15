@@ -149,111 +149,121 @@ def calculate_solution_hash(tokens_per_sec: float, target_sequence_length: int,
 # Add new columns if they don't exist (migration)
 from sqlalchemy import text
 try:
-    with engine.connect() as conn:
-        # Check database type
-        is_postgresql = "postgresql" in str(engine.url)
+    # Check database type
+    is_postgresql = "postgresql" in str(engine.url)
     
-    if is_postgresql:
-        # PostgreSQL: use information_schema
-        # Check speed_submissions columns
-        result = conn.execute(text("""
-            SELECT column_name FROM information_schema.columns
-            WHERE table_name = 'speed_submissions'
-        """))
-        columns = [row[0] for row in result]
-        
-        # Add missing columns
-        if "vram_mb" not in columns:
-            conn.execute(text("ALTER TABLE speed_submissions ADD COLUMN vram_mb REAL"))
-            conn.commit()
-        if "benchmarks" not in columns:
-            conn.execute(text("ALTER TABLE speed_submissions ADD COLUMN benchmarks TEXT"))
-            conn.commit()
-        if "validated" not in columns:
-            conn.execute(text("ALTER TABLE speed_submissions ADD COLUMN validated BOOLEAN DEFAULT FALSE"))
-            conn.commit()
-        if "round_id" not in columns:
-            conn.execute(text("ALTER TABLE speed_submissions ADD COLUMN round_id INTEGER"))
-            conn.commit()
-        if "ip_address" not in columns:
-            conn.execute(text("ALTER TABLE speed_submissions ADD COLUMN ip_address VARCHAR"))
-            conn.commit()
-        if "is_baseline" not in columns:
-            conn.execute(text("ALTER TABLE speed_submissions ADD COLUMN is_baseline BOOLEAN DEFAULT FALSE"))
-            conn.commit()
-        if "solution_hash" not in columns:
-            conn.execute(text("ALTER TABLE speed_submissions ADD COLUMN solution_hash VARCHAR"))
-            conn.commit()
-        
-        # ═══════════════════════════════════════════════════════════════════════════
-        # CONTEXT BUILDER COLUMN (Phase 5: repo_hash for consistency tracking)
-        # ═══════════════════════════════════════════════════════════════════════════
-        if "repo_hash" not in columns:
-            conn.execute(text("ALTER TABLE speed_submissions ADD COLUMN repo_hash VARCHAR"))
-            conn.commit()
-            # Create index for repo_hash
-            conn.execute(text("CREATE INDEX IF NOT EXISTS ix_speed_submissions_repo_hash ON speed_submissions(repo_hash)"))
-            conn.commit()
-        
-        # ═══════════════════════════════════════════════════════════════════════════
-        # COMMIT-REVEAL COLUMNS (from const's qllm architecture)
-        # ═══════════════════════════════════════════════════════════════════════════
-        if "commitment_hash" not in columns:
-            conn.execute(text("ALTER TABLE speed_submissions ADD COLUMN commitment_hash VARCHAR"))
-            conn.commit()
-        if "commitment_salt" not in columns:
-            conn.execute(text("ALTER TABLE speed_submissions ADD COLUMN commitment_salt VARCHAR"))
-            conn.commit()
-        if "reveal_block" not in columns:
-            conn.execute(text("ALTER TABLE speed_submissions ADD COLUMN reveal_block INTEGER"))
-            conn.commit()
-        if "is_revealed" not in columns:
-            conn.execute(text("ALTER TABLE speed_submissions ADD COLUMN is_revealed BOOLEAN DEFAULT TRUE"))
-            conn.commit()
-        if "docker_image" not in columns:
-            conn.execute(text("ALTER TABLE speed_submissions ADD COLUMN docker_image VARCHAR"))
-            conn.commit()
-        
-        # ═══════════════════════════════════════════════════════════════════════════
-        # LOGIT VERIFICATION COLUMNS (from const's qllm architecture)
-        # ═══════════════════════════════════════════════════════════════════════════
-        if "logit_verification_passed" not in columns:
-            conn.execute(text("ALTER TABLE speed_submissions ADD COLUMN logit_verification_passed BOOLEAN"))
-            conn.commit()
-        if "cosine_similarity" not in columns:
-            conn.execute(text("ALTER TABLE speed_submissions ADD COLUMN cosine_similarity REAL"))
-            conn.commit()
-        if "max_abs_diff" not in columns:
-            conn.execute(text("ALTER TABLE speed_submissions ADD COLUMN max_abs_diff REAL"))
-            conn.commit()
-        if "verification_reason" not in columns:
-            conn.execute(text("ALTER TABLE speed_submissions ADD COLUMN verification_reason VARCHAR"))
-            conn.commit()
-        if "throughput_verified" not in columns:
-            conn.execute(text("ALTER TABLE speed_submissions ADD COLUMN throughput_verified REAL"))
-            conn.commit()
-        
-        # Check if competition_rounds table exists
-        result = conn.execute(text("""
-            SELECT EXISTS (
-                SELECT FROM information_schema.tables 
-                WHERE table_name = 'competition_rounds'
-            )
-        """))
-        if not result.scalar():
-            # Table doesn't exist, will be created by create_all
-            pass
-        
-        # Check if ip_bans table exists
-        result = conn.execute(text("""
-            SELECT EXISTS (
-                SELECT FROM information_schema.tables 
-                WHERE table_name = 'ip_bans'
-            )
-        """))
-        if not result.scalar():
-            # Table doesn't exist, will be created by create_all
-            pass
+    with engine.connect() as conn:
+        if is_postgresql:
+            # PostgreSQL: use information_schema
+            # Check speed_submissions columns
+            result = conn.execute(text("""
+                SELECT column_name FROM information_schema.columns
+                WHERE table_name = 'speed_submissions'
+            """))
+            columns = [row[0] for row in result]
+            
+            # Add missing columns
+            columns = [row[0] for row in result]
+            
+            # Add missing columns
+            if "vram_mb" not in columns:
+                conn.execute(text("ALTER TABLE speed_submissions ADD COLUMN vram_mb REAL"))
+                conn.commit()
+            if "benchmarks" not in columns:
+                conn.execute(text("ALTER TABLE speed_submissions ADD COLUMN benchmarks TEXT"))
+                conn.commit()
+            if "validated" not in columns:
+                conn.execute(text("ALTER TABLE speed_submissions ADD COLUMN validated BOOLEAN DEFAULT FALSE"))
+                conn.commit()
+            if "round_id" not in columns:
+                conn.execute(text("ALTER TABLE speed_submissions ADD COLUMN round_id INTEGER"))
+                conn.commit()
+            if "ip_address" not in columns:
+                conn.execute(text("ALTER TABLE speed_submissions ADD COLUMN ip_address VARCHAR"))
+                conn.commit()
+            if "is_baseline" not in columns:
+                conn.execute(text("ALTER TABLE speed_submissions ADD COLUMN is_baseline BOOLEAN DEFAULT FALSE"))
+                conn.commit()
+            if "solution_hash" not in columns:
+                conn.execute(text("ALTER TABLE speed_submissions ADD COLUMN solution_hash VARCHAR"))
+                conn.commit()
+            
+            # ═══════════════════════════════════════════════════════════════════════════
+            # CONTEXT BUILDER COLUMN (Phase 5: repo_hash for consistency tracking)
+            # ═══════════════════════════════════════════════════════════════════════════
+            if "repo_hash" not in columns:
+                conn.execute(text("ALTER TABLE speed_submissions ADD COLUMN repo_hash VARCHAR"))
+                conn.commit()
+                # Create index for repo_hash
+                conn.execute(text("CREATE INDEX IF NOT EXISTS ix_speed_submissions_repo_hash ON speed_submissions(repo_hash)"))
+                conn.commit()
+            
+            # ═══════════════════════════════════════════════════════════════════════════
+            # COMMIT-REVEAL COLUMNS (from const's qllm architecture)
+            # ═══════════════════════════════════════════════════════════════════════════
+            if "commitment_hash" not in columns:
+                conn.execute(text("ALTER TABLE speed_submissions ADD COLUMN commitment_hash VARCHAR"))
+                conn.commit()
+            if "commitment_salt" not in columns:
+                conn.execute(text("ALTER TABLE speed_submissions ADD COLUMN commitment_salt VARCHAR"))
+                conn.commit()
+            if "reveal_block" not in columns:
+                conn.execute(text("ALTER TABLE speed_submissions ADD COLUMN reveal_block INTEGER"))
+                conn.commit()
+            if "is_revealed" not in columns:
+                conn.execute(text("ALTER TABLE speed_submissions ADD COLUMN is_revealed BOOLEAN DEFAULT TRUE"))
+                conn.commit()
+            if "docker_image" not in columns:
+                conn.execute(text("ALTER TABLE speed_submissions ADD COLUMN docker_image VARCHAR"))
+                conn.commit()
+            
+            # ═══════════════════════════════════════════════════════════════════════════
+            # LOGIT VERIFICATION COLUMNS (from const's qllm architecture)
+            # ═══════════════════════════════════════════════════════════════════════════
+            if "logit_verification_passed" not in columns:
+                conn.execute(text("ALTER TABLE speed_submissions ADD COLUMN logit_verification_passed BOOLEAN"))
+                conn.commit()
+            if "cosine_similarity" not in columns:
+                conn.execute(text("ALTER TABLE speed_submissions ADD COLUMN cosine_similarity REAL"))
+                conn.commit()
+            if "max_abs_diff" not in columns:
+                conn.execute(text("ALTER TABLE speed_submissions ADD COLUMN max_abs_diff REAL"))
+                conn.commit()
+            if "verification_reason" not in columns:
+                conn.execute(text("ALTER TABLE speed_submissions ADD COLUMN verification_reason VARCHAR"))
+                conn.commit()
+            if "throughput_verified" not in columns:
+                conn.execute(text("ALTER TABLE speed_submissions ADD COLUMN throughput_verified REAL"))
+                conn.commit()
+            
+            # ═══════════════════════════════════════════════════════════════════════════
+            # SCORE COLUMN (for storing validation scores)
+            # ═══════════════════════════════════════════════════════════════════════════
+            if "score" not in columns:
+                conn.execute(text("ALTER TABLE speed_submissions ADD COLUMN score REAL"))
+                conn.commit()
+            
+            # Check if competition_rounds table exists
+            result = conn.execute(text("""
+                SELECT EXISTS (
+                    SELECT FROM information_schema.tables 
+                    WHERE table_name = 'competition_rounds'
+                )
+            """))
+            if not result.scalar():
+                # Table doesn't exist, will be created by create_all
+                pass
+            
+            # Check if ip_bans table exists
+            result = conn.execute(text("""
+                SELECT EXISTS (
+                    SELECT FROM information_schema.tables 
+                    WHERE table_name = 'ip_bans'
+                )
+            """))
+            if not result.scalar():
+                # Table doesn't exist, will be created by create_all
+                pass
     else:
         # SQLite: use PRAGMA
         result = conn.execute(text("PRAGMA table_info(speed_submissions)"))
@@ -328,6 +338,13 @@ try:
             conn.commit()
         if "throughput_verified" not in columns:
             conn.execute(text("ALTER TABLE speed_submissions ADD COLUMN throughput_verified REAL"))
+            conn.commit()
+        
+        # ═══════════════════════════════════════════════════════════════════════════
+        # SCORE COLUMN (for storing validation scores)
+        # ═══════════════════════════════════════════════════════════════════════════
+        if "score" not in columns:
+            conn.execute(text("ALTER TABLE speed_submissions ADD COLUMN score REAL"))
             conn.commit()
         
         # Commit any pending changes
@@ -1027,7 +1044,7 @@ def mark_validated(
     db: Session = Depends(get_db)
 ):
     """
-    Mark a submission as validated.
+    Mark a submission as validated and record its score.
     Used by validators to avoid re-evaluating the same submission.
     """
     submission_id = req.get("submission_id")
@@ -1039,13 +1056,20 @@ def mark_validated(
         raise HTTPException(status_code=404, detail="Submission not found")
 
     submission.validated = True
+    
+    # Update score if provided
+    score = req.get("score")
+    if score is not None:
+        submission.score = float(score)
+        print(f"📊 [MARK_VALIDATED] Submission {submission_id}: score={score:.4f}")
+    
     db.commit()
     
     # Record successful validation (reset failure count for IP)
     if submission.ip_address:
         record_success(submission.ip_address, db)
 
-    return {"status": "ok", "submission_id": submission_id}
+    return {"status": "ok", "submission_id": submission_id, "score": submission.score}
 
 @app.post("/record_failure")
 def record_failure_endpoint(

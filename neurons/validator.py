@@ -965,14 +965,21 @@ class Validator(BaseValidatorNeuron):
                     else:
                         evaluated_scores[miner_hotkey] = normalized_score
                     
-                    # Mark submission as validated in API (this will record success for IP)
+                    # Mark submission as validated in API and record score
                     if submission_id:
                         try:
-                            requests.post(
+                            response = requests.post(
                                 f"{VALIDATOR_API_URL}/mark_validated",
-                                json={"submission_id": submission_id},
+                                json={
+                                    "submission_id": submission_id,
+                                    "score": normalized_score  # Include the normalized score
+                                },
                                 timeout=30
                             )
+                            if response.status_code == 200:
+                                print(f"[VALIDATOR] ✅ Submission {submission_id} marked as validated with score {normalized_score:.4f}", flush=True)
+                            else:
+                                print(f"[VALIDATOR] ⚠️ Failed to mark submission as validated: {response.status_code} - {response.text}", flush=True)
                         except Exception as e:
                             print(f"[VALIDATOR] Failed to mark submission as validated: {e}", flush=True)
                 else:
@@ -992,15 +999,22 @@ class Validator(BaseValidatorNeuron):
                         except Exception as e:
                             print(f"[VALIDATOR] Failed to record failure: {e}", flush=True)
                     
-                    # Still mark as validated to avoid re-processing
+                    # Still mark as validated to avoid re-processing (with score 0.0)
                     submission_id = submission.get("id")
                     if submission_id:
                         try:
-                            requests.post(
+                            response = requests.post(
                                 f"{VALIDATOR_API_URL}/mark_validated",
-                                json={"submission_id": submission_id},
+                                json={
+                                    "submission_id": submission_id,
+                                    "score": 0.0  # Invalid submissions get score 0.0
+                                },
                                 timeout=30
                             )
+                            if response.status_code == 200:
+                                print(f"[VALIDATOR] ✅ Submission {submission_id} marked as validated with score 0.0", flush=True)
+                            else:
+                                print(f"[VALIDATOR] ⚠️ Failed to mark submission as validated: {response.status_code} - {response.text}", flush=True)
                         except Exception as e:
                             print(f"[VALIDATOR] Failed to mark submission as validated: {e}", flush=True)
 
