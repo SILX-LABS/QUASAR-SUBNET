@@ -1,0 +1,606 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Quasar</title>
+<link rel="icon" type="image/svg+xml" href="favicon.svg">
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Space+Mono:wght@400;700&display=swap');
+
+:root {
+    --bg: #000;
+    --paper: #fff;
+    --ink: #000;
+    --ink-inv: #fff;
+    --ink-muted: #999;
+    --border: 1px dashed #000;
+    --border-faint: 1px dotted rgba(0,0,0,0.15);
+    --font: 'Inter', system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+}
+
+[data-theme="dark"] {
+    --paper: #111;
+    --ink: #ddd;
+    --ink-inv: #111;
+    --ink-muted: #777;
+    --border: 1px dashed #ddd;
+    --border-faint: 1px dotted rgba(255,255,255,0.15);
+}
+
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+body {
+    background: var(--paper);
+    color: var(--ink);
+    font: 13px/1.5 var(--font);
+    display: flex;
+    justify-content: center;
+    min-height: 100vh;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    text-rendering: optimizeLegibility;
+}
+
+.page {
+    width: 100%;
+    max-width: 1400px;
+    background: var(--paper);
+    padding: 32px 48px;
+    display: flex;
+    flex-direction: column;
+    gap: 24px;
+}
+
+.section-label {
+    text-transform: uppercase;
+    font-weight: bold;
+    font-size: 11px;
+    border-bottom: var(--border);
+    padding-bottom: 4px;
+    margin-bottom: 8px;
+}
+
+.chart-wrap {
+    width: 100%;
+    aspect-ratio: 5 / 2;
+    position: relative;
+}
+.chart-wrap svg {
+    width: 100%;
+    height: 100%;
+    display: block;
+}
+.chart-meta {
+    display: flex;
+    justify-content: space-between;
+    font-size: 11px;
+    text-transform: uppercase;
+    margin-top: 4px;
+}
+
+.duel-bar-wrap {
+    border: 1px solid var(--ink);
+    height: 14px;
+    position: relative;
+    overflow: hidden;
+}
+.duel-bar {
+    height: 100%;
+    background: var(--ink);
+    transition: width .4s ease;
+}
+.duel-info {
+    font-size: 12px;
+    display: flex;
+    justify-content: space-between;
+    margin-top: 4px;
+}
+.duel-info span { min-width: 120px; }
+.duel-info span:last-child { text-align: right; }
+.duel-idle .duel-bar-wrap { opacity: 0.3; }
+
+.scroll-box {
+    overflow-y: auto;
+    scrollbar-width: thin;
+}
+.scroll-box::-webkit-scrollbar { width: 4px; }
+.scroll-box::-webkit-scrollbar-thumb { background: var(--ink); }
+.scroll-queue { max-height: 200px; }
+.scroll-hist { max-height: 60vh; }
+
+table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 12px;
+    table-layout: fixed;
+}
+th {
+    text-transform: uppercase;
+    font-weight: 600;
+    font-size: 11px;
+    letter-spacing: 0.04em;
+    text-align: left;
+    padding: 4px 0;
+    border-bottom: var(--border);
+    background: var(--paper);
+    position: sticky;
+    top: 0;
+    z-index: 1;
+}
+td {
+    padding: 3px 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+tr { border-bottom: var(--border-faint); }
+tr:hover td {
+    background: var(--ink);
+    color: var(--ink-inv);
+    cursor: crosshair;
+}
+tr:hover td a { color: var(--ink-inv) !important; }
+th:last-child, td:last-child { text-align: right; }
+
+[data-theme="dark"] .logo-img { filter: invert(1); }
+
+#theme-toggle, #chart-mode-toggle {
+    background: none;
+    border: var(--border);
+    color: var(--ink);
+    font: 600 11px/1 var(--font);
+    text-transform: uppercase;
+    padding: 3px 8px;
+    cursor: pointer;
+    letter-spacing: 0.05em;
+}
+#theme-toggle:hover, #chart-mode-toggle:hover {
+    background: var(--ink);
+    color: var(--ink-inv);
+}
+
+#smooth-slider {
+    -webkit-appearance: none;
+    appearance: none;
+    width: 80px;
+    height: 4px;
+    background: var(--ink-muted);
+    outline: none;
+    margin: 0 6px;
+    vertical-align: middle;
+    cursor: pointer;
+}
+#smooth-slider::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    width: 10px;
+    height: 10px;
+    background: var(--ink);
+    border: none;
+    cursor: pointer;
+}
+#smooth-slider::-moz-range-thumb {
+    width: 10px;
+    height: 10px;
+    background: var(--ink);
+    border: none;
+    cursor: pointer;
+}
+
+@media (max-width: 640px) {
+    .page {
+        padding: 16px 12px;
+        gap: 16px;
+    }
+    #top-bar {
+        flex-wrap: wrap;
+        gap: 4px 0;
+        font-size: 11px !important;
+    }
+    #top-bar > span,
+    #top-bar > button { width: 50%; }
+    #top-bar > span:nth-child(even),
+    #top-bar > button { text-align: right; }
+    .logo-img { width: 56px !important; height: 56px !important; }
+    .header-title { font-size: 16px !important; }
+    .section-label { flex-wrap: wrap; gap: 4px; }
+    .chart-controls { width: 100%; justify-content: flex-end; }
+    #smooth-slider { width: 60px; }
+    .chart-wrap { aspect-ratio: 3 / 2; }
+    .scroll-box { overflow-x: auto; }
+    .scroll-hist table,
+    .scroll-queue table { table-layout: auto; min-width: 500px; }
+    .scroll-hist table { min-width: 700px; }
+    .scroll-hist th:nth-child(6),
+    .scroll-hist td:nth-child(6),
+    .scroll-hist th:nth-child(8),
+    .scroll-hist td:nth-child(8) { display: none; }
+    .duel-info span { min-width: 80px; }
+    #last-winner { display: flex; flex-wrap: wrap; gap: 2px 12px; }
+}
+</style>
+</head>
+<body>
+<div class="page">
+
+    <div id="top-bar" style="display:flex;justify-content:space-between;align-items:center;border-bottom:var(--border);padding:6px 0;font-size:12px;text-transform:uppercase;">
+        <span>TAO <b id="tao-price">--</b> <span id="tao-change" style="font-size:10px"></span></span>
+        <span>SN24 ALPHA <b id="alpha-price">--</b></span>
+        <span>SN24 REG <b id="reg-cost">--</b></span>
+        <button id="theme-toggle">DARK</button>
+    </div>
+
+    <div style="text-align:center;margin-bottom:8px;">
+        <img src="favicon.svg" alt="Quasar" class="logo-img" style="width:80px;height:80px;margin-bottom:8px;">
+        <div class="header-title" style="font-size:20px;font-weight:bold;letter-spacing:0.1em;text-transform:uppercase;">Quasar</div>
+        <div style="font-size:11px;margin-top:4px;display:flex;flex-direction:column;align-items:center;gap:4px;text-transform:uppercase;">
+            <span><span id="king-health" title="King repo status"></span> KING: <a id="king-link-top" href="#" target="_blank" style="color:var(--ink);text-decoration:none;border-bottom:var(--border);">--</a> <span id="king-rev" style="opacity:0.6;"></span></span>
+            <span>VALIDATOR: <a href="https://github.com/SILX-LABS/QUASAR-SUBNET" target="_blank" style="color:var(--ink);text-decoration:none;border-bottom:var(--border);">GitHub</a></span>
+            <span>DATASET: <a href="https://s3.hippius.com/quasar/" target="_blank" style="color:var(--ink);text-decoration:none;border-bottom:var(--border);">Hippius</a></span>
+            <span id="king-reign" style="font-size:10px;opacity:0.5;"></span>
+        </div>
+    </div>
+
+    <div>
+        <div class="section-label" style="display:flex;justify-content:space-between;align-items:center;">
+            <span id="chart-label">Perplexity</span>
+            <span class="chart-controls" style="display:flex;align-items:center;gap:8px;">
+                <label style="font-weight:normal;font-size:11px;display:flex;align-items:center;cursor:default;">SMOOTH<input type="range" id="smooth-slider" min="0" max="1" step="0.05" value="0"><span id="smooth-val" style="min-width:1.8em;text-align:right;">0</span></label>
+                <button id="chart-mode-toggle">Loss</button>
+            </span>
+        </div>
+        <div class="chart-wrap"><svg id="chart"></svg></div>
+        <div class="chart-meta" id="chart-meta"><span>--</span></div>
+    </div>
+
+    <div id="duel-section" class="duel-idle">
+        <div class="section-label" id="duel-label">Idle</div>
+        <div class="duel-bar-wrap"><div class="duel-bar" id="duel-bar" style="width:0%"></div></div>
+        <div class="duel-info"><span id="duel-progress">--</span><span id="duel-wr">--</span></div>
+    </div>
+
+    <div>
+        <div class="section-label">Last Winner</div>
+        <div id="last-winner" style="font-size:12px;line-height:1.8;min-height:48px;display:flex;flex-wrap:wrap;gap:0 16px;">--</div>
+    </div>
+
+    <div>
+        <div class="section-label">Queue</div>
+        <div class="scroll-box scroll-queue">
+            <table>
+                <thead><tr><th>UID</th><th>Repo</th><th>Hotkey</th><th>Block</th><th>Status</th></tr></thead>
+                <tbody id="queue"></tbody>
+            </table>
+        </div>
+    </div>
+
+    <div>
+        <div class="section-label">Duel History</div>
+        <div class="scroll-box scroll-hist">
+            <table>
+                <thead><tr>
+                    <th>UID</th><th>Repo</th><th>Hotkey</th><th>Verdict</th><th>mu_hat</th><th>LCB</th><th>King Loss</th><th>Chall Loss</th><th>When</th>
+                </tr></thead>
+                <tbody id="hist"></tbody>
+            </table>
+        </div>
+    </div>
+</div>
+
+<script>
+var DEMO_MODE = new URLSearchParams(window.location.search).has("demo");
+var DATA_URLS = DEMO_MODE ? ["/demo-dashboard.json"] : ["/api/dashboard.json", "https://s3.hippius.com/quasar/dashboard.json"];
+var POLL_MS = 5000;
+var _lastData = null;
+var _chartMode = localStorage.getItem("chartMode") || "ppl";
+
+(function initTheme() {
+    var saved = localStorage.getItem("theme");
+    var dark = saved ? saved === "dark" : window.matchMedia("(prefers-color-scheme: dark)").matches;
+    document.documentElement.dataset.theme = dark ? "dark" : "light";
+})();
+
+function short(s, n) { return s ? s.slice(0, n || 12) + "\u2026" : "--"; }
+
+function timeAgo(iso) {
+    if (!iso) return "--";
+    var sec = Math.floor((Date.now() - new Date(iso).getTime()) / 1000);
+    if (sec < 0) sec = 0;
+    if (sec < 60) return sec + "s ago";
+    var min = Math.floor(sec / 60);
+    if (min < 60) return min + "m ago";
+    var hr = Math.floor(min / 60);
+    if (hr < 24) return hr + "h ago";
+    var day = Math.floor(hr / 24);
+    return day + "d ago";
+}
+
+function ema(arr, alpha) {
+    if (alpha >= 1 || arr.length === 0) return arr.slice();
+    var out = [arr[0]];
+    for (var i = 1; i < arr.length; i++) out.push(alpha * arr[i] + (1 - alpha) * out[i - 1]);
+    return out;
+}
+
+var ERROR_MESSAGES = {
+    hf_metadata_error: { title: "Model Not Found", message: function() { return "Could not fetch your model metadata from HuggingFace. Make sure your repo exists, is public, and has a valid main branch."; } },
+    config_rejected: { title: "Config Rejected", message: function(detail) { return "Your model config was rejected: " + detail; } },
+    no_manifest: { title: "Dataset Unavailable", message: function() { return "The evaluation dataset is temporarily unavailable. This is not a problem with your model -- it will be retried automatically."; } },
+    eval_error: { title: "Evaluation Failed", message: function(detail) { return "An unexpected error occurred during evaluation. Details: " + detail; } },
+    disqualified: { title: "Disqualified", message: function(detail) { return detail || "Model was disqualified by validator checks."; } }
+};
+
+function esc(s) {
+    return String(s == null ? "" : s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");
+}
+
+function repoLink(repo) {
+    if (!repo || repo === "--") return "--";
+    return '<a href="https://huggingface.co/' + esc(repo) + '" target="_blank" style="color:var(--ink)">' + esc(repo) + '</a>';
+}
+
+function hotkeyLink(hotkey) {
+    if (!hotkey) return "--";
+    return '<a href="https://taomarketcap.com/hotkey/' + esc(hotkey) + '/mining_hotkeys" target="_blank" style="color:var(--ink)">' + esc(short(hotkey, 16)) + '</a>';
+}
+
+function renderChart(d) {
+    var hist = (d.history || []).slice(0, 160).reverse();
+    var ev = d.current_eval;
+    var isPpl = _chartMode === "ppl";
+    document.getElementById("chart-label").textContent = isPpl ? "Perplexity" : "Loss";
+    document.getElementById("chart-mode-toggle").textContent = isPpl ? "Loss" : "Perplexity";
+
+    var kingVals = [], challVals = [];
+    for (var i = 0; i < hist.length; i++) {
+        if (hist[i].verdict === "error") continue;
+        var kl = hist[i].avg_king_loss || 0;
+        var cl = hist[i].avg_challenger_loss || 0;
+        if (kl || cl) {
+            var kv = kl || cl, cv = cl || kl;
+            kingVals.push(isPpl ? Math.exp(kv) : kv);
+            challVals.push(isPpl ? Math.exp(cv) : cv);
+        }
+    }
+    if (ev && ev.avg_king_loss) {
+        var ekv = ev.avg_king_loss;
+        var ecv = ev.avg_challenger_loss || ev.avg_king_loss;
+        kingVals.push(isPpl ? Math.exp(ekv) : ekv);
+        challVals.push(isPpl ? Math.exp(ecv) : ecv);
+    }
+
+    var nPts = kingVals.length;
+    var smoothVal = parseFloat(document.getElementById("smooth-slider").value);
+    var alpha = 1 / (1 + smoothVal * 20);
+    var rawKing = kingVals.slice(), rawChall = challVals.slice();
+    if (smoothVal > 0) { kingVals = ema(kingVals, alpha); }
+
+    var SVG = document.getElementById("chart");
+    var rect = SVG.parentElement.getBoundingClientRect();
+    var dpr = window.devicePixelRatio || 1;
+    var W = Math.max(1400, Math.round(rect.width * dpr));
+    var H = Math.max(360, Math.round(rect.height * dpr));
+    var ML = Math.round((window.innerWidth <= 640 ? 50 : 70) * dpr), MR = Math.round(16 * dpr);
+    var MT = Math.round(16 * dpr), MB = Math.round(36 * dpr);
+    var pw = W - ML - MR, ph = H - MT - MB;
+    SVG.setAttribute("viewBox", "0 0 " + W + " " + H);
+    var cs = getComputedStyle(document.documentElement);
+    var inkC = cs.getPropertyValue('--ink').trim();
+    var mutedC = cs.getPropertyValue('--ink-muted').trim();
+
+    if (nPts < 1) {
+        SVG.innerHTML = '<text x="' + (W/2) + '" y="' + (H/2) + '" text-anchor="middle" font-family="Space Mono,monospace" font-size="' + (13*dpr) + '" fill="' + inkC + '">NO DATA</text>';
+        document.getElementById("chart-meta").innerHTML = "<span>--</span>";
+        return;
+    }
+
+    var allVals = kingVals.concat(challVals).concat(rawKing).concat(rawChall).filter(isFinite).sort(function(a, b) { return a - b; });
+    var minL = allVals[0], maxL = allVals[allVals.length - 1];
+    if (allVals.length >= 8) {
+        var p95 = allVals[Math.floor((allVals.length - 1) * 0.95)];
+        var q1 = allVals[Math.floor((allVals.length - 1) * 0.25)];
+        var q3 = allVals[Math.floor((allVals.length - 1) * 0.75)];
+        var cap = p95 + (q3 - q1) * 1.5;
+        if (cap > minL && maxL > cap) maxL = cap;
+    }
+    if (_chartMode === "ppl" && maxL > 20) maxL = 20;
+    var padV = (maxL - minL) * 0.08 || 0.5;
+    minL -= padV; maxL += padV;
+    function toX(i) { return ML + (nPts > 1 ? (i / (nPts - 1)) * pw : pw / 2); }
+    function clamp(v) { return Math.max(minL, Math.min(maxL, v)); }
+    function toY(v) { return MT + ph - ((clamp(v) - minL) / (maxL - minL)) * ph; }
+    function line(vals) {
+        var pts = [];
+        for (var i = 0; i < vals.length; i++) pts.push(toX(i).toFixed(1) + "," + toY(vals[i]).toFixed(1));
+        return pts.join(" ");
+    }
+
+    var fs = Math.round(11 * dpr);
+    var font = 'font-family="Space Mono,monospace" font-size="' + fs + '" fill="' + inkC + '"';
+    var svg = '';
+    svg += '<line x1="' + ML + '" y1="' + MT + '" x2="' + ML + '" y2="' + (MT + ph) + '" stroke="' + inkC + '" stroke-width="' + dpr + '"/>';
+    svg += '<line x1="' + ML + '" y1="' + (MT + ph) + '" x2="' + (ML + pw) + '" y2="' + (MT + ph) + '" stroke="' + inkC + '" stroke-width="' + dpr + '"/>';
+    for (var t = 0; t <= 8; t++) {
+        var val = minL + (maxL - minL) * (t / 8);
+        var yy = toY(val);
+        svg += '<line x1="' + (ML - 5*dpr) + '" y1="' + yy + '" x2="' + ML + '" y2="' + yy + '" stroke="' + inkC + '" stroke-width="' + dpr + '"/>';
+        svg += '<text x="' + (ML - 8*dpr) + '" y="' + (yy + fs*0.35) + '" text-anchor="end" ' + font + '>' + val.toFixed(2) + '</text>';
+        if (t > 0 && t < 8) svg += '<line x1="' + ML + '" y1="' + yy + '" x2="' + (ML + pw) + '" y2="' + yy + '" stroke="' + inkC + '" stroke-width="' + (0.5*dpr) + '" stroke-dasharray="' + (3*dpr) + ' ' + (6*dpr) + '"/>';
+    }
+    if (smoothVal > 0) {
+        svg += '<polyline points="' + line(rawKing) + '" fill="none" stroke="' + inkC + '" stroke-width="' + (0.5*dpr) + '" stroke-dasharray="' + (2*dpr) + ' ' + (4*dpr) + '" opacity="0.25"/>';
+    }
+    for (var p = 0; p < nPts; p++) {
+        svg += '<circle cx="' + toX(p).toFixed(1) + '" cy="' + toY(rawChall[p]).toFixed(1) + '" r="' + (2*dpr) + '" fill="' + mutedC + '"/>';
+    }
+    svg += '<polyline points="' + line(kingVals) + '" fill="none" stroke="' + inkC + '" stroke-width="' + (1.5*dpr) + '" stroke-linejoin="round"/>';
+    for (var p = 0; p < nPts; p++) {
+        svg += '<circle cx="' + toX(p).toFixed(1) + '" cy="' + toY(kingVals[p]).toFixed(1) + '" r="' + (3*dpr) + '" fill="' + inkC + '"/>';
+    }
+    var legX = ML + 12*dpr, legY = MT + 14*dpr;
+    svg += '<line x1="' + legX + '" y1="' + legY + '" x2="' + (legX + 20*dpr) + '" y2="' + legY + '" stroke="' + inkC + '" stroke-width="' + (1.5*dpr) + '"/>';
+    svg += '<text x="' + (legX + 24*dpr) + '" y="' + (legY + fs*0.35) + '" ' + font + '>KING</text>';
+    svg += '<circle cx="' + (legX + 90*dpr) + '" cy="' + legY + '" r="' + (2*dpr) + '" fill="' + mutedC + '"/>';
+    svg += '<text x="' + (legX + 104*dpr) + '" y="' + (legY + fs*0.35) + '" ' + font + ' fill="' + mutedC + '">CHALLENGER</text>';
+    SVG.innerHTML = svg;
+    document.getElementById("chart-meta").innerHTML = "<span>" + (isPpl ? "KING PPL" : "KING LOSS") + ": " + kingVals[nPts - 1].toFixed(4) + "</span><span>EVALS: " + nPts + "</span>";
+}
+
+function render(d) {
+    var mkt = d.market || {};
+    if (mkt.tao_price_usd) {
+        document.getElementById("tao-price").textContent = "$" + Number(mkt.tao_price_usd).toFixed(2);
+        var ch = Number(mkt.tao_change_24h || 0);
+        var chEl = document.getElementById("tao-change");
+        chEl.textContent = (ch >= 0 ? "+" : "") + ch.toFixed(1) + "%";
+        chEl.style.color = ch >= 0 ? "#2a2" : "#c22";
+    }
+    var alphaPrice = mkt.sn24_alpha_price_tao;
+    var regBurn = mkt.sn24_reg_burn_tao;
+    if (alphaPrice != null) document.getElementById("alpha-price").textContent = Number(alphaPrice).toFixed(4) + " \u03C4";
+    if (regBurn != null) document.getElementById("reg-cost").textContent = Number(regBurn).toFixed(6) + " \u03C4";
+
+    var king = d.king || {};
+    var histAll = d.history || [];
+    var topModel = null;
+    for (var ti = 0; ti < histAll.length; ti++) if (histAll[ti].accepted && histAll[ti].challenger_repo) { topModel = histAll[ti]; break; }
+    var kingRepo = topModel ? topModel.challenger_repo : (king.hf_repo || "--");
+    var kingRev = king.king_revision || "";
+    var kingLinkTop = document.getElementById("king-link-top");
+    kingLinkTop.href = kingRepo !== "--" ? "https://huggingface.co/" + kingRepo : "#";
+    kingLinkTop.textContent = kingRepo;
+    document.getElementById("king-rev").innerHTML = kingRev && kingRepo !== "--" ? '@ <a href="https://huggingface.co/' + esc(kingRepo) + '/commit/' + esc(kingRev) + '" target="_blank" style="color:var(--ink);opacity:0.6">' + esc(kingRev.slice(0, 8)) + '</a>' : "";
+    var healthEl = document.getElementById("king-health");
+    healthEl.textContent = "\u25CF ";
+    healthEl.style.color = "#2a2";
+    document.getElementById("king-reign").textContent = king.reign_number != null ? "REIGN #" + king.reign_number + (king.crowned_at ? " \u2014 " + String(king.crowned_at).slice(0, 16) + "Z" : "") : "";
+
+    renderChart(d);
+
+    var ev = d.current_eval;
+    var duelSec = document.getElementById("duel-section");
+    var duelLabel = document.getElementById("duel-label");
+    var duelBar = document.getElementById("duel-bar");
+    var duelProgress = document.getElementById("duel-progress");
+    var duelWr = document.getElementById("duel-wr");
+    if (ev) {
+        duelSec.classList.remove("duel-idle");
+        var pct = ev.total > 0 ? Math.round((ev.progress / ev.total) * 100) : 0;
+        var duelName = ev.challenger_repo || short(ev.hotkey, 12);
+        duelLabel.innerHTML = ev.challenger_repo ? repoLink(ev.challenger_repo) : esc(duelName);
+        duelBar.style.width = (ev.loading ? 0 : pct) + "%";
+        duelProgress.textContent = ev.loading ? "Loading model \u2026" : ev.progress + " / " + ev.total + "  (" + pct + "%)";
+        duelWr.textContent = ev.loading ? "--" : "MU: " + Number(ev.mu_hat || 0).toFixed(6);
+    } else {
+        var q = d.queue || [];
+        if (q.length > 0) {
+            duelSec.classList.remove("duel-idle");
+            duelLabel.innerHTML = repoLink(q[0].hf_repo);
+            duelBar.style.width = "0%";
+            duelProgress.textContent = "Loading model \u2026";
+            duelWr.textContent = "--";
+        } else {
+            duelSec.classList.add("duel-idle");
+            duelLabel.textContent = "Idle";
+            duelBar.style.width = "0%";
+            duelProgress.textContent = "--";
+            duelWr.textContent = "--";
+        }
+    }
+
+    var lwEl = document.getElementById("last-winner");
+    var winner = null;
+    for (var i = 0; i < (d.history || []).length; i++) if (d.history[i].accepted) { winner = d.history[i]; break; }
+    if (winner) {
+        lwEl.innerHTML = '<span style="width:100%">' + repoLink(winner.challenger_repo) + '</span>' +
+            '<span>MU_HAT: ' + Number(winner.mu_hat || 0).toFixed(6) + '</span>' +
+            '<span>LCB: ' + Number(winner.lcb || 0).toFixed(6) + '</span>' +
+            '<span>DELTA: ' + Number(winner.delta || 0).toFixed(4) + '</span>' +
+            '<span>KING_LOSS: ' + Number(winner.avg_king_loss || 0).toFixed(4) + '</span>' +
+            '<span>CHALL_LOSS: ' + Number(winner.avg_challenger_loss || 0).toFixed(4) + '</span>' +
+            (winner.wall_time_s ? '<span>' + Number(winner.wall_time_s).toFixed(0) + 's</span>' : '');
+    } else {
+        lwEl.textContent = "NO DETHRONING YET";
+    }
+
+    var qEl = document.getElementById("queue");
+    var q = d.queue || [];
+    qEl.innerHTML = q.length === 0
+        ? '<tr><td colspan="5" style="text-align:center;padding:16px">Queue empty</td></tr>'
+        : q.map(function(e) {
+            return '<tr><td>' + (e.uid != null ? e.uid : "--") + '</td><td>' + repoLink(e.hf_repo) + '</td><td>' + hotkeyLink(e.hotkey) + '</td><td>' + (e.block ? '#' + e.block : '--') + '</td><td>' + (e.reeval ? 'SEEN' : 'UNSEEN') + '</td></tr>';
+        }).join("");
+
+    var hb = document.getElementById("hist");
+    var history = d.history || [];
+    hb.innerHTML = history.length === 0
+        ? '<tr><td colspan="9" style="text-align:center;padding:16px">No duels yet</td></tr>'
+        : history.map(function(h) {
+            var isErr = h.verdict === "error";
+            var errInfo = ERROR_MESSAGES[h.error_code];
+            var verdictCell = isErr
+                ? '<td title="' + esc((errInfo ? errInfo.title + ': ' + errInfo.message(h.error_detail || '') : (h.error_code || 'error'))) + '" style="color:#c22;cursor:help">' + esc(errInfo ? errInfo.title.toUpperCase() : "ERROR") + '</td>'
+                : '<td>' + (h.accepted ? "CHALLENGER" : "KING") + '</td>';
+            var ago = timeAgo(h.timestamp);
+            if (!isErr && h.wall_time_s) ago += " (" + Number(h.wall_time_s).toFixed(0) + "s)";
+            return '<tr><td>' + (h.uid != null ? h.uid : "--") + '</td><td>' + repoLink(h.challenger_repo) + '</td><td>' + hotkeyLink(h.hotkey) + '</td>' + verdictCell +
+                '<td>' + (isErr ? "--" : Number(h.mu_hat || 0).toFixed(6)) + '</td>' +
+                '<td>' + (isErr ? "--" : Number(h.lcb || 0).toFixed(6)) + '</td>' +
+                '<td>' + (isErr ? "--" : Number(h.avg_king_loss || 0).toFixed(4)) + '</td>' +
+                '<td>' + (isErr ? "--" : Number(h.avg_challenger_loss || 0).toFixed(4)) + '</td>' +
+                '<td title="' + esc(h.timestamp || "") + '">' + ago + '</td></tr>';
+        }).join("");
+}
+
+async function poll() {
+    for (var i = 0; i < DATA_URLS.length; i++) {
+        try {
+            var r = await fetch(DATA_URLS[i] + "?t=" + Date.now());
+            if (r.ok) {
+                _lastData = await r.json();
+                render(_lastData);
+                return;
+            }
+        } catch (e) {}
+    }
+}
+
+(function initToggle() {
+    var btn = document.getElementById("theme-toggle");
+    function updateLabel() { btn.textContent = document.documentElement.dataset.theme === "dark" ? "LIGHT" : "DARK"; }
+    updateLabel();
+    btn.addEventListener("click", function() {
+        var isDark = document.documentElement.dataset.theme === "dark";
+        document.documentElement.dataset.theme = isDark ? "light" : "dark";
+        localStorage.setItem("theme", document.documentElement.dataset.theme);
+        updateLabel();
+        if (_lastData) render(_lastData);
+    });
+})();
+
+(function initChartToggle() {
+    document.getElementById("chart-mode-toggle").addEventListener("click", function() {
+        _chartMode = _chartMode === "ppl" ? "loss" : "ppl";
+        localStorage.setItem("chartMode", _chartMode);
+        if (_lastData) render(_lastData);
+    });
+})();
+
+(function initSmoothSlider() {
+    var slider = document.getElementById("smooth-slider");
+    var label = document.getElementById("smooth-val");
+    var saved = localStorage.getItem("smoothing");
+    if (saved != null) slider.value = saved;
+    label.textContent = slider.value;
+    slider.addEventListener("input", function() {
+        label.textContent = slider.value;
+        localStorage.setItem("smoothing", slider.value);
+        if (_lastData) render(_lastData);
+    });
+})();
+
+poll();
+setInterval(poll, POLL_MS);
+</script>
+</body>
+</html>

@@ -1,0 +1,49 @@
+{
+  "netuid": 24,
+  "project": {
+    "name": "Quasar",
+    "company": "SILX",
+    "website": "https://silxinc.com",
+    "twitter": "https://x.com",
+    "github": "https://github.com",
+    "huggingface": "https://huggingface.co"
+  },
+  "teacher": {
+    "model": "Qwen/Qwen3.5-35B-A3B",
+    "architecture": "qwen3_5_moe",
+    "totalParams": 35000000000,
+    "activeParams": 3000000000,
+    "vocabSize": 248044,
+    "configVocabSize": 248320,
+    "maxStudentParams": 5250000000
+  },
+  "validator": {
+    "maxKlThreshold": 2.0,
+    "maxNewTokens": 8192,
+    "maxPromptTokens": 1024,
+    "evalPromptsFull": 60,
+    "evalPromptsH2h": 300,
+    "vllmConcurrency": 32,
+    "epsilon": 0.03,
+    "pairedTestAlpha": 0.03,
+    "staleH2hEpochs": 50,
+    "topNAlwaysInclude": 5,
+    "referenceModel": "Qwen/Qwen3.5-4B",
+    "referenceUid": -1,
+    "activationCopyThreshold": 0.99999,
+    "roleId": ""
+  },
+  "chat": {
+    "appPort": 8100
+  },
+  "api": {
+    "cacheTtl": 60,
+    "publicUrl": "http://localhost:3710",
+    "dashboardUrl": "http://localhost:3720",
+    "allowedOrigins": [
+      "http://localhost:3720",
+      "http://localhost:3000"
+    ],
+    "tmcBase": "https://api.taomarketcap.com"
+  }
+}

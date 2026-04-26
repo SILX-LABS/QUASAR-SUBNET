@@ -1,0 +1,47 @@
+---
+version: "2.0"
+
+services:
+  api:
+    # Build/push this image from Dockerfile.api, then replace the tag.
+    image: ghcr.io/SILX-LABS/quasar-api:0.8.0
+    env:
+      - QUASAR_NETUID=24
+      - QUASAR_STATE_DIR=/app/state
+      - QUASAR_BUCKET_ENDPOINT_URL=https://s3.hippius.com
+      - QUASAR_BUCKET_NAME=quasar
+      - QUASAR_BUCKET_KEY=dashboard.json
+      - QUASAR_BUCKET_REGION=decentralized
+      - QUASAR_BUCKET_ADDRESSING_STYLE=path
+    expose:
+      - port: 3710
+        as: 80
+        to:
+          - global: true
+        http_options:
+          max_body_size: 10485760
+          read_timeout: 60000
+          send_timeout: 60000
+
+profiles:
+  compute:
+    api:
+      resources:
+        cpu:
+          units: 2.0
+        memory:
+          size: 4Gi
+        storage:
+          - size: 20Gi
+  placement:
+    dcloud:
+      pricing:
+        api:
+          denom: uakt
+          amount: 1000
+
+deployment:
+  api:
+    dcloud:
+      profile: api
+      count: 1

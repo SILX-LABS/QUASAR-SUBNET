@@ -1,0 +1,49 @@
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+*.egg
+.eggs/
+*.so
+.mypy_cache/
+.pytest_cache/
+*.log
+wallets/
+dataset/
+
+# Secrets
+.env
+.env.*
+.env.local
+*.key
+*.pem
+*cookies*
+
+# Runtime cache
+state/api_cache/
+state/prompt_cache/
+knowledge/
+results/
+
+# Next.js incremental build artifacts
+frontend/tsconfig.tsbuildinfo
+frontend/.next/
+state/
+.openclaw/
+.trash/
+*.bak
+*.bak.*
+node_modules/
+memory/
+HEARTBEAT.md
+SESSION_MEMORY.md
+REWRITE_PLAN.md
+
+# Auto-generated / environment-specific
+.python-version
+REVISION
+ops/akash/README.md

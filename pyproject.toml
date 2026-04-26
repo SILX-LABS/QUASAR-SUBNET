@@ -1,0 +1,39 @@
+[project]
+name = "quasar"
+version = "0.8.0"
+description = "Quasar SN24 - Bittensor subnet for competitive Qwen knowledge distillation"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+dependencies = [
+    "boto3",
+    "bittensor",
+    "bittensor-wallet",
+    "click",
+    "datasets",
+    "fastapi",
+    "huggingface-hub",
+    "httpx",
+    "lium",
+    "numpy",
+    "pydantic",
+    "requests",
+    "rich",
+    "safetensors",
+    "starlette",
+    "torch",
+    "transformers",
+    "uvicorn",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+]
+gpu = [
+    "flash-attn",
+]
+
+[tool.setuptools.packages.find]
+include = ["eval*", "api*"]
+exclude = ["state*", "scripts*", "distillation*", "neurons*"]
