@@ -4,9 +4,9 @@ Model architecture checker with MoE-aware param counting and identity verificati
 Checks:
 1. Total parameter count ≤ max allowed (prevents huge MoE uploads)
 2. Active parameter count for MoE models (logged for transparency)
-3. Vocab size matches teacher (same tokenizer required)
+3. Vocab size matches the official Quasar base tokenizer
 4. SHA256 hash of first safetensors shard (copy detection)
-5. Tokenizer file integrity (byte-for-byte comparison with teacher)
+5. Tokenizer file integrity against the official Quasar base
 6. Tokenizer encoding verification (spot-check)
 """
 import json
@@ -17,12 +17,50 @@ from pathlib import Path
 from typing import Optional
 
 from huggingface_hub import hf_hub_download, model_info
-from eval.runtime import STATE_DIR as RUNTIME_STATE_DIR, TEACHER_CONFIG_VOCAB_SIZE, TEACHER_MODEL
+from eval.runtime import (
+    STATE_DIR as RUNTIME_STATE_DIR,
+    STUDENT,
+    STUDENT_BASE_MODEL,
+    STUDENT_VOCAB_SIZE,
+    TEACHER_CONFIG_VOCAB_SIZE,
+    TEACHER_MODEL,
+)
 
 logger = logging.getLogger("quasar.model_checker")
 
-BASELINE_VOCAB_SIZE = TEACHER_CONFIG_VOCAB_SIZE
+BASELINE_VOCAB_SIZE = STUDENT_VOCAB_SIZE or TEACHER_CONFIG_VOCAB_SIZE
+TOKENIZER_REFERENCE_MODEL = STUDENT_BASE_MODEL or TEACHER_MODEL
 STATE_DIR = Path(RUNTIME_STATE_DIR)
+
+QUASAR_CONFIG_REQUIREMENTS = {
+    "model_type": STUDENT.get("architecture", "quasar"),
+    "vocab_size": STUDENT.get("vocabSize", 248320),
+    "d_model": STUDENT.get("dModel", 2048),
+    "n_heads": STUDENT.get("nHeads", 16),
+    "n_layers": STUDENT.get("nLayers", 20),
+    "d_ff": STUDENT.get("dFf", 5632),
+    "num_shared_experts": STUDENT.get("numSharedExperts", 1),
+    "num_routed_experts": STUDENT.get("numRoutedExperts", 48),
+    "top_k": STUDENT.get("topK", 4),
+    "shared_expert_size": STUDENT.get("sharedExpertSize", 1536),
+    "routed_expert_size": STUDENT.get("routedExpertSize", 512),
+    "quasar_layers": STUDENT.get("quasarLayers", 4),
+    "gated_layers": STUDENT.get("gatedLayers", 2),
+    "dense_input_layers": STUDENT.get("denseInputLayers", 4),
+    "max_seq_len": STUDENT.get("maxSeqLen", 16384),
+    "num_loops": STUDENT.get("numLoops", 1),
+    "rope_theta": STUDENT.get("ropeTheta", 1000000.0),
+    "hidden_act": STUDENT.get("hiddenAct", "silu"),
+}
+
+
+def _quasar_config_mismatches(config: dict) -> list[str]:
+    mismatches = []
+    for key, expected in QUASAR_CONFIG_REQUIREMENTS.items():
+        actual = config.get(key)
+        if actual != expected:
+            mismatches.append(f"{key}={actual!r} expected {expected!r}")
+    return mismatches
 
 
 def compute_moe_params(config: dict) -> dict:
@@ -46,11 +84,11 @@ def compute_moe_params(config: dict) -> dict:
             v = text_cfg.get(key)
         return v if v is not None else default
 
-    hidden = _get("hidden_size", 0)
-    layers = _get("num_hidden_layers", 0)
+    hidden = _get("hidden_size", 0) or _get("d_model", 0)
+    layers = _get("num_hidden_layers", 0) or _get("n_layers", 0)
     vocab = _get("vocab_size", 0)
-    intermediate = _get("intermediate_size", hidden * 4)
-    num_heads = _get("num_attention_heads", 0)
+    intermediate = _get("intermediate_size", 0) or _get("d_ff", hidden * 4)
+    num_heads = _get("num_attention_heads", 0) or _get("n_heads", 0)
     kv_heads = _get("num_key_value_heads", num_heads)
     head_dim = _get("head_dim", hidden // num_heads if num_heads else 0)
 
@@ -74,19 +112,19 @@ def compute_moe_params(config: dict) -> dict:
     norm_params = layers * hidden * 4  # 2 norms per layer, 2 params each
 
     # MoE detection — check both top-level and text_config
-    num_experts = _get("num_local_experts", 0) or _get("num_experts", 1)
-    num_active = _get("num_experts_per_tok", 0) or _get("num_active_experts", num_experts)
+    num_experts = _get("num_local_experts", 0) or _get("num_experts", 0) or _get("num_routed_experts", 1)
+    num_active = _get("num_experts_per_tok", 0) or _get("num_active_experts", 0) or _get("top_k", num_experts)
     is_moe = num_experts > 1
 
     # FFN params per expert (SwiGLU: gate + up + down)
     # Some models use moe_intermediate_size for expert FFN
-    expert_intermediate = _get("moe_intermediate_size", intermediate)
+    expert_intermediate = _get("moe_intermediate_size", 0) or _get("routed_expert_size", intermediate)
     ffn_per_expert = hidden * expert_intermediate * 2 + expert_intermediate * hidden
 
     if is_moe:
         # Some layers may be dense (shared experts)
         num_shared = _get("num_shared_experts", 0)
-        shared_intermediate = _get("shared_expert_intermediate_size", intermediate)
+        shared_intermediate = _get("shared_expert_intermediate_size", 0) or _get("shared_expert_size", intermediate)
         shared_ffn = hidden * shared_intermediate * 2 + shared_intermediate * hidden if num_shared else 0
 
         router_per_layer = hidden * num_experts
@@ -238,7 +276,7 @@ def compute_content_hash(model_repo: str, revision: str = None, sample_tensors: 
     This hashes the bytes of a fixed set of named tensors, so it catches
     re-sharded copies that slip past compute_model_hash.
 
-    Samples these tensors (present on every Qwen3.5 student):
+    Samples these tensors when present:
       - model.embed_tokens.weight
       - model.layers.0.input_layernorm.weight
       - model.layers.0.mlp.down_proj.weight
@@ -523,13 +561,7 @@ _teacher_tokenizer = None
 
 
 def assess_vllm_compatibility(config: dict, repo_info=None) -> tuple[bool, str]:
-    """Soft check for whether a student repo is natively vLLM-compatible.
-
-    This does NOT gate evaluation yet. It is used to surface whether a model was
-    saved in the base Qwen3.5 wrapper format (`Qwen3_5ForConditionalGeneration`)
-    instead of the extracted text-only format (`Qwen3_5ForCausalLM`), which needs
-    serving-time reconstruction.
-    """
+    """Check whether a student repo uses the supported runtime architecture."""
     model_type = config.get("model_type")
     archs = config.get("architectures") or []
     preproc_present = False
@@ -542,6 +574,9 @@ def assess_vllm_compatibility(config: dict, repo_info=None) -> tuple[bool, str]:
         except Exception:
             pass
 
+    if model_type == "quasar" and not _quasar_config_mismatches(config):
+        return True, "native_quasar"
+
     if model_type == "qwen3_5" and "Qwen3_5ForConditionalGeneration" in archs:
         # preprocessor_config.json is nice-to-have (for full vLLM vision pipeline)
         # but not required — chat_server.py copies it from base model at serving time
@@ -553,11 +588,11 @@ def assess_vllm_compatibility(config: dict, repo_info=None) -> tuple[bool, str]:
 
 
 def _get_teacher_tokenizer():
-    """Lazily load and cache the teacher tokenizer."""
+    """Lazily load and cache the reference tokenizer."""
     global _teacher_tokenizer
     if _teacher_tokenizer is None:
         from transformers import AutoTokenizer
-        _teacher_tokenizer = AutoTokenizer.from_pretrained(TEACHER_MODEL, trust_remote_code=True)
+        _teacher_tokenizer = AutoTokenizer.from_pretrained(TOKENIZER_REFERENCE_MODEL, trust_remote_code=True)
     return _teacher_tokenizer
 
 
@@ -573,10 +608,10 @@ def _is_transient_error(exc: Exception) -> bool:
 
 def verify_tokenizer_files(model_repo: str, revision: str = None) -> dict:
     """
-    Byte-for-byte verification of tokenizer files against the teacher model.
+    Byte-for-byte verification of tokenizer files against the tokenizer reference.
 
     Checks:
-    1. tokenizer.json: SHA256 must exactly match the teacher's tokenizer.json.
+    1. tokenizer.json: SHA256 must exactly match the reference tokenizer.json.
        This file contains the full vocabulary, merges, and added_tokens.
     2. tokenizer_config.json: all fields except chat_template must match.
        (chat_template is checked separately by the template hash check.)
@@ -585,9 +620,9 @@ def verify_tokenizer_files(model_repo: str, revision: str = None) -> dict:
       match: bool
       reason: str (if not matching)
     """
-    # Download teacher tokenizer.json
+    # Download reference tokenizer.json
     teacher_tok_json_path = hf_hub_download(
-        repo_id=TEACHER_MODEL, filename="tokenizer.json"
+        repo_id=TOKENIZER_REFERENCE_MODEL, filename="tokenizer.json"
     )
     with open(teacher_tok_json_path, "rb") as f:
         teacher_tok_hash = hashlib.sha256(f.read()).hexdigest()
@@ -604,14 +639,14 @@ def verify_tokenizer_files(model_repo: str, revision: str = None) -> dict:
             "match": False,
             "reason": (
                 f"tokenizer.json mismatch: student hash {student_tok_hash[:16]}... "
-                f"!= teacher hash {teacher_tok_hash[:16]}... "
-                f"(vocab/merges/added_tokens differ from {TEACHER_MODEL})"
+                f"!= reference hash {teacher_tok_hash[:16]}... "
+                f"(vocab/merges/added_tokens differ from {TOKENIZER_REFERENCE_MODEL})"
             ),
         }
 
     # Check tokenizer_config.json (excluding chat_template)
     teacher_cfg_path = hf_hub_download(
-        repo_id=TEACHER_MODEL, filename="tokenizer_config.json"
+        repo_id=TOKENIZER_REFERENCE_MODEL, filename="tokenizer_config.json"
     )
     student_cfg_path = hf_hub_download(
         repo_id=model_repo, filename="tokenizer_config.json", revision=revision
@@ -646,7 +681,7 @@ def verify_tokenizer_files(model_repo: str, revision: str = None) -> dict:
 
 def verify_tokenizer_match(model_repo: str, revision: str = None) -> dict:
     """
-    Verify that a model's tokenizer produces identical token IDs as the teacher.
+    Verify that a model's tokenizer produces identical token IDs as the reference.
     
     Downloads the student tokenizer and encodes fixed test strings.
     If any encoding differs, the tokenizer is incompatible.
@@ -659,7 +694,7 @@ def verify_tokenizer_match(model_repo: str, revision: str = None) -> dict:
     # Load tokenizer.json directly via the `tokenizers` library.
     # This bypasses AutoTokenizer class resolution issues (e.g., TokenizersBackend)
     # while still verifying identical encoding behavior.
-    teacher_path = _hf_dl(TEACHER_MODEL, "tokenizer.json")
+    teacher_path = _hf_dl(TOKENIZER_REFERENCE_MODEL, "tokenizer.json")
     teacher_tok = RawTokenizer.from_file(teacher_path)
 
     student_path = _hf_dl(model_repo, "tokenizer.json", revision=revision)
@@ -673,7 +708,7 @@ def verify_tokenizer_match(model_repo: str, revision: str = None) -> dict:
                 "match": False,
                 "reason": (
                     f"Encoding mismatch on test string: "
-                    f"teacher produced {len(teacher_ids)} tokens, "
+                    f"reference produced {len(teacher_ids)} tokens, "
                     f"student produced {len(student_ids)} tokens"
                 ),
             }
@@ -691,7 +726,7 @@ def check_model_architecture(
 
     Checks:
     - Total params ≤ max_total_params_b (prevents huge MoE uploads)
-    - Vocab size matches baseline (same tokenizer)
+    - Config and vocab match the official Quasar base
     - Reports active params for MoE transparency
 
     Returns dict with pass, reason, params_b, active_params_b, vocab_size
@@ -847,7 +882,7 @@ def check_model_architecture(
                         "pass": False,
                         "reason": f"FRAUD: Config claims {total_params_b:.2f}B params but weight files are "
                                   f"{total_weight_bytes / 1e9:.1f}GB (~{estimated_params_from_size:.1f}B params in bf16). "
-                                  f"Config/weights mismatch — possible teacher model disguised as student.",
+                                  f"Config/weights mismatch — possible larger model disguised as a Quasar student.",
                         "params_b": estimated_params_from_size,
                     }
         except Exception as e:
@@ -863,23 +898,36 @@ def check_model_architecture(
                 "params_b": total_params_b,
             }
 
-        # 6. Check vocab size (may be in text_config for multimodal/nested configs)
+        # 6. Check official Quasar architecture/config
+        quasar_mismatches = _quasar_config_mismatches(config)
+        if quasar_mismatches:
+            return {
+                "pass": False,
+                "reason": (
+                    f"Quasar config mismatch against {STUDENT_BASE_MODEL}: "
+                    f"{'; '.join(quasar_mismatches[:8])}"
+                ),
+                "params_b": total_params_b,
+                "active_params_b": config_active_b,
+            }
+
+        # 7. Check vocab size
         vocab_size = config.get("vocab_size", 0)
         if not vocab_size:
             vocab_size = config.get("text_config", {}).get("vocab_size", 0)
         if vocab_size != BASELINE_VOCAB_SIZE:
             return {
                 "pass": False,
-                "reason": f"Vocab size mismatch: {vocab_size} ≠ {BASELINE_VOCAB_SIZE} (teacher)",
+                "reason": f"Vocab size mismatch: {vocab_size} != {BASELINE_VOCAB_SIZE} (official Quasar base)",
                 "params_b": total_params_b,
                 "vocab_size": vocab_size,
             }
 
-        # 7a. Tokenizer file hash check REMOVED — different transformers versions
+        # 8a. Tokenizer file hash check REMOVED — different transformers versions
         # materialize extra_special_tokens into tokenizer.json differently (cosmetic).
         # The encoding-based check below is sufficient to verify identical behavior.
 
-        # 7b. Verify tokenizer produces identical encodings as teacher
+        # 8b. Verify tokenizer produces identical encodings as official base
         try:
             tokenizer_match = verify_tokenizer_match(model_repo, revision)
             if not tokenizer_match["match"]:
@@ -900,7 +948,7 @@ def check_model_architecture(
                     "vocab_size": vocab_size,
                 }
 
-        # 8. Verify chat_template matches the official Qwen template
+        # 9. Verify chat_template matches the official Quasar template
         # Prevents exploits via modified chat templates and blocks derivative models
         # that copy templates from other miners (e.g., slowsnake copying caseus's watermarked template)
         REFERENCE_TEMPLATE_HASH = "a4aee8afcf2e0711942cf848899be66016f8d14a889ff9ede07bca099c28f715"
@@ -939,8 +987,8 @@ def check_model_architecture(
                     if raw_hash != REFERENCE_TEMPLATE_HASH:
                         return {
                             "pass": False,
-                            "reason": f"Chat template modified from reference Qwen template. "
-                                      f"Students must use the original Qwen3.5 chat template unmodified. "
+                            "reason": f"Chat template modified from reference Quasar template. "
+                                      f"Students must use the original Quasar chat template unmodified. "
                                       f"(hash: {template_hash[:16]}... != expected {REFERENCE_TEMPLATE_HASH[:16]}...)",
                             "params_b": total_params_b,
                             "vocab_size": vocab_size,
@@ -961,18 +1009,16 @@ def check_model_architecture(
                 f"total={total_params_b:.2f}B, active={config_active_b:.2f}B"
             )
 
-        # Enforce vLLM-native architecture
+        # Enforce runtime-compatible architecture
         if not vllm_compatible:
             return {
                 "pass": False,
                 "reason": (
-                    f"Model must use Qwen3_5ForConditionalGeneration architecture "
-                    f"(model_type=qwen3_5) to be vLLM-compatible. "
+                    f"Model must preserve the official Quasar architecture "
+                    f"(model_type=quasar) to be runtime-compatible. "
                     f"Found: {','.join(config.get('architectures', []))} "
                     f"(model_type={config.get('model_type', 'unknown')}). "
-                    f"Fix: edit config.json on HuggingFace — change architectures to "
-                    f"[\"Qwen3_5ForConditionalGeneration\"] and model_type to \"qwen3_5\". "
-                    f"No weight changes needed."
+                    f"Start from {STUDENT_BASE_MODEL} and keep its config fields."
                 ),
                 "params_b": total_params_b,
                 "vllm_compatible": False,

@@ -2,7 +2,7 @@
 """
 KL Distillation Training for Bittensor Subnet 24 (distil)
 
-Train a student model to match the teacher's (Qwen3.5-35B-A3B) output distribution
+Train a Quasar student model to match a frontier teacher's output distribution
 using forward KL divergence on raw text from karpathy/climbmix-400b-shuffle.
 
 Requirements:
@@ -15,7 +15,7 @@ Usage (start from a leaderboard model):
     python distil_kl_train.py --student some_user/their_model --teacher_gpu 0 --student_gpu 1
 
 Usage (local dev with smaller models, e.g. 2x 24GB GPUs):
-    python distil_kl_train.py --teacher Qwen/Qwen3.5-4B --student Qwen/Qwen3.5-0.8B --teacher_gpu 0 --student_gpu 1
+    python distil_kl_train.py --teacher Qwen/Qwen3.5-4B --student silx-ai/Quasar-3B-A1B-Preview --teacher_gpu 0 --student_gpu 1
 
 Hyperparameters:
     --lr              Learning rate (default: 1e-5)
@@ -48,10 +48,10 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 try:
-    from miner.constants import TEACHER_MODEL
+    from miner.constants import BASE_MODEL, DISTILLATION_TEACHER_MODEL
 except ModuleNotFoundError:
-    from constants import TEACHER_MODEL  # type: ignore
-STUDENT_MODEL = "Qwen/Qwen3.5-4B"
+    from constants import BASE_MODEL, DISTILLATION_TEACHER_MODEL  # type: ignore
+STUDENT_MODEL = BASE_MODEL
 DATASET = "karpathy/climbmix-400b-shuffle"
 LR = 1e-4
 WARMUP = 10
@@ -109,7 +109,7 @@ def main():
         description="KL Distillation for Bittensor Subnet 24",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("--teacher", type=str, default=TEACHER_MODEL)
+    parser.add_argument("--teacher", type=str, default=DISTILLATION_TEACHER_MODEL)
     parser.add_argument("--student", type=str, default=STUDENT_MODEL)
     parser.add_argument("--teacher_gpu", type=int, default=0)
     parser.add_argument("--student_gpu", type=int, default=1)

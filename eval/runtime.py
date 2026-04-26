@@ -28,6 +28,7 @@ def _load_config():
 _load_env()
 CONFIG = _load_config()
 TEACHER = CONFIG["teacher"]
+STUDENT = CONFIG.get("student", {})
 VALIDATOR = CONFIG["validator"]
 CHAT = CONFIG["chat"]
 API = CONFIG["api"]
@@ -55,7 +56,11 @@ TEACHER_CONFIG_VOCAB_SIZE = TEACHER["configVocabSize"]
 TEACHER_TOTAL_PARAMS = TEACHER["totalParams"]
 TEACHER_ACTIVE_PARAMS = TEACHER["activeParams"]
 TEACHER_ARCHITECTURE = TEACHER["architecture"]
-MAX_STUDENT_PARAMS = TEACHER["maxStudentParams"]
+MAX_STUDENT_PARAMS = STUDENT.get("maxStudentParams", TEACHER.get("maxStudentParams", 3500000000))
+STUDENT_BASE_MODEL = STUDENT.get("baseModel", TEACHER_MODEL)
+STUDENT_BASE_REVISION = STUDENT.get("revision", "main")
+STUDENT_ARCHITECTURE = STUDENT.get("architecture", "")
+STUDENT_VOCAB_SIZE = STUDENT.get("vocabSize", TEACHER_CONFIG_VOCAB_SIZE)
 
 MAX_KL_THRESHOLD = _env_float("QUASAR_MAX_KL_THRESHOLD", VALIDATOR["maxKlThreshold"])
 MAX_NEW_TOKENS = _env_int("QUASAR_MAX_NEW_TOKENS", VALIDATOR["maxNewTokens"])

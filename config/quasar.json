@@ -8,14 +8,38 @@
     "github": "https://github.com",
     "huggingface": "https://huggingface.co"
   },
+  "student": {
+    "baseModel": "silx-ai/Quasar-3B-A1B-Preview",
+    "revision": "main",
+    "architecture": "quasar",
+    "totalParams": 3000000000,
+    "activeParams": 1000000000,
+    "maxStudentParams": 3500000000,
+    "vocabSize": 248320,
+    "dModel": 2048,
+    "nHeads": 16,
+    "nLayers": 20,
+    "dFf": 5632,
+    "numSharedExperts": 1,
+    "numRoutedExperts": 48,
+    "topK": 4,
+    "sharedExpertSize": 1536,
+    "routedExpertSize": 512,
+    "quasarLayers": 4,
+    "gatedLayers": 2,
+    "denseInputLayers": 4,
+    "maxSeqLen": 16384,
+    "numLoops": 1,
+    "ropeTheta": 1000000.0,
+    "hiddenAct": "silu"
+  },
   "teacher": {
     "model": "Qwen/Qwen3.5-35B-A3B",
     "architecture": "qwen3_5_moe",
     "totalParams": 35000000000,
     "activeParams": 3000000000,
     "vocabSize": 248044,
-    "configVocabSize": 248320,
-    "maxStudentParams": 5250000000
+    "configVocabSize": 248320
   },
   "validator": {
     "maxKlThreshold": 2.0,

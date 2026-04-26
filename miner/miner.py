@@ -9,14 +9,14 @@ replace, or re-commit. One model per hotkey, forever.
 Usage:
     # Dry run (validate without committing):
     python miner.py \\
-        --model-repo user/my-distilled-qwen \\
+        --model-repo user/my-quasar-model \\
         --wallet-name my_wallet \\
         --hotkey-name my_hotkey \\
         --dry-run
 
     # Full commitment (private model → auto-publish after commit):
     python miner.py \\
-        --model-repo user/my-distilled-qwen \\
+        --model-repo user/my-quasar-model \\
         --wallet-name my_wallet \\
         --hotkey-name my_hotkey \\
         --network finney \\
@@ -26,7 +26,7 @@ Usage:
 
     # Test-only (alias for --dry-run):
     python miner.py \\
-        --model-repo user/my-distilled-qwen \\
+        --model-repo user/my-quasar-model \\
         --wallet-name my_wallet \\
         --hotkey-name my_hotkey \\
         --test-only
@@ -163,7 +163,7 @@ def _check_repo_visibility(model_repo, hf_token=None):
 @click.option("--wallet-path", default="~/.bittensor/wallets", help="Path to wallet directory")
 @click.option("--hotkey-name", required=True, help="Name of existing hotkey")
 @click.option("--model-repo", required=True,
-              help="HuggingFace repo e.g. 'user/distilled-qwen'")
+              help="HuggingFace repo e.g. 'user/my-quasar-model'")
 @click.option("--revision", default=None, help="HF commit SHA (pinned at latest if omitted)")
 @click.option("--force", is_flag=True, help="Skip the existing-commitment check (DANGEROUS)")
 @click.option("--dry-run", is_flag=True,

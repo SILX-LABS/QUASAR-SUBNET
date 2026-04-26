@@ -38,7 +38,7 @@ from scripts.validator.service import run_validator
               envvar=["QUASAR_LOCAL_EVAL_DIR", "DISTIL_LOCAL_EVAL_DIR"],
               help="Local workspace for --eval-backend local.")
 @click.option("--state-dir", default="state")
-@click.option("--max-params-b", type=float, default=5.25)
+@click.option("--max-params-b", type=float, default=3.5)
 @click.option("--tempo", type=int, default=360, help="Seconds between epochs")
 @click.option("--once", is_flag=True, help="Run one epoch and exit (for testing)")
 @click.option("--use-vllm", is_flag=True, default=False, envvar="USE_VLLM",

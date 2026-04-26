@@ -50,25 +50,42 @@ logger = logging.getLogger("check_model")
 try:
     from miner.constants import (
         TEACHER_MODEL,
+        BASE_MODEL,
+        TOKENIZER_REFERENCE_MODEL,
         TEACHER_TOTAL_PARAMS_B,
         MAX_PARAM_RATIO,
+        MAX_PARAMS_B,
         BASELINE_VOCAB_SIZE,
         MIN_MODEL_BYTES,
+        QUASAR_CONFIG_REQUIREMENTS,
     )
 except ModuleNotFoundError:
     from constants import (  # type: ignore
         TEACHER_MODEL,
+        BASE_MODEL,
+        TOKENIZER_REFERENCE_MODEL,
         TEACHER_TOTAL_PARAMS_B,
         MAX_PARAM_RATIO,
+        MAX_PARAMS_B,
         BASELINE_VOCAB_SIZE,
         MIN_MODEL_BYTES,
+        QUASAR_CONFIG_REQUIREMENTS,
     )
 
 # ── Constants (must match validator) ────────────────────────────────────
 MAX_STUDENT_VRAM_GB = 20.0        # Real 4B ≈ 8-10GB
 MIN_TOKENS_PER_SEC = 50           # Real 4B on B200 does 100+ tok/s
-KL_FRAUD_THRESHOLD = 1e-6         # KL ≤ this = identical to teacher = fraud
+KL_FRAUD_THRESHOLD = 1e-6         # KL <= this = identical to reference = fraud
 FINGERPRINT_COSINE_THRESHOLD = 0.99999  # functional copy detection (bumped 2026-04-19, see commit history)
+
+
+def _quasar_config_mismatches(config: dict) -> list[str]:
+    mismatches = []
+    for key, expected in QUASAR_CONFIG_REQUIREMENTS.items():
+        actual = config.get(key)
+        if actual != expected:
+            mismatches.append(f"{key}={actual!r} (expected {expected!r})")
+    return mismatches
 
 
 def run_student_probe(model_repo: str, revision: Optional[str], max_new_tokens: int) -> dict:
@@ -145,9 +162,9 @@ def check_info(name: str, detail: str = ""):
 @click.option("--prompts", type=int, default=20,
               help="Number of prompts for --eval mode (default: 20)")
 @click.option("--max-new-tokens", type=int, default=64,
-              help="Teacher continuation length for --eval mode (default: 64; use 512 for fuller eval)")
+              help="Reference continuation length for --eval mode (default: 64; use 512 for fuller eval)")
 @click.option("--teacher-cache", default=None, type=click.Path(),
-              help="Path to teacher_cache.pt (skips teacher inference if provided)")
+              help="Path to cached reference logits (keeps old --teacher-cache name for compatibility)")
 @click.option("--dataset", default="karpathy/climbmix-400b-shuffle",
               help="Dataset for eval prompts")
 @click.option("--king-repo", default=None,
@@ -163,7 +180,7 @@ def main(model_repo, revision, run_eval, prompts, max_new_tokens, teacher_cache,
     """
     from huggingface_hub import model_info as hf_model_info, hf_hub_download, repo_info
 
-    max_params_b = TEACHER_TOTAL_PARAMS_B * MAX_PARAM_RATIO
+    max_params_b = MAX_PARAMS_B
     max_model_bytes = max_params_b * 2.2e9
 
     failures = []
@@ -177,6 +194,8 @@ def main(model_repo, revision, run_eval, prompts, max_new_tokens, teacher_cache,
     banner("QUASAR SN24 — PRE-SUBMISSION MODEL CHECKER")
     print(f"  Model: {model_repo}")
     print(f"  Revision: {revision or '(latest)'}")
+    print(f"  Base checkpoint: {BASE_MODEL}")
+    print(f"  KL teacher: {TEACHER_MODEL}")
     print(f"  Max params: {max_params_b:.2f}B")
 
     # ── Resolve revision ────────────────────────────────────────────────
@@ -349,7 +368,7 @@ def main(model_repo, revision, run_eval, prompts, max_new_tokens, teacher_cache,
             if estimated_params_from_size > total_params_b * 2.5:
                 check_fail("Config vs file size",
                            f"Config claims {total_params_b:.2f}B but files suggest "
-                           f"~{estimated_params_from_size:.1f}B (bf16). Possible teacher in disguise.")
+                           f"~{estimated_params_from_size:.1f}B (bf16). Possible larger model in disguise.")
                 failures.append(("cross_validate", "Config/file size mismatch"))
             else:
                 check_pass("Config vs file size", "Consistent")
@@ -365,38 +384,31 @@ def main(model_repo, revision, run_eval, prompts, max_new_tokens, teacher_cache,
         else:
             check_pass("No quantization")
 
-        # RULE: Must use Qwen3_5ForConditionalGeneration (vLLM-native architecture)
+        # RULE: Must preserve official Quasar architecture/config.
         archs = config.get("architectures", [])
         model_type = config.get("model_type", "")
-        has_preproc = any(
-            getattr(s, "rfilename", "") == "preprocessor_config.json"
-            for s in (info.siblings or [])
-        ) if info else False
-        if model_type == "qwen3_5" and "Qwen3_5ForConditionalGeneration" in archs and has_preproc:
-            check_pass("Architecture", f"Qwen3_5ForConditionalGeneration (vLLM-native)")
-        elif model_type == "qwen3_5" and "Qwen3_5ForConditionalGeneration" in archs:
-            check_warn("Architecture",
-                       f"Qwen3_5ForConditionalGeneration found but missing preprocessor_config.json. "
-                       f"Copy it from Qwen/Qwen3.5-4B.")
+        quasar_mismatches = _quasar_config_mismatches(config)
+        if not quasar_mismatches:
+            check_pass("Architecture", "Quasar 3B/A1B config matches official base")
         else:
             check_fail("Architecture",
-                       f"Must use Qwen3_5ForConditionalGeneration (model_type=qwen3_5). "
-                       f"Found: {','.join(archs)} (model_type={model_type}). "
-                       f"See Discord announcement for conversion instructions.")
-            failures.append(("architecture", f"{','.join(archs)} / {model_type}"))
+                       f"Must preserve the official Quasar config from {BASE_MODEL}. "
+                       f"Found: {','.join(archs) or 'no architectures'} (model_type={model_type}). "
+                       f"Mismatches: {'; '.join(quasar_mismatches[:6])}")
+            failures.append(("architecture", "; ".join(quasar_mismatches)))
 
-        # RULE: Vocab size matches teacher
+        # RULE: Vocab size matches official base checkpoint
         vocab_size = config.get("vocab_size", 0)
         if not vocab_size:
             vocab_size = config.get("text_config", {}).get("vocab_size", 0)
 
         if vocab_size != BASELINE_VOCAB_SIZE:
             check_fail("Vocab size",
-                       f"{vocab_size} ≠ {BASELINE_VOCAB_SIZE} (teacher). "
-                       f"Must use same tokenizer as Qwen3.5-35B-A3B.")
+                       f"{vocab_size} != {BASELINE_VOCAB_SIZE} (official Quasar base). "
+                       f"Must use the same tokenizer as {TOKENIZER_REFERENCE_MODEL}.")
             failures.append(("vocab_size", f"{vocab_size} ≠ {BASELINE_VOCAB_SIZE}"))
         else:
-            check_pass("Vocab size", f"{vocab_size} matches teacher")
+            check_pass("Vocab size", f"{vocab_size} matches official base")
 
         # RULE: Nested MoE detection (text_config with hidden experts)
         text_cfg = config.get("text_config", {})
@@ -421,7 +433,7 @@ def main(model_repo, revision, run_eval, prompts, max_new_tokens, teacher_cache,
     try:
         from transformers import AutoTokenizer
 
-        teacher_tok = AutoTokenizer.from_pretrained(TEACHER_MODEL, trust_remote_code=True)
+        teacher_tok = AutoTokenizer.from_pretrained(TOKENIZER_REFERENCE_MODEL, trust_remote_code=True)
         try:
             student_tok = AutoTokenizer.from_pretrained(model_repo, revision=revision, trust_remote_code=False)
         except Exception:
@@ -443,13 +455,13 @@ def main(model_repo, revision, run_eval, prompts, max_new_tokens, teacher_cache,
             if t_ids != s_ids:
                 check_fail("Tokenizer encoding",
                            f"Mismatch on: '{s[:40]}...' "
-                           f"(teacher: {len(t_ids)} tokens, student: {len(s_ids)} tokens)")
+                           f"(base: {len(t_ids)} tokens, student: {len(s_ids)} tokens)")
                 failures.append(("tokenizer", f"Encoding mismatch"))
                 mismatch = True
                 break
 
         if not mismatch:
-            check_pass("Tokenizer encoding", "All test strings match teacher")
+            check_pass("Tokenizer encoding", "All test strings match official base")
 
     except Exception as e:
         check_warn("Tokenizer check", f"Could not verify: {e}")
@@ -530,7 +542,7 @@ def main(model_repo, revision, run_eval, prompts, max_new_tokens, teacher_cache,
     # Key: scores CONTINUATION positions only (not prompt), uses fp32 casting,
     # uses F.kl_div with log_target=True, and tokenizes full_text as one string.
     banner("GPU EVALUATION", char="█")
-    print(f"  Running {prompts}-prompt eval against teacher")
+    print(f"  Running {prompts}-prompt eval against reference model")
     print(f"  Max new tokens per prompt: {max_new_tokens}")
     if king_repo:
         print(f"  King comparison: {king_repo}")
@@ -549,8 +561,8 @@ def main(model_repo, revision, run_eval, prompts, max_new_tokens, teacher_cache,
 
         from transformers import AutoModelForCausalLM, AutoTokenizer
 
-        # ── Load teacher ──────────────────────────────────────────────
-        banner("Loading Teacher Model")
+        # ── Load reference model ──────────────────────────────────────
+        banner("Loading Reference Model")
         teacher_tok = AutoTokenizer.from_pretrained(TEACHER_MODEL, trust_remote_code=True)
 
         # ── Sample prompts using the same pipeline as production ──────
@@ -581,7 +593,7 @@ def main(model_repo, revision, run_eval, prompts, max_new_tokens, teacher_cache,
         prompt_lens_list = []     # prompt token length per prompt
 
         if teacher_cache and Path(teacher_cache).exists():
-            print(f"  Loading cached teacher data from {teacher_cache}...")
+            print(f"  Loading cached reference data from {teacher_cache}...")
             try:
                 cache_data = torch.load(teacher_cache, map_location="cpu", weights_only=False)
                 if (len(cache_data.get("full_sequences", [])) >= len(eval_prompts)
@@ -607,14 +619,14 @@ def main(model_repo, revision, run_eval, prompts, max_new_tokens, teacher_cache,
                 trust_remote_code=True,
             )
             teacher.eval()
-            print(f"  Teacher loaded in {time.time() - t0:.1f}s")
+            print(f"  Reference loaded in {time.time() - t0:.1f}s")
             teacher_vram = torch.cuda.memory_allocated() / 1024**3
-            print(f"  Teacher VRAM: {teacher_vram:.1f}GB")
+            print(f"  Reference VRAM: {teacher_vram:.1f}GB")
 
-            # ── Generate teacher continuations & extract logits ────────
+            # ── Generate reference continuations & extract logits ──────
             # Matches production: generate continuation, then forward pass
             # to get logits, extract continuation-only positions.
-            banner("Generating Teacher Continuations + Logits")
+            banner("Generating Reference Continuations + Logits")
             with torch.no_grad():
                 for i, prompt_text in enumerate(eval_prompts):
                     enc = teacher_tok(prompt_text, return_tensors="pt", truncation=False)
@@ -622,7 +634,7 @@ def main(model_repo, revision, run_eval, prompts, max_new_tokens, teacher_cache,
                     prompt_mask = enc.attention_mask.to(teacher.device)
                     prompt_len = prompt_ids.shape[1]
                     print(
-                        f"  Teacher generation {i + 1}/{len(eval_prompts)}: "
+                        f"  Reference generation {i + 1}/{len(eval_prompts)}: "
                         f"prompt={prompt_len} tokens, max_new={max_new_tokens}",
                         flush=True,
                     )
@@ -640,7 +652,7 @@ def main(model_repo, revision, run_eval, prompts, max_new_tokens, teacher_cache,
 
                     # Forward pass to get logits for the full sequence
                     full_mask = torch.ones_like(output_ids, device=output_ids.device)
-                    print(f"  Teacher forward {i + 1}/{len(eval_prompts)}", flush=True)
+                    print(f"  Reference forward {i + 1}/{len(eval_prompts)}", flush=True)
                     logits = teacher(output_ids, attention_mask=full_mask).logits.float()
                     # Extract continuation-only logits: positions prompt_len-1 to -1
                     # (shifted by 1 because logits[t] predicts token[t+1])
@@ -651,15 +663,15 @@ def main(model_repo, revision, run_eval, prompts, max_new_tokens, teacher_cache,
                     prompt_lens_list.append(prompt_len)
 
                     del logits, cont_logits, full_mask, prompt_ids, prompt_mask
-                    print(f"  Teacher: {i + 1}/{len(eval_prompts)} prompts "
+                    print(f"  Reference: {i + 1}/{len(eval_prompts)} prompts "
                           f"({prompt_len}+{gen_len} tokens)", flush=True)
 
-            print(f"  Teacher logits generated for {len(eval_prompts)} prompts")
+            print(f"  Reference logits generated for {len(eval_prompts)} prompts")
 
             # Move full_sequences to cuda
             full_sequences = [s.to("cuda") for s in full_sequences]
 
-            # Unload teacher to free VRAM for student
+            # Unload reference to free VRAM for student
             del teacher
             torch.cuda.empty_cache()
 
@@ -718,7 +730,7 @@ def main(model_repo, revision, run_eval, prompts, max_new_tokens, teacher_cache,
 
         # ── Score KL divergence (continuation-only, matches production) ──
         # This matches the production eval pipeline in pod_eval_vllm.py:
-        # - Forward pass on full sequence (prompt + teacher continuation)
+        # - Forward pass on full sequence (prompt + reference continuation)
         # - Extract student logits at continuation positions only
         # - Cast to fp32 before log_softmax
         # - Use F.kl_div with log_target=True
@@ -729,7 +741,7 @@ def main(model_repo, revision, run_eval, prompts, max_new_tokens, teacher_cache,
             full_seq = full_sequences[i].to(student.device)
             prompt_len = prompt_lens_list[i]
 
-            # Teacher: compute log_softmax on-the-fly in fp32 (matches production)
+            # Reference: compute log_softmax on-the-fly in fp32 (matches production)
             t_logits = teacher_logits_list[i].to(student.device).float()
             t_log_p = F.log_softmax(t_logits, dim=-1)
 
@@ -746,7 +758,7 @@ def main(model_repo, revision, run_eval, prompts, max_new_tokens, teacher_cache,
             t_lp_slice = t_log_p[:, :min_len, :]
             s_lp_slice = F.log_softmax(cont_s[:, :min_len, :], dim=-1)
 
-            # KL(teacher || student) using log_target=True (matches production)
+            # KL(reference || student) using log_target=True (matches production)
             kl_per_pos = F.kl_div(
                 s_lp_slice, t_lp_slice, log_target=True, reduction='none'
             ).sum(dim=-1)
@@ -770,12 +782,12 @@ def main(model_repo, revision, run_eval, prompts, max_new_tokens, teacher_cache,
         print(f"  95% CI: [{kl_ci_low:.6f}, {kl_ci_high:.6f}]")
         print(f"  Std dev: {kl_std:.6f} over {len(kl_scores)} prompts")
 
-        # ANTI-CHEAT: KL too low = teacher copy
+        # ANTI-CHEAT: KL too low = reference copy
         banner("CHECK 11: KL Fraud Detection")
         if kl_global <= KL_FRAUD_THRESHOLD:
             check_fail("KL fraud check",
                        f"KL={kl_global:.10f} ≤ {KL_FRAUD_THRESHOLD}. "
-                       f"Model is identical to teacher — automatic DQ.")
+                       f"Model is identical to reference — automatic DQ.")
             failures.append(("kl_fraud", f"KL={kl_global}"))
         elif kl_global < 0.001:
             check_warn("KL suspiciously low",

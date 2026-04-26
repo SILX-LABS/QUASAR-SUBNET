@@ -25,6 +25,8 @@ from typing import Optional
 try:
     from miner.constants import (
         TEACHER_MODEL,
+        BASE_MODEL,
+        TOKENIZER_REFERENCE_MODEL,
         TEACHER_TOTAL_PARAMS_B,
         MAX_PARAM_RATIO,
         MAX_PARAMS_B,
@@ -33,10 +35,13 @@ try:
         MIN_BITTENSOR_VERSION,
         MIN_MODEL_BYTES,
         MAX_MODEL_BYTES,
+        QUASAR_CONFIG_REQUIREMENTS,
     )
 except ModuleNotFoundError:
     from constants import (  # type: ignore
         TEACHER_MODEL,
+        BASE_MODEL,
+        TOKENIZER_REFERENCE_MODEL,
         TEACHER_TOTAL_PARAMS_B,
         MAX_PARAM_RATIO,
         MAX_PARAMS_B,
@@ -45,6 +50,7 @@ except ModuleNotFoundError:
         MIN_BITTENSOR_VERSION,
         MIN_MODEL_BYTES,
         MAX_MODEL_BYTES,
+        QUASAR_CONFIG_REQUIREMENTS,
     )
 
 TOKENIZER_TEST_STRINGS = [
@@ -260,7 +266,7 @@ def check_no_dual_format_fraud(results: CheckResults, st_files: list, pt_files: 
 
 
 def check_param_count(results: CheckResults, model_repo: str, revision: str = None) -> float:
-    """Check 6: Total params ≤ 5.25B from safetensors metadata."""
+    """Check 6: Total params within Quasar 3B/A1B guardrail."""
     from huggingface_hub import model_info as hf_model_info
     try:
         info = hf_model_info(model_repo, revision=revision)
@@ -270,7 +276,7 @@ def check_param_count(results: CheckResults, model_repo: str, revision: str = No
                 results.add("Parameter count", False,
                              f"{params_b:.2f}B params > {MAX_PARAMS_B}B max",
                              f"Your model is too large. Max allowed: {MAX_PARAMS_B}B total params "
-                             f"({MAX_PARAM_RATIO * 100:.0f}% of teacher's {TEACHER_TOTAL_PARAMS_B}B).")
+                             f"for the Quasar base architecture.")
                 return params_b
             results.add("Parameter count", True,
                          f"{params_b:.2f}B / {MAX_PARAMS_B}B max")
@@ -373,8 +379,33 @@ def check_no_quantization(results: CheckResults, model_repo: str, revision: str)
         return True
 
 
+def check_quasar_config(results: CheckResults, model_repo: str, revision: str) -> bool:
+    """Check 9: Config preserves the official Quasar base architecture."""
+    from huggingface_hub import hf_hub_download
+    try:
+        config_path = hf_hub_download(repo_id=model_repo, filename="config.json", revision=revision)
+        with open(config_path) as f:
+            config = json.load(f)
+        mismatches = []
+        for key, expected in QUASAR_CONFIG_REQUIREMENTS.items():
+            actual = config.get(key)
+            if actual != expected:
+                mismatches.append(f"{key}={actual!r} expected {expected!r}")
+        if mismatches:
+            results.add("Quasar config", False,
+                         "; ".join(mismatches[:6]),
+                         f"Start from {BASE_MODEL} and preserve the official architecture fields.")
+            return False
+        results.add("Quasar config", True, "Matches official Quasar 3B/A1B base")
+        return True
+    except Exception as e:
+        results.add("Quasar config", False, f"Could not check: {e}",
+                     "Ensure config.json is present and readable")
+        return False
+
+
 def check_vocab_size(results: CheckResults, model_repo: str, revision: str) -> bool:
-    """Check 9: Vocab size matches teacher."""
+    """Check 10: Vocab size matches official Quasar base."""
     from huggingface_hub import hf_hub_download
     try:
         config_path = hf_hub_download(repo_id=model_repo, filename="config.json", revision=revision)
@@ -386,10 +417,10 @@ def check_vocab_size(results: CheckResults, model_repo: str, revision: str) -> b
         if vocab_size != BASELINE_VOCAB_SIZE:
             results.add("Vocab size", False,
                          f"Got {vocab_size}, expected {BASELINE_VOCAB_SIZE}",
-                         f"Your model's vocab_size must be {BASELINE_VOCAB_SIZE} (same as teacher {TEACHER_MODEL}). "
+                         f"Your model's vocab_size must be {BASELINE_VOCAB_SIZE} (same as {TOKENIZER_REFERENCE_MODEL}). "
                          f"You may need to resize embeddings or use the correct tokenizer.")
             return False
-        results.add("Vocab size", True, f"{vocab_size} (matches teacher)")
+        results.add("Vocab size", True, f"{vocab_size} (matches official base)")
         return True
     except Exception as e:
         results.add("Vocab size", False, f"Could not check: {e}",
@@ -398,10 +429,10 @@ def check_vocab_size(results: CheckResults, model_repo: str, revision: str) -> b
 
 
 def check_tokenizer_encoding(results: CheckResults, model_repo: str, revision: str) -> bool:
-    """Check 10: Tokenizer encoding matches teacher on test strings."""
+    """Check 11: Tokenizer encoding matches official base on test strings."""
     from transformers import AutoTokenizer
     try:
-        teacher_tok = AutoTokenizer.from_pretrained(TEACHER_MODEL, trust_remote_code=True)
+        teacher_tok = AutoTokenizer.from_pretrained(TOKENIZER_REFERENCE_MODEL, trust_remote_code=True)
         student_tok = AutoTokenizer.from_pretrained(model_repo, revision=revision, trust_remote_code=False)
 
         mismatches = []
@@ -410,18 +441,18 @@ def check_tokenizer_encoding(results: CheckResults, model_repo: str, revision: s
             student_ids = student_tok.encode(test_str)
             if teacher_ids != student_ids:
                 mismatches.append(
-                    f"String {i + 1}: teacher={len(teacher_ids)} tokens, student={len(student_ids)} tokens"
+                    f"String {i + 1}: base={len(teacher_ids)} tokens, student={len(student_ids)} tokens"
                 )
 
         if mismatches:
             results.add("Tokenizer encoding", False,
                          f"{len(mismatches)} mismatch(es): {'; '.join(mismatches)}",
-                         "Your tokenizer produces different token IDs than the teacher. "
+                         "Your tokenizer produces different token IDs than the official base. "
                          "Copy the tokenizer files (tokenizer.json, tokenizer_config.json, etc.) "
-                         f"directly from {TEACHER_MODEL}.")
+                         f"directly from {TOKENIZER_REFERENCE_MODEL}.")
             return False
         results.add("Tokenizer encoding", True,
-                     f"All {len(TOKENIZER_TEST_STRINGS)} test strings match teacher")
+                     f"All {len(TOKENIZER_TEST_STRINGS)} test strings match official base")
         return True
     except Exception as e:
         results.add_warn("Tokenizer encoding",
@@ -430,7 +461,7 @@ def check_tokenizer_encoding(results: CheckResults, model_repo: str, revision: s
 
 
 def check_chat_template(results: CheckResults, model_repo: str, revision: str) -> bool:
-    """Check 11: Chat template matches reference hash."""
+    """Check 12: Chat template matches reference hash."""
     from huggingface_hub import hf_hub_download
     try:
         student_template = ""
@@ -460,7 +491,7 @@ def check_chat_template(results: CheckResults, model_repo: str, revision: str) -
         if not student_template:
             results.add("Chat template", False,
                          "No chat template found in tokenizer_config.json or chat_template.jinja",
-                         f"Copy the chat template from {TEACHER_MODEL}. Download its tokenizer_config.json "
+                         f"Copy the chat template from {TOKENIZER_REFERENCE_MODEL}. Download its tokenizer_config.json "
                          "and include the chat_template field in yours.")
             return False
 
@@ -482,8 +513,8 @@ def check_chat_template(results: CheckResults, model_repo: str, revision: str) -
 
         results.add("Chat template", False,
                      f"Hash mismatch: {template_hash[:16]}... ≠ {REFERENCE_TEMPLATE_HASH[:16]}...",
-                     f"Your chat template doesn't match the reference Qwen3.5 template. "
-                     f"Copy the exact chat_template from {TEACHER_MODEL}'s tokenizer_config.json. "
+                     f"Your chat template doesn't match the reference Quasar template. "
+                     f"Copy the exact chat_template from {TOKENIZER_REFERENCE_MODEL}'s tokenizer_config.json. "
                      f"Do not add comments, watermarks, or modifications.")
         return False
     except Exception as e:
@@ -646,16 +677,19 @@ def run_all_checks(model_repo: str, revision: str = None,
     # 8. No quantization
     check_no_quantization(results, model_repo, revision)
 
-    # 9. Vocab size
+    # 9. Quasar config
+    check_quasar_config(results, model_repo, revision)
+
+    # 10. Vocab size
     check_vocab_size(results, model_repo, revision)
 
-    # 10. Tokenizer encoding
+    # 11. Tokenizer encoding
     check_tokenizer_encoding(results, model_repo, revision)
 
-    # 11. Chat template
+    # 12. Chat template
     check_chat_template(results, model_repo, revision)
 
-    # 12. Model hash
+    # 13. Model hash
     check_model_hash(results, model_repo, revision)
 
     # 13. Bittensor version
@@ -714,7 +748,8 @@ def main():
         print(f"  Revision: {args.revision}")
     if args.wallet_name:
         print(f"  Wallet: {args.wallet_name} / {args.hotkey_name}")
-    print(f"  Teacher: {TEACHER_MODEL}")
+    print(f"  Base checkpoint: {BASE_MODEL}")
+    print(f"  KL teacher: {TEACHER_MODEL}")
     print(f"  Max params: {MAX_PARAMS_B}B")
 
     results = run_all_checks(
