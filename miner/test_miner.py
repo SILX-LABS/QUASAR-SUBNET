@@ -27,6 +27,7 @@ try:
         TEACHER_MODEL,
         BASE_MODEL,
         TOKENIZER_REFERENCE_MODEL,
+        ALLOWED_CUSTOM_CODE_FILES,
         TEACHER_TOTAL_PARAMS_B,
         MAX_PARAM_RATIO,
         MAX_PARAMS_B,
@@ -42,6 +43,7 @@ except ModuleNotFoundError:
         TEACHER_MODEL,
         BASE_MODEL,
         TOKENIZER_REFERENCE_MODEL,
+        ALLOWED_CUSTOM_CODE_FILES,
         TEACHER_TOTAL_PARAMS_B,
         MAX_PARAM_RATIO,
         MAX_PARAMS_B,
@@ -175,20 +177,46 @@ def check_hf_accessibility(results: CheckResults, model_repo: str, revision: str
         return None
 
 
-def check_no_custom_code(results: CheckResults, info) -> bool:
-    """Check 2: No .py files in the repo (security)."""
+def check_no_custom_code(results: CheckResults, info, model_repo: str, revision: str) -> bool:
+    """Check 2: Only official Quasar runtime .py files are allowed."""
+    from huggingface_hub import hf_hub_download
     dangerous_files = []
+    allowed_code_files = []
     for sibling in (info.siblings or []):
         fname = sibling.rfilename
         if fname.endswith('.py') and fname != '__init__.py':
-            dangerous_files.append(fname)
+            if fname in ALLOWED_CUSTOM_CODE_FILES:
+                allowed_code_files.append(fname)
+            else:
+                dangerous_files.append(fname)
     if dangerous_files:
         results.add("No custom code", False,
                      f"Found Python files: {', '.join(dangerous_files)}",
-                     "Remove all .py files from your repo. Custom code (e.g., custom tokenizer.py) "
-                     "is a security risk and not allowed. Use standard HuggingFace architectures only.")
+                     "Only official Quasar runtime files are allowed.")
         return False
-    results.add("No custom code", True, "No .py files found in repo")
+
+    for fname in allowed_code_files:
+        try:
+            ref_path = hf_hub_download(repo_id=BASE_MODEL, filename=fname)
+            student_path = hf_hub_download(repo_id=model_repo, filename=fname, revision=revision)
+            with open(ref_path, "rb") as f:
+                ref_hash = hashlib.sha256(f.read()).hexdigest()
+            with open(student_path, "rb") as f:
+                student_hash = hashlib.sha256(f.read()).hexdigest()
+            if student_hash != ref_hash:
+                results.add("Official Quasar code", False,
+                            f"{fname} differs from {BASE_MODEL}",
+                            "Use the exact runtime code files from the official Quasar base.")
+                return False
+        except Exception as e:
+            results.add("Official Quasar code", False, f"Could not verify {fname}: {e}")
+            return False
+
+    detail = (
+        f"Allowed official files: {', '.join(sorted(allowed_code_files))}"
+        if allowed_code_files else "No .py files found in repo"
+    )
+    results.add("Custom code policy", True, detail)
     return True
 
 
@@ -655,7 +683,7 @@ def run_all_checks(model_repo: str, revision: str = None,
         return results
 
     # 2. No custom code
-    check_no_custom_code(results, info)
+    check_no_custom_code(results, info, model_repo, revision)
 
     # 3. Safetensors required
     st_files, pt_files = check_safetensors_required(results, info)

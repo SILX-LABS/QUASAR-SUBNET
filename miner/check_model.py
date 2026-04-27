@@ -52,6 +52,7 @@ try:
         TEACHER_MODEL,
         BASE_MODEL,
         TOKENIZER_REFERENCE_MODEL,
+        ALLOWED_CUSTOM_CODE_FILES,
         TEACHER_TOTAL_PARAMS_B,
         MAX_PARAM_RATIO,
         MAX_PARAMS_B,
@@ -64,6 +65,7 @@ except ModuleNotFoundError:
         TEACHER_MODEL,
         BASE_MODEL,
         TOKENIZER_REFERENCE_MODEL,
+        ALLOWED_CUSTOM_CODE_FILES,
         TEACHER_TOTAL_PARAMS_B,
         MAX_PARAM_RATIO,
         MAX_PARAMS_B,
@@ -243,20 +245,47 @@ def main(model_repo, revision, run_eval, prompts, max_new_tokens, teacher_cache,
     # ══════════════════════════════════════════════════════════════════════
     banner("CHECK 2: Security — No Custom Code")
     dangerous_files = []
+    allowed_code_files = []
     all_files = []
     for sibling in (info.siblings or []):
         fname = sibling.rfilename
         all_files.append(fname)
         if fname.endswith('.py') and fname != '__init__.py':
-            dangerous_files.append(fname)
+            if fname in ALLOWED_CUSTOM_CODE_FILES:
+                allowed_code_files.append(fname)
+            else:
+                dangerous_files.append(fname)
 
     if dangerous_files:
         check_fail("No custom code",
                     f"Found Python files: {', '.join(dangerous_files)}. "
-                    f"Custom code is NOT allowed — students must use standard architectures only.")
+                    f"Only official Quasar runtime files are allowed.")
         failures.append(("custom_code", f"Files: {', '.join(dangerous_files)}"))
     else:
-        check_pass("No custom code", "No .py files found in repo")
+        code_mismatch = False
+        for fname in allowed_code_files:
+            try:
+                ref_path = hf_hub_download(repo_id=BASE_MODEL, filename=fname)
+                student_path = hf_hub_download(repo_id=model_repo, filename=fname, revision=revision)
+                with open(ref_path, "rb") as f:
+                    ref_hash = hashlib.sha256(f.read()).hexdigest()
+                with open(student_path, "rb") as f:
+                    student_hash = hashlib.sha256(f.read()).hexdigest()
+                if student_hash != ref_hash:
+                    check_fail("Official Quasar code",
+                               f"{fname} differs from {BASE_MODEL}")
+                    failures.append(("custom_code", f"{fname} hash mismatch"))
+                    code_mismatch = True
+            except Exception as e:
+                check_fail("Official Quasar code", f"Could not verify {fname}: {e}")
+                failures.append(("custom_code", f"{fname}: {e}"))
+                code_mismatch = True
+        if not code_mismatch:
+            detail = (
+                f"Allowed official files: {', '.join(sorted(allowed_code_files))}"
+                if allowed_code_files else "No .py files found in repo"
+            )
+            check_pass("Custom code policy", detail)
 
     # ══════════════════════════════════════════════════════════════════════
     # CHECK 3: Weight file format (safetensors required)

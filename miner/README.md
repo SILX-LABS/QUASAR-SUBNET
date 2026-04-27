@@ -20,8 +20,8 @@ Key config values:
   "model_type": "quasar",
   "vocab_size": 248320,
   "top_k": 4,
-  "shared_expert_size": 1536,
-  "routed_expert_size": 512
+  "shared_expert_size": 3072,
+  "routed_expert_size": 256
 }
 ```
 

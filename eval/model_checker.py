@@ -21,6 +21,7 @@ from eval.runtime import (
     STATE_DIR as RUNTIME_STATE_DIR,
     STUDENT,
     STUDENT_BASE_MODEL,
+    STUDENT_BASE_REVISION,
     STUDENT_VOCAB_SIZE,
     TEACHER_CONFIG_VOCAB_SIZE,
     TEACHER_MODEL,
@@ -35,23 +36,57 @@ STATE_DIR = Path(RUNTIME_STATE_DIR)
 QUASAR_CONFIG_REQUIREMENTS = {
     "model_type": STUDENT.get("architecture", "quasar"),
     "vocab_size": STUDENT.get("vocabSize", 248320),
-    "d_model": STUDENT.get("dModel", 2048),
-    "n_heads": STUDENT.get("nHeads", 16),
-    "n_layers": STUDENT.get("nLayers", 20),
-    "d_ff": STUDENT.get("dFf", 5632),
-    "num_shared_experts": STUDENT.get("numSharedExperts", 1),
-    "num_routed_experts": STUDENT.get("numRoutedExperts", 48),
-    "top_k": STUDENT.get("topK", 4),
-    "shared_expert_size": STUDENT.get("sharedExpertSize", 1536),
-    "routed_expert_size": STUDENT.get("routedExpertSize", 512),
+    "d_model": STUDENT.get("dModel", 1536),
+    "n_heads": STUDENT.get("nHeads", 12),
+    "n_layers": STUDENT.get("nLayers", 24),
+    "d_ff": STUDENT.get("dFf", 4096),
+    "head_dim": STUDENT.get("headDim", 128),
+    "max_seq_len": STUDENT.get("maxSeqLen", 16384),
+    "dropout": STUDENT.get("dropout", 0.0),
+    "rms_norm_eps": STUDENT.get("rmsNormEps", 0.000001),
+    "initializer_range": STUDENT.get("initializerRange", 0.02),
+    "use_cache": STUDENT.get("useCache", True),
+    "tie_word_embeddings": STUDENT.get("tieWordEmbeddings", False),
     "quasar_layers": STUDENT.get("quasarLayers", 4),
     "gated_layers": STUDENT.get("gatedLayers", 2),
+    "use_gla_first": STUDENT.get("useGlaFirst", False),
+    "use_short_conv": STUDENT.get("useShortConv", True),
+    "conv_size": STUDENT.get("convSize", 4),
+    "conv_bias": STUDENT.get("convBias", False),
+    "allow_neg_eigval": STUDENT.get("allowNegEigval", False),
+    "attn_mode": STUDENT.get("attnMode", "chunk"),
+    "expand_k": STUDENT.get("expandK", 0.5),
+    "expand_v": STUDENT.get("expandV", 1.0),
+    "gla_mode": STUDENT.get("glaMode", "chunk"),
+    "memory_slots": STUDENT.get("memorySlots", 128),
+    "memory_dim": STUDENT.get("memoryDim", 128),
+    "moe_type": STUDENT.get("moeType", "bigmac"),
+    "num_shared_experts": STUDENT.get("numSharedExperts", 1),
+    "num_routed_experts": STUDENT.get("numRoutedExperts", 64),
+    "top_k": STUDENT.get("topK", 4),
+    "shared_expert_size": STUDENT.get("sharedExpertSize", 3072),
+    "routed_expert_size": STUDENT.get("routedExpertSize", 256),
     "dense_input_layers": STUDENT.get("denseInputLayers", 4),
-    "max_seq_len": STUDENT.get("maxSeqLen", 16384),
+    "bigmac_r": STUDENT.get("bigmacR", 0.25),
+    "moe_z_loss_coeff": STUDENT.get("moeZLossCoeff", 0.0001),
+    "moe_aux_loss_coeff": STUDENT.get("moeAuxLossCoeff", 0.0001),
+    "smebu_kappa": STUDENT.get("smebuKappa", 2.0),
+    "smebu_lambda": STUDENT.get("smebuLambda", 0.002),
+    "smebu_beta": STUDENT.get("smebuBeta", 0.5),
     "num_loops": STUDENT.get("numLoops", 1),
+    "use_looped_injection": STUDENT.get("useLoopedInjection", False),
+    "looped_injection_init": STUDENT.get("loopedInjectionInit", 0.1),
     "rope_theta": STUDENT.get("ropeTheta", 1000000.0),
     "hidden_act": STUDENT.get("hiddenAct", "silu"),
+    "residual_scale": STUDENT.get("residualScale", 0.1),
+    "bos_token_id": STUDENT.get("bosTokenId", 1),
+    "eos_token_id": STUDENT.get("eosTokenId", 2),
+    "auto_map": STUDENT.get("autoMap", {
+        "AutoConfig": "configuration_quasar.QuasarConfig",
+        "AutoModelForCausalLM": "modeling_quasar.QuasarForCausalLM",
+    }),
 }
+ALLOWED_CUSTOM_CODE_FILES = set(STUDENT.get("allowedCustomCodeFiles", []))
 
 
 def _quasar_config_mismatches(config: dict) -> list[str]:
@@ -732,23 +767,51 @@ def check_model_architecture(
     Returns dict with pass, reason, params_b, active_params_b, vocab_size
     """
     try:
-        # 0. SECURITY: Reject repos with custom Python code files
-        # This blocks exploits like tokenizer.py that monkey-patch json.dump
+        # 0. SECURITY: Reject arbitrary Python code. Quasar requires two custom
+        # code files, but they must be byte-identical to the official base repo.
         info = None  # may be set below; used later by assess_vllm_compatibility
         try:
             info = model_info(model_repo, revision=revision, files_metadata=True)
             dangerous_files = []
+            allowed_code_files = []
             for sibling in (info.siblings or []):
                 fname = sibling.rfilename
                 if fname.endswith('.py') and fname != '__init__.py':
-                    dangerous_files.append(fname)
+                    if fname in ALLOWED_CUSTOM_CODE_FILES:
+                        allowed_code_files.append(fname)
+                    else:
+                        dangerous_files.append(fname)
             if dangerous_files:
                 return {
                     "pass": False,
                     "reason": f"SECURITY: Repo contains custom code files ({', '.join(dangerous_files)}). "
-                              f"Custom code is not allowed — students must use standard architectures only.",
+                              f"Only official Quasar runtime files are allowed.",
                     "params_b": 0,
                 }
+            for fname in allowed_code_files:
+                ref_path = hf_hub_download(
+                    repo_id=STUDENT_BASE_MODEL,
+                    filename=fname,
+                    revision=STUDENT_BASE_REVISION,
+                )
+                student_path = hf_hub_download(
+                    repo_id=model_repo,
+                    filename=fname,
+                    revision=revision,
+                )
+                with open(ref_path, "rb") as f:
+                    ref_hash = hashlib.sha256(f.read()).hexdigest()
+                with open(student_path, "rb") as f:
+                    student_hash = hashlib.sha256(f.read()).hexdigest()
+                if student_hash != ref_hash:
+                    return {
+                        "pass": False,
+                        "reason": (
+                            f"SECURITY: {fname} differs from official Quasar base. "
+                            f"Custom runtime code must be byte-identical to {STUDENT_BASE_MODEL}."
+                        ),
+                        "params_b": 0,
+                    }
         except Exception as e:
             logger.warning(f"Could not check repo files for {model_repo}: {e}")
 
