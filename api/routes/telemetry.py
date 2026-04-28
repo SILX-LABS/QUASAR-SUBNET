@@ -1,6 +1,6 @@
 """Telemetry endpoints — expanded visibility for miners & auditors.
 
-Rolls up data from disqualified.json, h2h_latest.json, last_eval.json,
+Rolls up data from disqualified.json, latest round state, last_eval.json,
 current_round.json, validator_log.json, private_pool_commit.json, etc.
 into dashboard-friendly payloads so miners can self-diagnose.
 """

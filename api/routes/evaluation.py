@@ -1,4 +1,4 @@
-"""Evaluation endpoints: H2H, leaderboard, eval progress, history, benchmarks, announcements."""
+"""Evaluation endpoints: leaderboard, round state, eval progress, history, benchmarks, announcements."""
 
 import asyncio
 import fcntl
@@ -17,12 +17,12 @@ from state_store import (
     current_round,
     eval_data_file,
     eval_progress,
-    h2h_history,
-    h2h_latest,
-    h2h_tested_against_king,
+    latest_round,
     normalize_eval_progress,
     read_json_file,
     read_state,
+    round_history,
+    rounds_tested_against_king,
     score_history,
     scores,
     composite_scores,
@@ -40,7 +40,7 @@ def get_leaderboard():
     top4 = top4_leaderboard() or {}
     scores_data = scores()
     composite_data = composite_scores()
-    latest = h2h_latest()
+    latest = latest_round()
     uid_map = uid_hotkey_map()
     commitments_data = _get_stale("commitments") or {}
     commitments = commitments_data.get("commitments", {})
@@ -99,7 +99,7 @@ def get_leaderboard():
         return entry
 
     king_data = dict(top4.get("king") or {}) if top4.get("king") else None
-    # h2h_latest is the current applied king; composite_scores is the ranking
+    # latest_round is the current applied king; composite_scores is the ranking
     # table behind that decision.
     if latest.get("king_uid") is not None:
         if not king_data or king_data.get("uid") != latest["king_uid"]:
@@ -296,8 +296,8 @@ Response:
 - `students_total` / `students_done` / `prompts_total` / `prompts_done`: progress counters
 - `slots[]`: ordered list of `{uid, model, role, status}` where `status` ∈
   `running` | `done` | `pending`. `role` is `king` | `challenger` | `reference`.
-- `top4_leaderboard_contenders[]`: UIDs that the H2H leaderboard expects to be
-  in this round. Useful for miners verifying they weren't dropped.
+- `top4_leaderboard_contenders[]`: Legacy compatibility field. In production
+  single-eval mode, king selection comes from composite scores.
 
 Cache: 5 s.
 """)
@@ -354,20 +354,20 @@ def get_queue():
     )
 
 
-@router.get("/api/h2h-latest", tags=["Evaluation"], summary="Latest head-to-head round",
-         description="""Returns results from the most recent evaluation round where miners compete against the king.
+@router.get("/api/latest-round", tags=["Evaluation"], summary="Latest evaluation round",
+         description="""Returns results from the most recent composite evaluation round.
 
 Response includes:
 - `block`: Block when this round was scored
 - `king_uid`: Current king's UID
-- `king_h2h_kl`: King's KL-axis telemetry in this round
+- `king_h2h_kl`: Legacy field name for the king's KL-axis telemetry in this round
 - `king_global_kl`: King's persisted KL-axis telemetry
 - `composite`: Per-axis composite score used for ranking
 - `n_prompts`: Number of prompts used
 - `results[]`: Array of `{uid, model, kl, is_king, vs_king}` for each evaluated miner
 - `king_changed`: Whether the king changed after composite ranking
 """)
-def get_h2h_latest():
+def get_latest_round():
     path = os.path.join(STATE_DIR, "h2h_latest.json")
     if os.path.exists(path):
         try:
@@ -376,12 +376,17 @@ def get_h2h_latest():
             return _sanitize_floats(data)
         except Exception:
             pass
-    return {"error": "No H2H data yet"}
+    return {"error": "No evaluation round data yet"}
 
 
-@router.get("/api/h2h-history", tags=["Evaluation"], summary="Head-to-head round history",
+@router.get("/api/h2h-latest", include_in_schema=False)
+def get_h2h_latest():
+    return get_latest_round()
+
+
+@router.get("/api/round-history", tags=["Evaluation"], summary="Evaluation round history",
          description="Returns evaluation rounds with pagination. Supports `?limit=N` (default 50, max 200) and `?page=N` (1-indexed, default 1). Returns newest rounds first when paginated.")
-def get_h2h_history(limit: int = 50, page: int = 1):
+def get_round_history(limit: int = 50, page: int = 1):
     limit = max(1, min(limit, 200))
     page = max(1, page)
     path = os.path.join(STATE_DIR, "h2h_history.json")
@@ -430,10 +435,15 @@ def get_h2h_history(limit: int = 50, page: int = 1):
     )
 
 
+@router.get("/api/h2h-history", include_in_schema=False)
+def get_h2h_history(limit: int = 50, page: int = 1):
+    return get_round_history(limit=limit, page=page)
+
+
 @router.get("/api/king-history", tags=["Evaluation"], summary="King dethronement history",
          description="Returns the chain of king changes (dethronements). Each entry shows the block, new king, and the dethroned UID with margin of victory.")
 def get_king_history():
-    """Extract all king changes from h2h_history.json."""
+    """Extract all king changes from round history."""
     path = os.path.join(STATE_DIR, "h2h_history.json")
     if not os.path.exists(path):
         return JSONResponse(content=[], headers={"Cache-Control": "public, max-age=10"})
@@ -500,11 +510,11 @@ def get_king_history():
 Useful for monitoring eval pipeline health and performance over time.
 """)
 def get_eval_stats():
-    h2h_history = _safe_json_load(os.path.join(STATE_DIR, "h2h_history.json"), [])
-    if not h2h_history:
+    rounds = round_history()
+    if not rounds:
         return JSONResponse(content={"rounds": 0}, headers={"Cache-Control": "public, max-age=30"})
 
-    recent = h2h_history[-20:]  # last 20 rounds
+    recent = rounds[-20:]  # last 20 rounds
     timings = [r.get("elapsed_seconds") for r in recent if r.get("elapsed_seconds")]
     student_counts = [r.get("n_students") or len(r.get("results", [])) for r in recent]
     king_kls = [r.get("king_kl") for r in recent if r.get("king_kl")]
@@ -515,7 +525,7 @@ def get_eval_stats():
     intervals = [timestamps[i+1] - timestamps[i] for i in range(len(timestamps)-1) if timestamps[i+1] > timestamps[i]]
 
     stats = {
-        "total_rounds": len(h2h_history),
+        "total_rounds": len(rounds),
         "recent_rounds": len(recent),
         "dethronements_recent": dethronements,
         "timing": {
@@ -555,8 +565,8 @@ Statuses: king, queued, tested, stale, untested, disqualified.""")
 def get_eval_status():
     scores_data = scores()
     dq = read_state("disqualified.json", {})
-    h2h_tracker = h2h_tested_against_king()
-    latest = h2h_latest()
+    h2h_tracker = rounds_tested_against_king()
+    latest = latest_round()
     current_king_uid = latest.get("king_uid")
     current_block = latest.get("block", 0)
 
@@ -592,7 +602,7 @@ def get_history(limit: int = 50):
     entries = history_entries[-limit:] if len(history_entries) > limit else history_entries
 
     full_eval_block = None
-    full_eval_round = next((r for r in reversed(h2h_history()) if r.get("type") == "full_eval"), None)
+    full_eval_round = next((r for r in reversed(round_history()) if r.get("type") == "full_eval"), None)
     if full_eval_round:
         raw_block = full_eval_round.get("block")
         full_eval_ts = full_eval_round.get("timestamp")
@@ -674,14 +684,14 @@ def get_benchmarks():
          description="""One round-trip snapshot used by the landing page.
 
 Bundles the most commonly-fetched state (king, top-N contenders, eval progress,
-latest H2H, price, health) so clients don't have to fan out 7+ requests.
+latest round, price, health) so clients don't have to fan out 7+ requests.
 """)
 def get_dashboard():
     from state_store import disqualified as load_disqualified
 
     from helpers.cache import _get_stale as _cache_get
     try:
-        latest = h2h_latest() or {}
+        latest = latest_round() or {}
         top4 = top4_leaderboard() or {}
         prog = normalize_eval_progress(eval_progress())
         scores_data = scores()
@@ -717,7 +727,7 @@ def get_dashboard():
                 "eval_order": prog.get("eval_order"),
                 "teacher_prompts_done": prog.get("teacher_prompts_done"),
             },
-            "h2h_latest": latest,
+            "latest_round": latest,
             "price": {
                 "alpha_price_tao": price.get("alpha_price_tao"),
                 "alpha_price_usd": price.get("alpha_price_usd"),
@@ -780,10 +790,10 @@ async def eval_stream(request: Request):
                 latest_mtime = os.path.getmtime(latest_path) if os.path.exists(latest_path) else 0.0
                 if prog_mtime != last_prog_mtime or latest_mtime != last_latest_mtime:
                     progress = normalize_eval_progress(eval_progress())
-                    latest = h2h_latest()
+                    latest = latest_round()
                     payload = json.dumps(_sanitize_floats({
                         "progress": progress,
-                        "h2h_latest": latest,
+                        "latest_round": latest,
                         "t": time.time(),
                     }))
                     if payload != last_payload:

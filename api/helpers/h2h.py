@@ -1,7 +1,7 @@
-"""Shared head-to-head history reader used by /api/miner, /api/compare, etc.
+"""Shared round history reader used by /api/miner, /api/compare, etc.
 
-Before this module every endpoint reloaded `h2h_history.json` with a linear
-scan. We now load once per request, index by UID, and expose narrow helpers.
+The validator still writes the legacy `h2h_history.json` filename, but the
+records are production composite evaluation rounds.
 """
 
 import os

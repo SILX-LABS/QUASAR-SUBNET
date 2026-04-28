@@ -10,10 +10,10 @@ from helpers.cache import _get_stale
 from helpers.sanitize import _sanitize_floats
 from state_store import (
     eval_progress,
-    h2h_history,
-    h2h_latest,
-    h2h_tested_against_king,
+    latest_round,
     normalize_eval_progress,
+    round_history,
+    rounds_tested_against_king,
     scores,
     uid_hotkey_map,
 )
@@ -157,7 +157,7 @@ def _current_eval(progress, commitments):
 
 def _queue(commitments, history_rows):
     scored = {str(k) for k in scores().keys()}
-    tested = h2h_tested_against_king() or {}
+    tested = rounds_tested_against_king() or {}
     recent = {row.get("uid") for row in history_rows[:50]}
     rows = []
     for uid, commit in sorted(commitments.items()):
@@ -177,8 +177,8 @@ def _queue(commitments, history_rows):
 @router.get("/api/dashboard.json", tags=["Dashboard"], summary="Compact static dashboard payload")
 def get_dashboard_json():
     commitments = _commitments_by_uid()
-    latest = h2h_latest() or {}
-    history = h2h_history()
+    latest = latest_round() or {}
+    history = round_history()
     hist_rows = _history_rows(history, commitments)
     king_uid = latest.get("king_uid")
     king_commit = commitments.get(king_uid, {})

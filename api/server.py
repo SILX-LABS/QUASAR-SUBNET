@@ -31,7 +31,7 @@ app = FastAPI(
         {"name": "Overview", "description": "API info and health checks"},
         {"name": "Metagraph", "description": "On-chain subnet data - UIDs, stakes, weights, incentive"},
         {"name": "Miners", "description": "Miner model commitments and scores"},
-        {"name": "Evaluation", "description": "Live eval progress, head-to-head rounds, and score history"},
+        {"name": "Evaluation", "description": "Live eval progress, composite rounds, and score history"},
         {"name": "Market", "description": "Token pricing, emission, and market data"},
         {"name": "Chat", "description": "Chat with the current king model (when GPU is available)"},
         {"name": "Telemetry", "description": "Dashboard telemetry — composite axes, DQs, validator events, pod health"},

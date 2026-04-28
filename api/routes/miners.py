@@ -12,10 +12,10 @@ from helpers.h2h import compact_round, index_by_uid, load_history, rounds_for_ui
 from helpers.sanitize import _safe_json_load, _sanitize_floats
 from state_store import (
     disqualified,
-    h2h_latest,
-    h2h_tested_against_king,
     last_eval,
+    latest_round,
     read_state,
+    rounds_tested_against_king,
     scores as load_scores,
     composite_scores,
     uid_hotkey_map,
@@ -121,7 +121,7 @@ Response includes:
 - `commitment`: Model repo, revision, and commitment block
 - `kl_score`: KL-axis telemetry
 - `disqualified`: Disqualification status and reason (if any)
-- `h2h_history`: Last 10 head-to-head rounds involving this UID
+- `round_history`: Last 10 evaluation rounds involving this UID
 - `in_top5`: Whether this UID is in the top 5 (king or contender)
 - `is_king`: Whether this UID is the current king
 - `registered`: Whether this UID is registered in the metagraph
@@ -184,7 +184,7 @@ def get_miner(uid: int):
     result["disqualified"] = dq_reason
 
     # Composite top set / king status
-    latest = h2h_latest()
+    latest = latest_round()
     king_uid = latest.get("king_uid")
     result["is_king"] = king_uid == uid
     top5_uids = set()
@@ -205,7 +205,7 @@ def get_miner(uid: int):
     result["in_top5"] = uid in top5_uids
 
     # Eval status: why (not) evaluated
-    h2h_tracker = h2h_tested_against_king()
+    h2h_tracker = rounds_tested_against_king()
     current_king_uid = latest.get("king_uid")
     current_block = latest.get("block", 0)
     tracker_entry = h2h_tracker.get(uid_str, {})
@@ -241,7 +241,7 @@ def get_miner(uid: int):
             eval_status["stale_after"] = STALE_EVAL_BLOCKS
         else:
             eval_status["status"] = "stale"
-            eval_status["reason"] = f"Due for re-test ({epochs_since} epochs since last H2H, threshold is {STALE_EVAL_BLOCKS})"
+            eval_status["reason"] = f"Due for re-test ({epochs_since} epochs since last evaluation, threshold is {STALE_EVAL_BLOCKS})"
             eval_status["last_test_block"] = last_block
             eval_status["epochs_since"] = epochs_since
     else:
@@ -261,11 +261,11 @@ def get_miner(uid: int):
         }
         for item in rounds_for_uid(h2h_index, uid, limit=10)
     ]
-    result["h2h_history"] = relevant
+    result["round_history"] = relevant
 
     # Composite axes: miners want to see their per-axis scores without parsing
     # /api/eval-data. Pull the latest matching entry straight from
-    # h2h_latest.results, which ``annotate_h2h_with_composite`` stamps
+    # latest round results, which the validator stamps with composite axes
     # every round.
     composite_entry = None
     for r in (latest.get("results") or []):
@@ -372,8 +372,8 @@ def get_model_hashes():
     )
 
 
-@router.get("/api/miner/{uid}/rounds", tags=["Miners"], summary="H2H rounds for a specific miner",
-         description="""Returns all head-to-head rounds where a specific UID participated.
+@router.get("/api/miner/{uid}/rounds", tags=["Miners"], summary="Evaluation rounds for a specific miner",
+         description="""Returns all evaluation rounds where a specific UID participated.
 
 Supports `?limit=N` (default 50, max 200) and `?page=N` (1-indexed). Newest rounds first.
 
@@ -383,7 +383,7 @@ Each round entry includes:
 - `kl`: This miner's KL score in that round
 - `is_king`: Whether the miner was king during this round
 - `king_changed`: Whether the king was dethroned
-- `type`: Round type (h2h or full_eval)
+- `type`: Round type
 - `king_uid`: Who was king that round
 - `n_prompts`: Number of prompts used
 """)
@@ -453,14 +453,14 @@ def get_commitment_by_hotkey(hotkey: str):
 
 
 @router.get("/api/compare", tags=["Miners"], summary="Compare two or more miners",
-         description="""Compare KL scores and H2H history for multiple UIDs side by side.
+         description="""Compare KL-axis telemetry and evaluation history for multiple UIDs side by side.
 
 Usage: `/api/compare?uids=2,34,36,218`
 
 Returns for each UID:
 - Current KL score
 - Model name
-- Number of H2H rounds participated
+- Number of evaluation rounds participated
 - Best KL ever achieved
 - Win/loss record vs king
 """)
@@ -473,7 +473,7 @@ def compare_miners(uids: str):
     uid_map = uid_hotkey_map()
     commitments_data = _get_stale("commitments") or {}
     commitments = commitments_data.get("commitments", {}) if isinstance(commitments_data, dict) else {}
-    latest = h2h_latest()
+    latest = latest_round()
     dq = disqualified()
     idx = index_by_uid(load_history())
 
@@ -514,7 +514,7 @@ def miners_batch(uids: str):
     uid_map = uid_hotkey_map()
     commitments_data = _get_stale("commitments") or {}
     commitments = commitments_data.get("commitments", {}) if isinstance(commitments_data, dict) else {}
-    latest = h2h_latest()
+    latest = latest_round()
     dq = disqualified()
 
     miners = []

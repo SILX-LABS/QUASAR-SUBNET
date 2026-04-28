@@ -9,7 +9,7 @@ from fastapi import APIRouter
 from fastapi.responses import RedirectResponse
 
 from config import NETUID
-from state_store import eval_progress, h2h_latest, progress_value, scores, disqualified
+from state_store import eval_progress, latest_round, progress_value, scores, disqualified
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 _REVISION_FILE_CANDIDATES = (
@@ -104,12 +104,12 @@ def health():
     eval_students_total = 0
     prog = {}
     try:
-        h2h = h2h_latest()
-        last_eval_block = h2h.get("block")
-        ts = h2h.get("timestamp")
+        latest = latest_round()
+        last_eval_block = latest.get("block")
+        ts = latest.get("timestamp")
         if ts:
             last_eval_age_min = round((_time.time() - ts) / 60, 1)
-        king_uid = h2h.get("king_uid")
+        king_uid = latest.get("king_uid")
         score_data = scores()
         n_scored = len(score_data)
         if king_uid is not None and str(king_uid) in score_data:

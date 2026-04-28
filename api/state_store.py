@@ -32,6 +32,13 @@ from helpers.sanitize import _safe_json_load
 REMOTE_STATE_BASE_URL = os.environ.get("QUASAR_STATE_BASE_URL", "").rstrip("/")
 REMOTE_STATE_TTL = int(os.environ.get("QUASAR_STATE_REMOTE_TTL", "10"))
 REMOTE_STATE_TIMEOUT = float(os.environ.get("QUASAR_STATE_REMOTE_TIMEOUT", "5"))
+STATE_BUCKET_NAME = os.environ.get("QUASAR_STATE_BUCKET_NAME") or os.environ.get("QUASAR_BUCKET_NAME", "")
+STATE_BUCKET_PREFIX = os.environ.get("QUASAR_STATE_KEY_PREFIX", "").strip("/")
+STATE_BUCKET_ENDPOINT_URL = os.environ.get("QUASAR_BUCKET_ENDPOINT_URL") or os.environ.get("AWS_ENDPOINT_URL_S3", "")
+STATE_BUCKET_REGION = os.environ.get("QUASAR_BUCKET_REGION") or os.environ.get("AWS_DEFAULT_REGION", "us-east-1")
+STATE_BUCKET_ADDRESSING_STYLE = os.environ.get("QUASAR_BUCKET_ADDRESSING_STYLE", "path")
+STATE_BUCKET_ACCESS_KEY = os.environ.get("QUASAR_BUCKET_ACCESS_KEY_ID") or os.environ.get("AWS_ACCESS_KEY_ID", "")
+STATE_BUCKET_SECRET_KEY = os.environ.get("QUASAR_BUCKET_SECRET_ACCESS_KEY") or os.environ.get("AWS_SECRET_ACCESS_KEY", "")
 
 
 def _read(path, default=None):
@@ -48,8 +55,6 @@ def _remote_cache_path(filename):
 def _read_remote_state(filename, default=None):
     if default is None:
         default = {}
-    if not REMOTE_STATE_BASE_URL:
-        return default
     cache_file = _remote_cache_path(filename)
     now = time.time()
     try:
@@ -57,21 +62,56 @@ def _read_remote_state(filename, default=None):
             return _safe_json_load(cache_file, default)
     except OSError:
         pass
-    url = f"{REMOTE_STATE_BASE_URL}/{filename.lstrip('/')}"
-    try:
-        import requests
+    if REMOTE_STATE_BASE_URL:
+        url = f"{REMOTE_STATE_BASE_URL}/{filename.lstrip('/')}"
+        try:
+            import requests
 
-        response = requests.get(url, timeout=REMOTE_STATE_TIMEOUT)
-        response.raise_for_status()
-        data = response.json()
+            response = requests.get(url, timeout=REMOTE_STATE_TIMEOUT)
+            response.raise_for_status()
+            data = response.json()
+            Path(cache_file).parent.mkdir(parents=True, exist_ok=True)
+            with open(cache_file, "w") as handle:
+                json.dump(data, handle)
+            return data
+        except Exception:
+            pass
+    data = _read_bucket_state(filename, cache_file, default)
+    if data is not default:
+        return data
+    if os.path.exists(cache_file):
+        return _safe_json_load(cache_file, default)
+    return default
+
+
+def _read_bucket_state(filename, cache_file, default=None):
+    if default is None:
+        default = {}
+    if not (STATE_BUCKET_NAME and STATE_BUCKET_ACCESS_KEY and STATE_BUCKET_SECRET_KEY):
+        return default
+    key = filename.lstrip("/")
+    if STATE_BUCKET_PREFIX:
+        key = f"{STATE_BUCKET_PREFIX}/{key}"
+    try:
+        import boto3
+        from botocore.config import Config
+
+        client = boto3.client(
+            "s3",
+            endpoint_url=STATE_BUCKET_ENDPOINT_URL or None,
+            aws_access_key_id=STATE_BUCKET_ACCESS_KEY,
+            aws_secret_access_key=STATE_BUCKET_SECRET_KEY,
+            region_name=STATE_BUCKET_REGION,
+            config=Config(s3={"addressing_style": STATE_BUCKET_ADDRESSING_STYLE}),
+        )
+        obj = client.get_object(Bucket=STATE_BUCKET_NAME, Key=key)
+        data = json.loads(obj["Body"].read().decode("utf-8"))
         Path(cache_file).parent.mkdir(parents=True, exist_ok=True)
         with open(cache_file, "w") as handle:
             json.dump(data, handle)
         return data
     except Exception:
-        if os.path.exists(cache_file):
-            return _safe_json_load(cache_file, default)
-    return default
+        return default
 
 
 def state_path(filename):
@@ -113,11 +153,11 @@ def current_round():
     return read_state(CURRENT_ROUND_FILE, {})
 
 
-def h2h_latest():
+def latest_round():
     return read_state(H2H_LATEST_FILE, {})
 
 
-def h2h_history():
+def round_history():
     data = read_state(H2H_HISTORY_FILE, [])
     return data if isinstance(data, list) else []
 
@@ -139,8 +179,22 @@ def uid_hotkey_map():
     return read_state(UID_HOTKEY_MAP_FILE, {})
 
 
-def h2h_tested_against_king():
+def rounds_tested_against_king():
     return read_state(H2H_TESTED_KING_FILE, {})
+
+
+# Legacy aliases. Validator state files still use the historical h2h_*.json
+# filenames, but public code should prefer the round-named helpers above.
+def h2h_latest():
+    return latest_round()
+
+
+def h2h_history():
+    return round_history()
+
+
+def h2h_tested_against_king():
+    return rounds_tested_against_king()
 
 
 def announcement():

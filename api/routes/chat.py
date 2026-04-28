@@ -22,7 +22,7 @@ from config import (
 from helpers.rate_limit import _chat_rate_limiter
 from helpers.sanitize import _safe_json_load
 from helpers.ssh import _ssh_exec, SshExecError
-from state_store import h2h_latest, read_cache, uid_hotkey_map
+from state_store import latest_round, read_cache, uid_hotkey_map
 
 router = APIRouter()
 
@@ -30,11 +30,11 @@ router = APIRouter()
 # ── King info helper ──────────────────────────────────────────────────────────
 
 def _get_king_info():
-    h2h = h2h_latest()
-    king_uid = h2h.get("king_uid")
+    latest = latest_round()
+    king_uid = latest.get("king_uid")
     if king_uid is None:
         return None, None
-    for r in h2h.get("results", []):
+    for r in latest.get("results", []):
         if r.get("is_king") or r.get("uid") == king_uid:
             return king_uid, r.get("model")
     commitments_data = read_cache("commitments", {})
