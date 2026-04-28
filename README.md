@@ -1,58 +1,90 @@
 # Quasar Subnet
 
-Quasar is SILX Labs' Bittensor subnet for distributed language-model
-distillation on subnet 24.
+**Bittensor subnet built to crush the long-context barrier | SN24 |**
 
-Miners start from the official Quasar base checkpoint, improve it through
-distillation, publish a public Hugging Face model repo, and commit that repo
-on-chain. Validators evaluate committed models head-to-head against the current
-king and assign weight to the best valid model.
+Quasar is SILX Labs' competitive small-model subnet on Bittensor. Miners train
+Quasar-compatible language models, publish them as public Hugging Face
+repositories, and commit the pinned model revision on-chain. Validators verify
+each valid commitment, score it with the production composite evaluator, and set
+weights to the current king.
 
 ## Network
 
 - Chain: Bittensor Finney
 - Netuid: 24
+- X: [`@QuasarModels`](https://x.com/QuasarModels)
 - Base checkpoint: [`silx-ai/Quasar-3B-A1B-Preview`](https://huggingface.co/silx-ai/Quasar-3B-A1B-Preview)
 - Launch teacher: [`Qwen/Qwen3.5-4B`](https://huggingface.co/Qwen/Qwen3.5-4B)
 - Model family: Quasar 3B total / about 1B active Mixture-of-Experts
-- Scoring: king-of-the-hill composite evaluation against the current king
+- Ranking: single-eval composite; KL is one axis, not the king-selection gate
+
+## How It Works
+
+Miners submit one public model repo per registered hotkey. Commitments are
+permanent for that hotkey. If a commitment is disqualified, the miner can
+register a new hotkey and submit a different model.
+
+Validators score committed models with a composite evaluator that covers the
+parts that matter for a useful long-context model:
+
+- Distribution match: teacher support KL and on-policy distribution checks.
+- Capability: math, code, reasoning, instruction following, tool use, long
+  context, and robustness probes.
+- Conversational quality: chat-turn and judge probes.
+- Generation discipline: reasoning-density and collapse checks that penalize
+  models that ramble, loop, or never answer.
+- Robustness: block-seeded procedural prompts and prompt rewrites so miners
+  cannot train against a static answer key.
+
+The king is the strongest valid model under the composite rule. Validators set
+one-hot weights on-chain: king `1.0`, everyone else `0.0`.
+
+## King-of-the-Hill Evaluation
+
+The validator uses a king-of-the-hill workflow for fast, high-confidence
+ranking:
+
+- Pre-checks run before GPU evaluation: architecture compliance, tokenizer
+  compatibility, public revision integrity, safetensors availability, duplicate
+  hashes, and quantization rejection.
+- Each eligible commitment is evaluated on a deterministic prompt set seeded by
+  the chain block context.
+- The reference Quasar checkpoint is included so weak or broken axes can be
+  handled consistently.
+- Each model receives normalized per-axis scores plus aggregate `worst` and
+  `weighted` composite scores.
+- King selection uses composite score, with KL treated as one distribution-fit
+  signal rather than the whole ranking system.
+- Weight setting happens after evaluation by assigning the current king the full
+  validator weight.
 
 ## Model Requirements
 
-Submitted models must preserve the official Quasar checkpoint structure:
+Submissions must match the official Quasar base interface. The canonical config
+is the `config.json` in
+[`silx-ai/Quasar-3B-A1B-Preview`](https://huggingface.co/silx-ai/Quasar-3B-A1B-Preview).
 
-```json
-{
-  "model_type": "quasar",
-  "vocab_size": 248320,
-  "d_model": 1536,
-  "n_heads": 12,
-  "n_layers": 24,
-  "d_ff": 4096,
-  "head_dim": 128,
-  "num_shared_experts": 1,
-  "num_routed_experts": 64,
-  "top_k": 4,
-  "shared_expert_size": 3072,
-  "routed_expert_size": 256,
-  "quasar_layers": 4,
-  "gated_layers": 2,
-  "dense_input_layers": 4,
-  "max_seq_len": 16384,
-  "num_loops": 1,
-  "rope_theta": 1000000.0,
-  "hidden_act": "silu"
-}
-```
+A valid model must:
 
-Submissions also need to be public Hugging Face repos with safetensors weights,
-a stable pinned revision, and the same tokenizer behavior as the official base
-checkpoint. Quantized uploads and incompatible architecture changes are not
-accepted.
+- Use the Quasar architecture and tokenizer.
+- Keep `vocab_size=248320`.
+- Stay within the current subnet parameter cap.
+- Provide public safetensors weights.
+- Include the expected Quasar custom code files.
+- Be loadable with `AutoModelForCausalLM.from_pretrained(..., trust_remote_code=True)`.
+- Stay public and unchanged after the committed revision.
+- Avoid quantized formats such as GPTQ, AWQ, GGUF, and FP8.
+- Use unique weights that are not identical to an earlier committed model.
 
-## Miner Quick Start
+## Mining Guide
 
-Install the project:
+Requirements:
+
+- Bittensor wallet registered on subnet 24.
+- Hugging Face account for model hosting.
+- Training infrastructure of your choice.
+
+Install the subnet package and Quasar attention dependency:
 
 ```bash
 pip install -e .
@@ -66,7 +98,7 @@ python miner/check_model.py --model-repo your-username/your-model
 python miner/test_miner.py --model-repo your-username/your-model
 ```
 
-Commit your model to subnet 24:
+Submit a dry run first:
 
 ```bash
 python miner/miner.py \
@@ -78,52 +110,65 @@ python miner/miner.py \
   --dry-run
 ```
 
-Remove `--dry-run` only after local checks pass. Treat each on-chain model
-commitment as permanent for that hotkey.
+Remove `--dry-run` only after the checks pass and you are ready to commit that
+repo revision on-chain.
 
-## Validator Quick Start
+## Validator Guide
 
-Install and run:
+Requirements:
+
+- Bittensor wallet registered as a validator on subnet 24.
+- Python 3.10+.
+- GPU capacity for the current evaluator.
+- Local wallet keys kept on the validator host.
+
+Quick start:
 
 ```bash
 pip install -e .
+pip install "git+https://github.com/SILX-LABS/quasar-flash-linear-attention.git"
 bash scripts/run_validator.sh
 ```
 
-Common environment variables:
+Common validator settings:
 
 ```bash
+QUASAR_NETWORK=finney
+QUASAR_NETUID=24
 QUASAR_WALLET_NAME=validator
 QUASAR_HOTKEY_NAME=validator
 QUASAR_WALLET_PATH=/path/to/wallets
 QUASAR_STATE_DIR=/path/to/state
-QUASAR_EVAL_BACKEND=lium
-LIUM_API_KEY=...
 ```
 
-For a validator with its own GPU:
+Keep wallet files, provider keys, Hugging Face tokens, and state credentials out
+of git. Use a private environment file or your process manager's secret store.
 
-```bash
-QUASAR_EVAL_BACKEND=local
-QUASAR_LOCAL_EVAL_DIR=/path/to/local_eval_runs
-```
+## Disqualification
 
-## Dashboard
+Models are disqualified for the current commitment when they fail production
+checks:
 
-The public dashboard shows the current king, active evaluations, queue, and
-duel history. During an active validation it displays progress, `MU_HAT`,
-`LCB`, aggregate loss gap, king loss, challenger loss, and wall time.
+- `COPY`: identical or near-identical weights to an earlier valid commitment.
+- `REMOVED`: model deleted, made private, or changed after the committed
+  revision.
+- `INVALID`: incompatible architecture, tokenizer, custom code, parameter cap,
+  format, or quantization.
+- `EVAL_ERROR`: repeated non-transient failure during validator evaluation.
 
-## Development Checks
+Disqualification is scoped to the commitment. The on-chain commitment remains
+permanent, but the miner can register a new hotkey and submit a different model.
 
-```bash
-PYTHONPYCACHEPREFIX=/tmp/quasar_pycache python3 -m py_compile \
-  api/server.py api/routes/dashboard.py eval/runtime.py eval/model_checker.py \
-  scripts/remote_validator.py scripts/validator/results.py
+## Anti-Gaming
 
-cd frontend
-npm run build
-```
+- Weight hashes and content hashes are tracked for duplicate detection.
+- Earlier on-chain commitment owns an identical weight hash.
+- Re-sharded copies are checked through content hashing.
+- Public revision integrity is verified continuously.
+- Quantized submissions are rejected.
+- Prompt sets are block-seeded and not known before evaluation.
+- Composite scoring prevents a model from winning on KL while failing core
+  capability or generation-discipline checks.
 
 ## License
 

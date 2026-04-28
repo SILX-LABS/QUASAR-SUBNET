@@ -34,17 +34,17 @@ ANNOUNCEMENT_CLAIMS_KEEP = 50
 API_DESCRIPTION = f"""
 # Quasar - Subnet {NETUID} API
 
-Public API for [Quasar]({DASHBOARD_URL}), a Bittensor subnet where miners compete to produce the best knowledge-distilled small language models.
+Public API for Quasar, a Bittensor subnet built to crush the long-context barrier.
 
 ## How It Works
 
-Miners submit Quasar-compatible models and validators score them with the composite evaluator. KL is one distillation axis, while king selection uses composite worst/weighted scores.
+Miners submit Quasar-compatible models and validators score them with the composite evaluator. KL is one distribution-fit axis, while king selection uses composite worst/weighted scores. Validators set weights to the current king.
 
 ## Quick Start
 
 ```bash
-curl http://localhost:8000/api/health
-curl http://localhost:8000/api/scores
-curl http://localhost:8000/api/price
+curl /api/health
+curl /api/scores
+curl /api/price
 ```
 """
