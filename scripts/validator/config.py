@@ -4,7 +4,7 @@ from eval.runtime import (
     CHAT_POD_HOST,
     CHAT_POD_SSH_PORT,
     DASHBOARD_URL,
-    DISTIL_ROLE_ID,
+    QUASAR_ROLE_ID,
     EPSILON,
     EVAL_PROMPTS_FULL,
     EVAL_PROMPTS_H2H,

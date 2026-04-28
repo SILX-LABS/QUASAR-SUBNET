@@ -5,6 +5,8 @@ This implements the same small interface used by ``scripts.validator.pod_session
 without going through a rented Lium pod. It intentionally avoids broad GPU or
 cache cleanup by default because the local machine may be doing other work.
 """
+from __future__ import annotations
+
 import logging
 import os
 import shlex
@@ -136,16 +138,16 @@ class LocalPodManager:
         except Exception:
             return False
 
-    def ensure_dependencies(self, teacher_model: str = "Qwen/Qwen3.5-35B-A3B"):
+    def ensure_dependencies(self, teacher_model: str = "Qwen/Qwen3.5-4B"):
         del teacher_model
         check = (
             "import importlib.util, torch; "
-            "missing=[m for m in ('transformers','safetensors','huggingface_hub') "
+            "missing=[m for m in ('transformers','safetensors','huggingface_hub','fla') "
             "if importlib.util.find_spec(m) is None]; "
             "vllm=importlib.util.find_spec('vllm') is not None; "
             "print(f'torch={torch.__version__} cuda={torch.cuda.is_available()} "
             "devices={torch.cuda.device_count()} vllm={vllm}'); "
-            "raise SystemExit('missing dependencies: '+','.join(missing) if missing else 0)"
+            "raise SystemExit('missing dependencies: '+','.join(missing)+'; install SILX FLA from https://github.com/SILX-LABS/quasar-flash-linear-attention' if missing else 0)"
         )
         try:
             result = self.exec(f"{shlex.quote(self.python_bin)} -c {shlex.quote(check)}", timeout=60)
@@ -187,7 +189,7 @@ class LocalPodManager:
         if not root.exists():
             return
         cutoff = time.time() - max_age_hours * 3600
-        for path in root.glob("distil_eval_*"):
+        for path in root.glob("quasar_eval_*"):
             try:
                 if path.is_dir() and path.stat().st_mtime < cutoff:
                     self._remove_run_dir(path)
@@ -213,7 +215,7 @@ class LocalPodManager:
             logger.info("Local GPU cleanup skipped (set QUASAR_LOCAL_CLEAR_GPU=1 to enable)")
             return
         cmd = (
-            "for p in $(pgrep -f 'distil_eval_.*pod_eval.py' 2>/dev/null); do "
+            "for p in $(pgrep -f 'quasar_eval_.*pod_eval.py' 2>/dev/null); do "
             "  kill -9 \"$p\" 2>/dev/null || true; "
             "done; echo 'Local eval GPU jobs cleared'"
         )

@@ -1,10 +1,12 @@
 """
-Centralized state management for the Subnet 24 validator.
+Centralized state management for the Quasar SN24 validator.
 
 All JSON state files are managed through the ValidatorState class,
 which provides atomic writes, consistency validation, and a single
 source of truth for file paths.
 """
+from __future__ import annotations
+
 import json
 import math
 import os
@@ -53,6 +55,12 @@ SCORES_FILE = "scores.json"
 FAILURES_FILE = "failures.json"
 DISQUALIFIED_FILE = "disqualified.json"
 EVALUATED_UIDS_FILE = "evaluated_uids.json"
+# Per-UID canonical composite record. Each entry is
+# the absolute composite from the single eval that UID's current commitment
+# received. Used by SINGLE_EVAL_MODE to rank kings cross-round without
+# re-evaluating models, and by the API/dashboard to surface stable per-UID
+# scores. Format: {uid_str: {worst, weighted, axes, model, revision, block, ts}}.
+COMPOSITE_SCORES_FILE = "composite_scores.json"
 H2H_LATEST_FILE = "h2h_latest.json"
 H2H_HISTORY_FILE = "h2h_history.json"
 MODEL_SCORE_HISTORY_FILE = "model_score_history.json"
@@ -62,6 +70,13 @@ EVAL_PROGRESS_FILE = "eval_progress.json"
 CURRENT_ROUND_FILE = "current_round.json"
 TOP4_LEADERBOARD_FILE = "top4_leaderboard.json"
 H2H_TESTED_KING_FILE = "h2h_tested_against_king.json"
+# Per-king consecutive-at-risk round
+# counter. Tracks how many recent rounds the current king's composite
+# ``worst`` axis has been below the floor or below the base model. Read
+# by API/dashboard (``king_health`` badge) and, once
+# ``KING_REGRESSION_GATE=1`` flips, used by results.py to force
+# dethronement. Shadow until we've observed ≥1 week of data.
+KING_REGRESSION_FILE = "king_regression_streak.json"
 ANNOUNCEMENT_FILE = "announcement.json"
 MODEL_HASHES_FILE = "model_hashes.json"
 SCORE_HISTORY_FILE = "score_history.json"
@@ -124,11 +139,20 @@ class ValidatorState:
         self.failure_models: dict[str, str] = {}  # UID -> model_name at time of failure
         self.dq_reasons: dict[str, str] = {}
         self.evaluated_uids: set[str] = set()
+        # Canonical absolute composite per UID (one-eval-per-commitment).
+        # uid_str -> {"worst", "weighted", "axes", "model", "revision",
+        #             "block", "ts", "n_axes"}.
+        self.composite_scores: dict[str, dict] = {}
 
         # Head-to-head state
         self.h2h_latest: dict = {}
         self.h2h_history: list[dict] = []
         self.h2h_tested_against_king: dict = {}
+        # King regression streak (2026-04-24): maps stringified king_uid →
+        # consecutive round counter of "at risk" composite (below floor
+        # OR worse than base model). Shadow telemetry for the
+        # validator design discussion.
+        self.king_regression_streak: dict = {}
 
         # Model tracking
         self.model_score_history: dict = {}
@@ -160,10 +184,15 @@ class ValidatorState:
         raw = _load_json(self._path(EVALUATED_UIDS_FILE), [])
         self.evaluated_uids = set(raw) if isinstance(raw, list) else set()
 
+        raw_comp = _load_json(self._path(COMPOSITE_SCORES_FILE), {})
+        self.composite_scores = raw_comp if isinstance(raw_comp, dict) else {}
+
         self.h2h_latest = _load_json(self._path(H2H_LATEST_FILE), {})
         raw_history = _load_json(self._path(H2H_HISTORY_FILE), [])
         self.h2h_history = raw_history if isinstance(raw_history, list) else []
         self.h2h_tested_against_king = _load_json(self._path(H2H_TESTED_KING_FILE), {})
+        raw_streak = _load_json(self._path(KING_REGRESSION_FILE), {})
+        self.king_regression_streak = raw_streak if isinstance(raw_streak, dict) else {}
 
         self.model_score_history = _load_json(self._path(MODEL_SCORE_HISTORY_FILE), {})
         raw_bad = _load_json(self._path(PERMANENTLY_BAD_FILE), [])
@@ -193,12 +222,14 @@ class ValidatorState:
         atomic_json_write(self._path(DISQUALIFIED_FILE), self.dq_reasons, indent=2)
         atomic_json_write(self._path(EVALUATED_UIDS_FILE), list(self.evaluated_uids))
         atomic_json_write(self._path(UID_HOTKEY_MAP_FILE), self.uid_hotkey_map)
+        atomic_json_write(self._path(COMPOSITE_SCORES_FILE), self.composite_scores, indent=2)
 
     def save_h2h(self):
         """Persist head-to-head state files."""
         atomic_json_write(self._path(H2H_LATEST_FILE), self.h2h_latest, indent=2)
         atomic_json_write(self._path(H2H_HISTORY_FILE), self.h2h_history, indent=2)
         atomic_json_write(self._path(H2H_TESTED_KING_FILE), self.h2h_tested_against_king, indent=2)
+        atomic_json_write(self._path(KING_REGRESSION_FILE), self.king_regression_streak, indent=2)
 
     def save_model_tracking(self):
         """Persist model score history and permanently bad models."""
@@ -210,25 +241,70 @@ class ValidatorState:
         atomic_json_write(self._path(MODEL_HASHES_FILE), self.model_hashes, indent=2)
 
     def save_progress(self, data: dict = None):
-        """Write eval progress for dashboard live display."""
-        atomic_json_write(self._path(EVAL_PROGRESS_FILE), data or self.eval_progress)
+        """Write eval progress for dashboard live display.
+
+        When ``data`` is a full dict (``active`` is present and a bool),
+        replace both disk and ``self.eval_progress`` atomically —
+        full-round overwrites are the normal path.
+
+        When ``data`` is a partial update (e.g. ``{"failed": True}``),
+        merge it into ``self.eval_progress`` first and write the merged
+        result. This prevents the 220m phantom-age false-kill where a
+        round-end partial update truncated ``started_at`` out of the
+        on-disk progress, while the stale in-memory dict still said
+        ``active=True`` with a started_at from the validator's original
+        bootstrap — ``ensure_clean_state``'s ``age_min`` check then
+        computed ~3.5h and nuked a fresh, healthy round at ~1m age.
+        Production validator behaviour.
+        """
+        if data is None:
+            payload = dict(self.eval_progress)
+        else:
+            has_full_active = "active" in data and isinstance(data.get("active"), bool)
+            if has_full_active and len(data) > 3:
+                payload = dict(data)
+            else:
+                payload = dict(self.eval_progress)
+                payload.update(data)
+        atomic_json_write(self._path(EVAL_PROGRESS_FILE), payload)
+        self.eval_progress = payload
 
     def save_round(self, data: dict = None):
         """Save current round state for crash recovery."""
         atomic_json_write(self._path(CURRENT_ROUND_FILE), data or self.current_round)
 
     def clear_round(self):
-        """Clear round state after successful completion."""
+        """Clear round state after successful completion.
+
+        IMPORTANT: also resets the in-memory ``self.current_round`` dict.
+        Without that step the next epoch's ``_detect_resumable_round`` reads
+        the stale in-memory copy (still pointing at a dead pod ``run_dir``),
+        wrongly enters resume mode, and then aborts with
+        ``Resume: king UID … is no longer valid`` — which on 2026-04-25
+        repeatedly discarded fully-completed single-eval rounds. The on-disk
+        unlink without the in-memory reset was the actual root cause behind
+        commit 0b82081's residual recurrence.
+        """
         path = self._path(CURRENT_ROUND_FILE)
         if path.exists():
             path.unlink()
+        self.current_round = {}
 
     def save_top4(self):
         """Persist top-4 leaderboard."""
         atomic_json_write(self._path(TOP4_LEADERBOARD_FILE), self.top4_leaderboard, indent=2)
 
+    def save_composite_scores(self):
+        """Persist canonical per-UID composite scores immediately.
+
+        Used by single-eval bootstrap and merge so the validator can crash
+        or restart at any point without losing the ranking table. Cheaper
+        than ``save()`` (one file vs ~13).
+        """
+        atomic_json_write(self._path(COMPOSITE_SCORES_FILE), self.composite_scores, indent=2)
+
     def save_announcement(self, data: dict):
-        """Write a pending announcement for async Discord posting.
+        """Write a pending announcement for async posting.
         
         Skips write if an existing announcement for the same king change
         is already present (whether posted or not), to prevent duplicates.
@@ -265,6 +341,7 @@ class ValidatorState:
         from eval.scoring import is_disqualified
 
         issues = []
+        single_eval_mode = os.environ.get("SINGLE_EVAL_MODE", "1") != "0"
 
         # Check 1: Scored UIDs must be evaluated
         scored_uids = set(self.scores.keys())
@@ -303,9 +380,17 @@ class ValidatorState:
             h2h_king = self.h2h_latest.get("king_uid")
             new_king = self.h2h_latest.get("new_king_uid")
             king_changed = self.h2h_latest.get("king_changed", False)
-            if new_king is not None and str(new_king) not in self.scores:
+            if (
+                new_king is not None
+                and str(new_king) not in self.scores
+                and not (single_eval_mode and str(new_king) in self.composite_scores)
+            ):
                 issues.append(f"h2h_latest.new_king_uid={new_king} has no valid score — stale")
-            if h2h_king is not None and str(h2h_king) not in self.scores:
+            if (
+                h2h_king is not None
+                and str(h2h_king) not in self.scores
+                and not (single_eval_mode and str(h2h_king) in self.composite_scores)
+            ):
                 issues.append(f"h2h_latest.king_uid={h2h_king} has no valid score — stale")
             if king_changed and new_king is not None and h2h_king != new_king:
                 issues.append(f"h2h_latest: king_changed=true but king_uid={h2h_king} != new_king_uid={new_king} — fixing")
@@ -320,6 +405,12 @@ class ValidatorState:
                 self.scores.pop(uid_str)
                 self.evaluated_uids.discard(uid_str)
             elif kl >= max_kl_threshold:
+                if single_eval_mode:
+                    # In composite/single-eval mode raw KL is telemetry and
+                    # one scoring axis, not the eligibility gate. DQ state is
+                    # represented in dq_reasons and was handled above.
+                    self.evaluated_uids.add(uid_str)
+                    continue
                 capped = max_kl_threshold + 1
                 issues.append(f"UID {uid_str} has high KL {kl:.4f} >= {max_kl_threshold} — capping to {capped} (stays evaluated)")
                 self.scores[uid_str] = capped

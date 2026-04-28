@@ -37,7 +37,7 @@ CLIMBMIX_TEXT_FIELD = "text"
 DEFAULT_MIN_CHARS = 200
 DEFAULT_MAX_CHARS = 4000
 
-TEACHER_MODEL = "Qwen/Qwen3.5-35B-A3B"
+TEACHER_MODEL = "Qwen/Qwen3.5-4B"
 
 
 class Colors:
@@ -318,7 +318,7 @@ def verify_scoring_logic(h2h: dict) -> bool:
                 ok(f"Challenger {best['uid']} beat threshold {threshold:.6f} — king change correct")
             else:
                 warn(f"Challenger {best['uid']} beat threshold but king didn't change "
-                     f"(may be due to global KL smoothing)")
+                     f"(may be due to persisted KL telemetry)")
         else:
             if not h2h.get("king_changed"):
                 ok(f"Challenger didn't beat epsilon threshold — king holds")
@@ -356,7 +356,7 @@ def rerun_evaluation(prompts: list[str], h2h: dict) -> bool:
         reported_kl = r.get("kl", "N/A")
         info(f"  UID {r['uid']}: {model} (reported KL={reported_kl})")
 
-    warn("Full re-evaluation requires downloading all models and the teacher (~35B+ params).")
+    warn("Full re-evaluation requires downloading all models and the active teacher.")
     warn("This is resource-intensive and is left as a manual step.")
     info("To re-evaluate a specific model:")
     info(f"  1. Save prompts: python scripts/reproduce_prompts.py --block-number {h2h['block']} --block-hash <hash> --output prompts.json")

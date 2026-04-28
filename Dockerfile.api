@@ -9,25 +9,20 @@ WORKDIR /app
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-        build-essential \
         curl \
-        git \
         openssh-client \
     && rm -rf /var/lib/apt/lists/*
 
-COPY pyproject.toml setup.py requirements.txt README.md ./
+COPY requirements-api.txt ./
+RUN python -m pip install --no-cache-dir --upgrade pip \
+    && python -m pip install --no-cache-dir -r requirements-api.txt
+
 COPY api ./api
 COPY config ./config
 COPY eval ./eval
-COPY frontend/public ./frontend/public
-COPY miner ./miner
-COPY scripts ./scripts
-
-RUN python -m pip install --no-cache-dir --upgrade pip \
-    && python -m pip install --no-cache-dir -e .
 
 RUN mkdir -p /app/state
 
 EXPOSE 3710
 
-CMD ["python", "-m", "uvicorn", "api.server:app", "--host", "0.0.0.0", "--port", "3710", "--log-level", "info"]
+CMD ["sh", "-c", "python -m uvicorn api.server:app --host 0.0.0.0 --port ${PORT:-3710} --log-level info"]

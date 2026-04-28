@@ -3,21 +3,38 @@
 Single source of truth for all miner-facing scripts.
 Do NOT import from eval/ or scripts/validator/ — keep miners self-contained.
 """
-# ── Official Quasar base / model constraints ──
-BASE_MODEL = "silx-ai/Quasar-3B-A1B-Preview"
-BASE_MODEL_REVISION = "main"
-TOKENIZER_REFERENCE_MODEL = BASE_MODEL
-BASE_TOTAL_PARAMS_B = 3.0
-BASE_ACTIVE_PARAMS_B = 1.0
-TEACHER_MODEL = "Qwen/Qwen3.5-35B-A3B"
-DISTILLATION_TEACHER_MODEL = TEACHER_MODEL
-TEACHER_TOTAL_PARAMS_B = 35.0
+import json
+from pathlib import Path
 
-MAX_PARAMS_B = 3.5
+
+def _load_subnet_config() -> dict:
+    config_path = Path(__file__).resolve().parents[1] / "config" / "quasar.json"
+    return json.loads(config_path.read_text())
+
+
+_CONFIG = _load_subnet_config()
+_STUDENT = _CONFIG["student"]
+_TEACHER = _CONFIG["teacher"]
+
+
+# ── Official Quasar base / model constraints ──
+BASE_MODEL = _STUDENT["baseModel"]
+BASE_MODEL_REVISION = _STUDENT.get("revision", "main")
+TOKENIZER_REFERENCE_MODEL = BASE_MODEL
+BASE_TOTAL_PARAMS_B = _STUDENT.get("totalParams", 3_000_000_000) / 1e9
+BASE_ACTIVE_PARAMS_B = _STUDENT.get("activeParams", 1_000_000_000) / 1e9
+TEACHER_MODEL = _TEACHER["model"]
+DISTILLATION_TEACHER_MODEL = TEACHER_MODEL
+TEACHER_TOTAL_PARAMS_B = _TEACHER.get("totalParams", 4_000_000_000) / 1e9
+
+MAX_PARAMS_B = _STUDENT.get("maxStudentParams", 3_500_000_000) / 1e9
 MAX_PARAM_RATIO = MAX_PARAMS_B / TEACHER_TOTAL_PARAMS_B
 
-BASELINE_VOCAB_SIZE = 248320
-REFERENCE_TEMPLATE_HASH = "a4aee8afcf2e0711942cf848899be66016f8d14a889ff9ede07bca099c28f715"
+BASELINE_VOCAB_SIZE = _STUDENT.get("vocabSize", _TEACHER.get("configVocabSize", 248320))
+REFERENCE_TEMPLATE_HASH = _STUDENT.get(
+    "chatTemplateHash",
+    "a4aee8afcf2e0711942cf848899be66016f8d14a889ff9ede07bca099c28f715",
+)
 ALLOWED_CUSTOM_CODE_FILES = {
     "configuration_quasar.py",
     "modeling_quasar.py",

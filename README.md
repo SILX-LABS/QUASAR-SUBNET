@@ -13,8 +13,9 @@ king and assign weight to the best valid model.
 - Chain: Bittensor Finney
 - Netuid: 24
 - Base checkpoint: [`silx-ai/Quasar-3B-A1B-Preview`](https://huggingface.co/silx-ai/Quasar-3B-A1B-Preview)
+- Launch teacher: [`Qwen/Qwen3.5-4B`](https://huggingface.co/Qwen/Qwen3.5-4B)
 - Model family: Quasar 3B total / about 1B active Mixture-of-Experts
-- Scoring: paired prompt-level KL improvement against the current king
+- Scoring: king-of-the-hill composite evaluation against the current king
 
 ## Model Requirements
 
@@ -55,6 +56,7 @@ Install the project:
 
 ```bash
 pip install -e .
+pip install "git+https://github.com/SILX-LABS/quasar-flash-linear-attention.git"
 ```
 
 Check your model before committing:

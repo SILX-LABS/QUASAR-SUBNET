@@ -6,7 +6,7 @@ compares KL values, and reports differences.
 
 Usage (on eval pod):
     python3 validate_vllm_scoring.py \
-        --teacher Qwen/Qwen3.5-35B-A3B \
+        --teacher Qwen/Qwen3.5-4B \
         --student sniper918/sn24-xxxn \
         --n-prompts 10 \
         --max-prompt-len 512 \
@@ -29,7 +29,7 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--teacher", default="Qwen/Qwen3.5-35B-A3B")
+    parser.add_argument("--teacher", default="Qwen/Qwen3.5-4B")
     parser.add_argument("--student", required=True)
     parser.add_argument("--student-revision", default="main")
     parser.add_argument("--n-prompts", type=int, default=10)

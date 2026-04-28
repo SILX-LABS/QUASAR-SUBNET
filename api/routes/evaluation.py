@@ -25,6 +25,7 @@ from state_store import (
     read_state,
     score_history,
     scores,
+    composite_scores,
     top4_leaderboard,
     uid_hotkey_map,
     write_json_file,
@@ -33,23 +34,32 @@ from state_store import (
 router = APIRouter()
 
 
-@router.get("/api/leaderboard", tags=["Evaluation"], summary="Top-4 leaderboard",
-         description="Returns the top-4 leaderboard - current king and contenders. Dethronement uses paired t-test (p < 0.05).")
+@router.get("/api/leaderboard", tags=["Evaluation"], summary="Composite leaderboard",
+         description="Returns the current king and top contenders ranked by composite score. KL is one scored axis, not the king-selection gate.")
 def get_leaderboard():
     top4 = top4_leaderboard() or {}
     scores_data = scores()
+    composite_data = composite_scores()
     latest = h2h_latest()
     uid_map = uid_hotkey_map()
     commitments_data = _get_stale("commitments") or {}
     commitments = commitments_data.get("commitments", {})
     cumulative = read_state("cumulative_scores.json", {})
 
-    # Build UID → composite map from the most recent H2H round. The validator
-    # already attaches ``composite: {axes, worst, weighted}`` to every h2h
-    # result entry via ``annotate_h2h_with_composite`` — surfacing it here is
-    # the miner-facing half of the shadow migration (T0.3). Currently
-    # informational; flips to the ranking key once T2.1 lands.
+    # Build UID → composite map from canonical composite_scores, then fill in
+    # any fresh round rows that have not hit disk yet.
     uid_to_composite = {}
+    for uid_str, rec in (composite_data or {}).items():
+        try:
+            uid_to_composite[int(uid_str)] = {
+                "worst": rec.get("worst"),
+                "weighted": rec.get("weighted"),
+                "axes": rec.get("axes", {}),
+                "present_count": rec.get("present_count") or rec.get("n_axes"),
+                "version": rec.get("version"),
+            }
+        except (TypeError, ValueError):
+            continue
     for r in (latest.get("results") or []):
         uid = r.get("uid")
         comp = r.get("composite")
@@ -57,7 +67,7 @@ def get_leaderboard():
             uid_to_composite[uid] = comp
 
     def _enrich(entry):
-        """Fill in model name, KL, and composite breakdown from live state."""
+        """Fill in model name, KL telemetry, and composite breakdown."""
         if not entry:
             return entry
         uid = entry.get("uid")
@@ -69,7 +79,7 @@ def get_leaderboard():
             if hotkey and hotkey in commitments:
                 c = commitments[hotkey]
                 entry["model"] = c.get("model") or c.get("repo")
-        # KL score
+        # KL telemetry
         if not entry.get("h2h_kl") and str(uid) in scores_data:
             entry["h2h_kl"] = scores_data[str(uid)]
         # Cumulative score
@@ -77,7 +87,6 @@ def get_leaderboard():
         if cum and isinstance(cum, dict):
             entry["cumulative_score"] = cum.get("cumulative_kl_diff")
             entry["cumulative_rounds"] = cum.get("rounds")
-        # Composite axes (shadow — will become canonical after T2.1).
         comp = uid_to_composite.get(uid)
         if comp:
             entry["composite"] = {
@@ -90,26 +99,43 @@ def get_leaderboard():
         return entry
 
     king_data = dict(top4.get("king") or {}) if top4.get("king") else None
-    # Override king from h2h_latest if top4 is stale
+    # h2h_latest is the current applied king; composite_scores is the ranking
+    # table behind that decision.
     if latest.get("king_uid") is not None:
         if not king_data or king_data.get("uid") != latest["king_uid"]:
             king_data = {"uid": latest["king_uid"], "kl": latest.get("king_kl")}
     king_data = _enrich(king_data)
 
-    contenders = [_enrich(dict(c)) for c in (top4.get("contenders") or [])]
-    # Filter out reference model (UID -1) and king from contenders
     king_uid = king_data.get("uid") if king_data else None
-    contenders = [c for c in contenders if c.get("uid") not in (-1, king_uid)]
-    # If contenders are empty or stale, rebuild from scores
-    if not contenders or not any(c.get("h2h_kl") for c in contenders):
-        scored = [(int(uid), kl) for uid, kl in scores_data.items()
-                  if int(uid) not in (-1, king_uid or -999) and kl is not None]
-        scored.sort(key=lambda x: x[1])
-        contenders = [_enrich({"uid": uid, "h2h_kl": kl}) for uid, kl in scored[:4]]
+    ranked = []
+    for uid_str, rec in (composite_data or {}).items():
+        try:
+            uid = int(uid_str)
+        except (TypeError, ValueError):
+            continue
+        if uid in (-1, king_uid):
+            continue
+        worst = rec.get("worst")
+        if worst is None:
+            continue
+        weighted = rec.get("weighted")
+        ranked.append((float(worst), float(weighted or 0), uid, rec))
+    ranked.sort(reverse=True)
+    contenders = [
+        _enrich({
+            "uid": uid,
+            "model": rec.get("model"),
+            "composite_worst": worst,
+            "composite_weighted": weighted,
+            "h2h_kl": scores_data.get(str(uid)),
+        })
+        for worst, weighted, uid, rec in ranked[:4]
+    ]
 
     leaderboard = {
         "king": king_data,
         "contenders": contenders,
+        "ranking_method": "composite_single_eval",
         "phase": top4.get("phase", "unknown"),
         "initial_eval_complete": top4.get("initial_eval_complete", False),
         "completed_at": top4.get("completed_at"),
@@ -334,12 +360,12 @@ def get_queue():
 Response includes:
 - `block`: Block when this round was scored
 - `king_uid`: Current king's UID
-- `king_h2h_kl`: King's KL score in this round
-- `king_global_kl`: King's smoothed global KL
-- `p_value`: Paired t-test p-value for the challenger vs king comparison
+- `king_h2h_kl`: King's KL-axis telemetry in this round
+- `king_global_kl`: King's persisted KL-axis telemetry
+- `composite`: Per-axis composite score used for ranking
 - `n_prompts`: Number of prompts used
 - `results[]`: Array of `{uid, model, kl, is_king, vs_king}` for each evaluated miner
-- `king_changed`: Whether the king was dethroned this round (requires p < 0.05)
+- `king_changed`: Whether the king changed after composite ranking
 """)
 def get_h2h_latest():
     path = os.path.join(STATE_DIR, "h2h_latest.json")

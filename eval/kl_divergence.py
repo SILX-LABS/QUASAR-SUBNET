@@ -130,7 +130,7 @@ def generate_teacher_continuations(
         input_ids = input_ids.to(device)
         prompt_len = input_ids.shape[1]
 
-        gen_kwargs = dict(max_new_tokens=max_new_tokens, use_cache=True)
+        gen_kwargs = dict(max_new_tokens=max_new_tokens, use_cache=False)
         if block_seed is not None:
             torch.manual_seed(block_seed)
             if torch.cuda.is_available():

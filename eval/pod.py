@@ -4,6 +4,8 @@ Pod lifecycle management for the Subnet 24 validator.
 Handles: connection, dependency installation, disk cleanup,
 file upload/download, and command execution with retries.
 """
+from __future__ import annotations
+
 import json
 import os
 import re
@@ -14,6 +16,7 @@ import time
 from pathlib import Path
 
 logger = logging.getLogger("quasar.pod")
+QUASAR_FLA_PACKAGE = "git+https://github.com/SILX-LABS/quasar-flash-linear-attention.git"
 
 # Patterns for sanitizing GPU logs before public exposure
 _ANSI_RE = re.compile(r'\x1b\[[0-9;]*m')
@@ -181,7 +184,7 @@ class PodManager:
         except Exception:
             return False
 
-    def ensure_dependencies(self, teacher_model: str = "Qwen/Qwen3.5-35B-A3B"):
+    def ensure_dependencies(self, teacher_model: str = "Qwen/Qwen3.5-4B"):
         """Install required packages on the pod and apply B200 patches.
 
         Installs vllm, accelerate, transformers, and patches grouped_mm
@@ -190,11 +193,13 @@ class PodManager:
         try:
             logger.info("Ensuring pod dependencies...")
             dep_result = self.exec(
-                "pip install --break-system-packages 'vllm>=0.19' accelerate -q 2>&1 | tail -1 && "
-                "pip install --break-system-packages 'transformers>=5.0' -q 2>&1 | tail -1 && "
-                "python3 -c 'import torch; import transformers; import vllm; "
+                "python3 -m pip install --break-system-packages --upgrade pip setuptools wheel ninja packaging -q && "
+                "python3 -m pip install --break-system-packages 'vllm>=0.19' accelerate -q && "
+                "python3 -m pip install --break-system-packages 'transformers>=5.0' -q && "
+                f"python3 -m pip install --break-system-packages '{QUASAR_FLA_PACKAGE}' -q && "
+                "python3 -c 'import torch; import transformers; import vllm; import fla; "
                 "print(f\"torch={torch.__version__} transformers={transformers.__version__} "
-                "vllm={vllm.__version__} cuda={torch.cuda.is_available()}\")'"
+                "vllm={vllm.__version__} fla=ok cuda={torch.cuda.is_available()}\")'"
             )
             logger.info(f"Pod deps: {dep_result.get('stdout', '').strip()}")
 

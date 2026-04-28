@@ -1,6 +1,8 @@
 """
 State file management: H2H state, scores, commitments, leaderboard updates.
 """
+from __future__ import annotations
+
 import json
 import logging
 import time
@@ -13,8 +15,32 @@ from eval.scoring import (
 from scripts.validator.config import (
     MAX_KL_THRESHOLD, EPSILON, PAIRED_TEST_ALPHA, TOP_N_ALWAYS_INCLUDE,
 )
+from scripts.validator.single_eval import is_single_eval_mode
 
 logger = logging.getLogger("quasar.validator")
+
+
+# Minimum number of prompts the king must have completed for a round's
+# results to be trusted for persistent state updates (top-4 leaderboard,
+# state.scores, model_score_history, h2h_tested_against_king).
+#
+# Background (2026-04-24): the round at block 8037177 ran on HuggingFace
+# fallback with the old PER_MODEL_TIMEOUT=600 and the king early-stopped
+# at 129/300 prompts. Because every write-path unconditionally stamped
+# `h2h_results` into persistent state, the broken round's partial-prompt
+# KLs (~0.06 scale, measured against ONLY 129 paired prompts) overwrote
+# the correct global scores (~0.2 scale) and the top-4 leaderboard picked
+# challengers by those corrupted KLs. Pete warned us to kill the round
+# before it wrote — we didn't, and the cleanup was painful. This gate
+# prevents a repeat: any round where the king's n_prompts_scored is below
+# this threshold is allowed to exist in h2h_history (marked `_invalid`)
+# but CANNOT overwrite the leaderboard or rewrite scores. The paired
+# t-test gate in results.py already enforces the same threshold for
+# dethronement (see MIN_PROMPTS_DETHRONE=100); this is a stricter gate
+# because the full-round leaderboard needs a higher bar than "eligible to
+# dethrone on one round" — partial pipes through composite axes amplify
+# noise on fewer axes.
+MIN_PROMPTS_FOR_LEADERBOARD = 150
 
 
 def migrate_dq_entries(state: ValidatorState, commitments: dict):
@@ -149,6 +175,40 @@ def update_h2h_state(state: ValidatorState, h2h_results, king_uid, winner_uid,
                 f"but DQ'd — {entry['dq_reason']}"
             )
 
+    # Determine if the king's paired-prompt count is sufficient for this
+    # round to be treated as canonical. king_per_prompt is None when the
+    # king failed entirely; otherwise it's a list of per-prompt KL means
+    # whose length is the number of prompts the king actually completed.
+    # See MIN_PROMPTS_FOR_LEADERBOARD docstring above for the 2026-04-24
+    # Pete-warned-us incident this prevents.
+    king_prompts_completed = len(king_per_prompt) if king_per_prompt else 0
+    single_eval_active = is_single_eval_mode()
+    # In single-eval mode the composite selector is canonical. If the king
+    # row is missing or has zero paired prompts, do not let the legacy H2H
+    # prompt-count gate mark an otherwise-scored challenger round invalid.
+    single_eval_kingless = single_eval_active and king_prompts_completed == 0
+    if single_eval_kingless:
+        round_is_canonical = bool(h2h_results)
+    else:
+        round_is_canonical = (
+            king_prompts_completed >= MIN_PROMPTS_FOR_LEADERBOARD
+            and not (king_uid is not None and king_h2h_kl is None)
+        )
+    if not round_is_canonical:
+        logger.warning(
+            f"🚧 Round at block {current_block} is PARTIAL "
+            f"(king completed {king_prompts_completed}/{n_prompts} prompts, "
+            f"threshold={MIN_PROMPTS_FOR_LEADERBOARD}). h2h_history entry will "
+            f"be marked `_invalid_for_leaderboard=True`; skipping "
+            f"top4_leaderboard/scores/h2h_tested_against_king writes."
+        )
+    elif single_eval_kingless:
+        logger.info(
+            f"single-eval round at block {current_block}: king deliberately "
+            f"absent (cross-round composite selection); treating round as "
+            f"canonical with {len(h2h_results)} challenger results."
+        )
+
     h2h_round = {
         "block": current_block, "block_hash": block_hash, "timestamp": time.time(),
         "shard_idx": shard_idx,
@@ -157,10 +217,10 @@ def update_h2h_state(state: ValidatorState, h2h_results, king_uid, winner_uid,
         "king_kl": _king_h2h_kl,  # canonical field for API consumers
         "king_h2h_kl": _king_h2h_kl,
         "king_global_kl": round(king_kl, 6),
-        "epsilon": EPSILON,
-        "epsilon_threshold": round(king_h2h_kl * (1.0 - EPSILON), 6) if king_h2h_kl else None,
-        "paired_test_alpha": PAIRED_TEST_ALPHA,
-        "dethrone_method": "paired_t_test" if king_per_prompt else "legacy_epsilon",
+        "epsilon": None if single_eval_active else EPSILON,
+        "epsilon_threshold": None if single_eval_active else round(king_h2h_kl * (1.0 - EPSILON), 6) if king_h2h_kl else None,
+        "paired_test_alpha": None if single_eval_active else PAIRED_TEST_ALPHA,
+        "dethrone_method": "composite_single_eval" if single_eval_active else "paired_t_test" if king_per_prompt else "legacy_epsilon",
         "n_prompts": n_prompts, "results": h2h_results,
         "king_changed": king_changed,
         "new_king_uid": winner_uid if king_changed else None,
@@ -169,17 +229,25 @@ def update_h2h_state(state: ValidatorState, h2h_results, king_uid, winner_uid,
         "type": "full_eval" if is_full_eval else "h2h",
         "elapsed_seconds": round(time.time() - epoch_start_time, 1) if epoch_start_time else None,
         "n_students": len(h2h_results),
+        "king_prompts_completed": king_prompts_completed,
+        "_invalid_for_leaderboard": not round_is_canonical,
+        "_min_prompts_for_leaderboard": MIN_PROMPTS_FOR_LEADERBOARD,
     }
 
-    state.h2h_latest = h2h_round
-    # Replace preliminary entries
+    # Only overwrite the canonical `h2h_latest` when the round is trustworthy.
+    # We still append to h2h_history so the dashboard can show the partial
+    # round (with a loud "invalid" flag) — useful for debugging and transparency.
+    if round_is_canonical:
+        state.h2h_latest = h2h_round
     state.h2h_history = [h for h in state.h2h_history if not (h.get("block") == current_block and h.get("_preliminary"))]
     state.h2h_history.append(h2h_round)
     state.h2h_history = state.h2h_history[-50:]
     state.save_h2h()
 
-    # Update tested-against-king tracker
-    if king_uid is not None:
+    # Only update "tested against king" tracker on canonical rounds — a partial
+    # round shouldn't mark a challenger as "already tested this king" because
+    # the paired test wasn't meaningful.
+    if round_is_canonical and king_uid is not None:
         for uid in challengers:
             uid_str = str(uid)
             if uid_str in state.scores and state.scores[uid_str] > 0:
@@ -190,6 +258,60 @@ def update_h2h_state(state: ValidatorState, h2h_results, king_uid, winner_uid,
                 }
         atomic_json_write(state._path("h2h_tested_against_king.json"),
                           state.h2h_tested_against_king, indent=2)
+
+    # ── King regression streak (2026-04-24, SHADOW) ────────────────────
+    # King camps the crown when it regresses on
+    # bench axes because the composite is only a veto, never a defense.
+    # Track consecutive "at risk" rounds (king.worst < floor OR <
+    # base model.worst). Purely telemetry today; flips to force
+    # dethronement once ``KING_REGRESSION_GATE=1`` after we have data.
+    # Only run on canonical rounds — a partial round's composite is
+    # meaningless for this check.
+    if round_is_canonical and effective_king_uid is not None:
+        try:
+            king_row = next(
+                (r for r in h2h_results if r.get("is_king")), None
+            )
+            health = ((king_row or {}).get("composite") or {}).get("king_health")
+            if health:
+                king_key = str(effective_king_uid)
+                at_risk = bool(health.get("at_risk"))
+                prev_streak = int(state.king_regression_streak.get(king_key, 0))
+                # Drop stale streaks for previous kings (keep only current
+                # king + the immediate predecessor for debugging).
+                state.king_regression_streak = {
+                    k: v for k, v in state.king_regression_streak.items()
+                    if k in (king_key, str(king_uid) if king_uid is not None else None)
+                }
+                if king_changed:
+                    prev_streak = 0  # fresh king, fresh slate
+                new_streak = prev_streak + 1 if at_risk else 0
+                state.king_regression_streak[king_key] = new_streak
+                if at_risk:
+                    logger.warning(
+                        f"🚨 King UID {effective_king_uid} at risk: "
+                        f"worst={health.get('king_worst'):.3f} "
+                        f"axis={health.get('king_worst_axis')} "
+                        f"(below_floor={health.get('below_floor')}, "
+                        f"worse_than_base={health.get('worse_than_base')}) — "
+                        f"streak={new_streak}/{health.get('min_streak')}"
+                    )
+                else:
+                    logger.info(
+                        f"King UID {effective_king_uid} healthy: "
+                        f"worst={health.get('king_worst'):.3f} "
+                        f"(floor={health.get('floor')}) — streak reset."
+                    )
+                # Persist the streak. save_h2h() above ran before this block
+                # so the in-memory mutation wouldn't hit disk without this
+                # second write. atomic_json_write is cheap on a 2-key dict.
+                atomic_json_write(
+                    state._path("king_regression_streak.json"),
+                    state.king_regression_streak,
+                    indent=2,
+                )
+        except Exception as exc:
+            logger.warning(f"king_regression_streak update failed (non-fatal): {exc}")
 
 
 _COPY_LIKE_DQ_PATTERNS = (
@@ -234,21 +356,31 @@ def update_model_tracking(state: ValidatorState, models_to_eval, current_block,
         if uid_str in state.scores and state.scores[uid_str] > 0:
             kl = state.scores[uid_str]
             prev = state.model_score_history.get(model_name, {})
+            # A past rollback persisted {"best_kl": null,
+            # "best_kl_before_rollback_*": <float>} for ~500 entries. Plain
+            # ``prev.get("best_kl", float("inf"))`` returned None (default is
+            # only used for missing keys, not for explicit None values), and
+            # ``kl < None`` blew up every epoch with the infamous EPOCH ERROR:
+            # '<' not supported between instances of 'float' and 'NoneType'.
+            # Collapse None to inf/0 sentinels so the comparisons stay total.
             if kl <= MAX_KL_THRESHOLD:
-                prev_best = prev.get("best_kl", float("inf"))
+                prev_best_raw = prev.get("best_kl")
+                prev_best = float("inf") if prev_best_raw is None else prev_best_raw
                 if kl < prev_best:
                     state.model_score_history[model_name] = {
                         **prev, "best_kl": round(kl, 6), "uid": uid,
                         "block": current_block, "timestamp": time.time(),
                     }
             else:
-                prev_worst = prev.get("worst_kl", 0)
+                prev_worst_raw = prev.get("worst_kl")
+                prev_worst = 0 if prev_worst_raw is None else prev_worst_raw
                 if kl > prev_worst:
                     state.model_score_history[model_name] = {
                         **prev, "worst_kl": round(kl, 6), "uid": uid,
                         "block": current_block, "timestamp": time.time(),
                     }
-                if "best_kl" not in state.model_score_history.get(model_name, {}):
+                existing = state.model_score_history.get(model_name, {})
+                if existing.get("best_kl") is None:
                     state.model_score_history.setdefault(model_name, {})["best_kl"] = round(kl, 6)
 
     if king_kl > 0 and king_kl < float("inf"):
@@ -284,7 +416,28 @@ def update_model_tracking(state: ValidatorState, models_to_eval, current_block,
 def update_top4_leaderboard(state: ValidatorState, winner_uid, king_uid, king_kl,
                             h2h_results, uid_to_model, valid_models, current_block,
                             epoch_count, disqualified):
-    """Update the top-4 leaderboard (initial eval → maintenance transition)."""
+    """Update the top-4 leaderboard (initial eval → maintenance transition).
+
+    Guard (2026-04-24): if the round that produced ``h2h_results`` is flagged
+    ``_invalid_for_leaderboard`` on ``state.h2h_latest`` (see
+    ``MIN_PROMPTS_FOR_LEADERBOARD`` above), skip the leaderboard overwrite
+    entirely. Partial-prompt KLs are on a different scale than full-round
+    KLs and silently clobbering the leaderboard with them is exactly what
+    caused the 2026-04-24 contender-selection regression.
+    """
+    if is_single_eval_mode():
+        logger.info("single-eval: skipping legacy top4_leaderboard update")
+        return
+
+    latest = getattr(state, "h2h_latest", None) or {}
+    if latest.get("_invalid_for_leaderboard"):
+        logger.warning(
+            f"🚧 Skipping top4_leaderboard update for block {current_block} "
+            f"— round flagged _invalid_for_leaderboard "
+            f"(king_prompts_completed={latest.get('king_prompts_completed')})."
+        )
+        return
+
     try:
         if state.top4_leaderboard.get("phase") == "initial_eval":
             # Check if all models tested
@@ -307,10 +460,14 @@ def update_top4_leaderboard(state: ValidatorState, winner_uid, king_uid, king_kl
                     "uid": int(tested_results[0][0]), "model": tested_results[0][2],
                     "h2h_kl": round(tested_results[0][1], 6), "block": current_block,
                 }
+                # Track up to TOP_N_ALWAYS_INCLUDE-1 contenders (slot 0 is the king).
+                # Keep enough sticky contender slots so older strong models do
+                # not rotate out too quickly and miss re-evaluation.
+                contender_cap = max(1, TOP_N_ALWAYS_INCLUDE - 1)
                 state.top4_leaderboard["contenders"] = [
                     {"uid": int(tested_results[i][0]), "model": tested_results[i][2],
                      "h2h_kl": round(tested_results[i][1], 6), "block": current_block}
-                    for i in range(1, min(4, len(tested_results)))
+                    for i in range(1, min(contender_cap + 1, len(tested_results)))
                 ]
                 state.top4_leaderboard["phase"] = "maintenance"
                 state.top4_leaderboard["initial_eval_complete"] = True
@@ -330,6 +487,7 @@ def update_top4_leaderboard(state: ValidatorState, winner_uid, king_uid, king_kl
                 "h2h_kl": round(king_kl_lb, 6) if isinstance(king_kl_lb, float) else king_kl_lb,
                 "block": current_block,
             }
+            contender_cap = max(1, TOP_N_ALWAYS_INCLUDE - 1)
             contenders = []
             for r in sorted(h2h_results, key=lambda r: r.get("kl", float("inf"))):
                 if r["uid"] == actual_king:
@@ -342,7 +500,7 @@ def update_top4_leaderboard(state: ValidatorState, winner_uid, king_uid, king_kl
                     "uid": r["uid"], "model": r["model"],
                     "h2h_kl": round(r["kl"], 6), "block": current_block,
                 })
-                if len(contenders) >= 4:
+                if len(contenders) >= contender_cap:
                     break
             state.top4_leaderboard["contenders"] = contenders
 

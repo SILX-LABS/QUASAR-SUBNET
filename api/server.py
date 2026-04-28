@@ -1,10 +1,8 @@
-"""Distil - Subnet 24 API. App creation, middleware, startup."""
+"""Quasar Subnet 24 API. App creation, middleware, startup."""
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from fastapi.staticfiles import StaticFiles
-from pathlib import Path
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from config import ALLOWED_ORIGINS, API_DESCRIPTION
@@ -79,11 +77,6 @@ app.include_router(chat_router)
 app.include_router(debugging_router)
 app.include_router(telemetry_router)
 app.include_router(dashboard_router)
-
-FRONTEND_PUBLIC = Path(__file__).resolve().parent.parent / "frontend" / "public"
-if FRONTEND_PUBLIC.exists():
-    app.mount("/", StaticFiles(directory=str(FRONTEND_PUBLIC), html=True), name="frontend")
-
 
 # ── Startup: prime caches ────────────────────────────────────────────────────
 

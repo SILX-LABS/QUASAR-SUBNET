@@ -462,7 +462,7 @@ def main(model_repo, revision, run_eval, prompts, max_new_tokens, teacher_cache,
     try:
         from transformers import AutoTokenizer
 
-        teacher_tok = AutoTokenizer.from_pretrained(TOKENIZER_REFERENCE_MODEL, trust_remote_code=True)
+        reference_tok = AutoTokenizer.from_pretrained(TOKENIZER_REFERENCE_MODEL, trust_remote_code=True)
         try:
             student_tok = AutoTokenizer.from_pretrained(model_repo, revision=revision, trust_remote_code=False)
         except Exception:
@@ -479,7 +479,7 @@ def main(model_repo, revision, run_eval, prompts, max_new_tokens, teacher_cache,
 
         mismatch = False
         for s in test_strings:
-            t_ids = teacher_tok.encode(s)
+            t_ids = reference_tok.encode(s)
             s_ids = student_tok.encode(s)
             if t_ids != s_ids:
                 check_fail("Tokenizer encoding",
@@ -675,7 +675,7 @@ def main(model_repo, revision, run_eval, prompts, max_new_tokens, teacher_cache,
                         max_new_tokens=max_new_tokens,
                         do_sample=True, temperature=0.7, top_p=0.9,
                         pad_token_id=teacher_tok.eos_token_id,
-                        use_cache=True,
+                        use_cache=False,
                     )
                     gen_len = output_ids.shape[1] - prompt_len
 
@@ -826,9 +826,11 @@ def main(model_repo, revision, run_eval, prompts, max_new_tokens, teacher_cache,
         else:
             check_pass("KL fraud check", f"KL={kl_global:.6f} (legitimate)")
 
-        # ── Compare against king ──────────────────────────────────────
+        # ── KL component comparison ───────────────────────────────────
+        # This is a local sanity check only. Production validators crown
+        # kings by the composite score, where KL is one axis.
         if king_repo:
-            banner("KING COMPARISON")
+            banner("KL COMPONENT COMPARISON")
             print(f"  Loading king: {king_repo}...")
             del student
             torch.cuda.empty_cache()
@@ -865,14 +867,14 @@ def main(model_repo, revision, run_eval, prompts, max_new_tokens, teacher_cache,
             del king
             torch.cuda.empty_cache()
 
-            print(f"\n  Your model:  KL = {kl_global:.6f}")
-            print(f"  Current king: KL = {king_kl:.6f}")
+            print(f"\n  Your model KL component:  {kl_global:.6f}")
+            print(f"  King KL component:        {king_kl:.6f}")
             diff_pct = (kl_global - king_kl) / king_kl * 100
             if kl_global < king_kl:
-                print(f"  🏆 Your model BEATS the king by {abs(diff_pct):.2f}%!")
+                print(f"  KL component is better by {abs(diff_pct):.2f}%.")
             else:
-                print(f"  👑 King is still better by {abs(diff_pct):.2f}%")
-                print(f"     You need KL < {king_kl:.6f} to dethrone.")
+                print(f"  KL component is worse by {abs(diff_pct):.2f}%.")
+            print("  Note: this does not decide the crown; validator ranking uses composite.")
         elif not king_repo:
             # Auto-detect king from state
             try:
@@ -884,16 +886,16 @@ def main(model_repo, revision, run_eval, prompts, max_new_tokens, teacher_cache,
                         if r.get("uid") == king_uid:
                             king_kl_est = r.get("kl", 0)
                             king_model = r.get("model", "?")
-                            banner("KING COMPARISON (estimated)")
+                            banner("KL COMPONENT COMPARISON (estimated)")
                             print(f"  Current king: UID {king_uid} ({king_model})")
-                            print(f"  King KL (last eval): {king_kl_est:.6f}")
-                            print(f"  Your model KL:       {kl_global:.6f}")
+                            print(f"  King KL component:   {king_kl_est:.6f}")
+                            print(f"  Your KL component:   {kl_global:.6f}")
                             diff_pct = (kl_global - king_kl_est) / king_kl_est * 100
                             if kl_global < king_kl_est:
-                                print(f"  🏆 Your model appears to BEAT the king by {abs(diff_pct):.2f}%!")
-                                print(f"     (Note: final eval uses {60} prompts with different sampling)")
+                                print(f"  KL component appears better by {abs(diff_pct):.2f}%.")
                             else:
-                                print(f"  👑 King is still better by {abs(diff_pct):.2f}%")
+                                print(f"  KL component appears worse by {abs(diff_pct):.2f}%.")
+                            print("  Note: this does not decide the crown; validator ranking uses composite.")
                             break
             except Exception:
                 pass

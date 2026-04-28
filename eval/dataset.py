@@ -7,6 +7,8 @@ No streaming, no skip, instant random access across 400B tokens.
 
 Fallback: HuggingFaceFW/fineweb via streaming (slower but 15x more data).
 """
+from __future__ import annotations
+
 import json
 import random
 import hashlib

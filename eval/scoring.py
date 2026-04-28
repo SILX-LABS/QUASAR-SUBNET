@@ -6,6 +6,8 @@ Scoring logic: winner-take-all weights.
 - Quality floor: KL > threshold gets zero weight
 - All state persisted to disk for restart survival
 """
+from __future__ import annotations
+
 import json
 import logging
 from pathlib import Path

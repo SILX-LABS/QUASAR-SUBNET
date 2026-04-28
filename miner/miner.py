@@ -178,7 +178,7 @@ def _check_repo_visibility(model_repo, hf_token=None):
 def main(network, netuid, wallet_name, wallet_path, hotkey_name, model_repo, revision,
          force, dry_run, test_only, hf_token, auto_publish):
     """
-    Commit a distilled model to the distillation subnet.
+    Commit a Quasar model to subnet 24.
 
     This is PERMANENT. Once committed, you cannot change your model.
     One commitment per hotkey, forever.

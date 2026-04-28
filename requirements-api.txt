@@ -1,0 +1,11 @@
+fastapi
+uvicorn[standard]
+starlette
+pydantic
+requests
+httpx
+boto3
+bittensor
+bittensor-wallet
+huggingface-hub
+rich

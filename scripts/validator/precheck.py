@@ -24,6 +24,7 @@ from eval.scoring import (
 )
 from eval.state import ValidatorState
 from scripts.validator.config import ACTIVATION_COPY_THRESHOLD, MAX_KL_THRESHOLD
+from scripts.validator.single_eval import is_single_eval_mode
 
 logger = logging.getLogger("quasar.validator")
 
@@ -192,6 +193,7 @@ def check_activation_fingerprint(model_name: str, uid: int, fingerprint: dict, s
 def precheck_all_models(commitments, uid_to_hotkey, uid_to_coldkey, state: ValidatorState, max_params_b: float):
     valid_models = {}
     disqualified = set()
+    single_eval_mode = is_single_eval_mode()
     for uid, commit in commitments.items():
         model_repo = commit["model"]
         revision = commit.get("revision", "main")
@@ -202,7 +204,7 @@ def precheck_all_models(commitments, uid_to_hotkey, uid_to_coldkey, state: Valid
             logger.info(f"UID {uid} ({model_repo}): DISQUALIFIED — {reason}")
             disqualified.add(uid)
             continue
-        if state.scores.get(str(uid), 0) > MAX_KL_THRESHOLD:
+        if not single_eval_mode and state.scores.get(str(uid), 0) > MAX_KL_THRESHOLD:
             disqualified.add(uid)
             continue
         if is_stale(uid, state.failures):
@@ -226,49 +228,56 @@ def precheck_all_models(commitments, uid_to_hotkey, uid_to_coldkey, state: Valid
                 disqualified.add(uid)
                 continue
         uid_str = str(uid)
-        if uid_str in state.evaluated_uids and uid_str in state.scores and state.scores[uid_str] <= MAX_KL_THRESHOLD:
-            try:
-                from huggingface_hub import hf_hub_download
-                import json as _json
-
-                cfg_path = hf_hub_download(model_repo, "config.json", revision=revision)
-                with open(cfg_path) as handle:
-                    cfg = _json.load(handle)
-                archs = cfg.get("architectures", [])
-                mtype = cfg.get("model_type", "")
-                if mtype != "qwen3_5" or "Qwen3_5ForConditionalGeneration" not in archs:
-                    logger.info(f"UID {uid} ({model_repo}): FAIL — wrong architecture ({mtype}/{','.join(archs)})")
-                    record_failure(uid, state.failures, state.failure_models, f"{model_repo}@{revision}")
-                    disqualify(
-                        hotkey,
-                        f"arch: Must use Qwen3_5ForConditionalGeneration (found {','.join(archs)}, model_type={mtype}). Fix: edit config.json on HuggingFace.",
-                        state.dq_reasons,
-                        commit_block=this_commit_block,
-                    )
+        _needs_full_check = False
+        has_existing_score = uid_str in state.scores and state.scores[uid_str] <= MAX_KL_THRESHOLD
+        has_composite_score = single_eval_mode and uid_str in state.composite_scores
+        if uid_str in state.evaluated_uids and (has_existing_score or has_composite_score):
+            expected_hash = state.model_hashes.get(str(uid))
+            stored_hotkey_quick = state.model_hashes.get(f"{uid}_hotkey")
+            stored_block_quick = state.model_hashes.get(f"{uid}_block")
+            hotkey_changed_quick = stored_hotkey_quick is not None and stored_hotkey_quick != hotkey
+            block_changed_quick = this_commit_block and stored_block_quick and this_commit_block != stored_block_quick
+            legacy_no_block_quick = expected_hash is not None and stored_block_quick is None and this_commit_block
+            if hotkey_changed_quick or block_changed_quick or legacy_no_block_quick:
+                reason = (
+                    "hotkey changed (UID recycled)" if hotkey_changed_quick
+                    else "new commitment" if block_changed_quick
+                    else "legacy hash (no block stored)"
+                )
+                logger.info(f"UID {uid}: quick re-check: {reason} at block {this_commit_block} (was {stored_block_quick}), resetting hash")
+                expected_hash = None
+                state.model_hashes.pop(str(uid), None)
+                state.model_hashes.pop(f"{uid}_block", None)
+                state.model_hashes.pop(f"{uid}_hotkey", None)
+                for dq_hk in [hotkey, stored_hotkey_quick] if stored_hotkey_quick else [hotkey]:
+                    for dq_key in [f"{dq_hk}:{stored_block_quick}", dq_hk]:
+                        if dq_key and dq_key in state.dq_reasons:
+                            logger.info(f"UID {uid}: Clearing stale DQ: {dq_key}")
+                            del state.dq_reasons[dq_key]
+                state.evaluated_uids.discard(uid_str)
+                state.scores.pop(uid_str, None)
+                reset_failures(uid, state.failures)
+                _needs_full_check = True
+            if not _needs_full_check:
+                integrity = verify_model_integrity(model_repo, revision, expected_hash)
+                if integrity.get("transient"):
+                    pass
+                elif not integrity["pass"]:
+                    logger.info(f"UID {uid} ({model_repo}): INTEGRITY FAIL — {integrity['reason']}")
+                    state.scores[str(uid)] = MAX_KL_THRESHOLD + 1
+                    disqualify(hotkey, f"integrity: {integrity['reason']}", state.dq_reasons, commit_block=this_commit_block)
                     disqualified.add(uid)
-                    state.scores.pop(uid_str, None)
                     state.evaluated_uids.discard(uid_str)
                     continue
-            except Exception:
-                pass
-            expected_hash = state.model_hashes.get(str(uid))
-            integrity = verify_model_integrity(model_repo, revision, expected_hash)
-            if integrity.get("transient"):
-                pass
-            elif not integrity["pass"]:
-                logger.info(f"UID {uid} ({model_repo}): INTEGRITY FAIL — {integrity['reason']}")
-                state.scores[str(uid)] = MAX_KL_THRESHOLD + 1
-                disqualify(hotkey, f"integrity: {integrity['reason']}", state.dq_reasons, commit_block=this_commit_block)
-                disqualified.add(uid)
-                state.evaluated_uids.discard(uid_str)
+                valid_models[uid] = {
+                    "model": model_repo,
+                    "revision": revision,
+                    "params_b": None,
+                    "hotkey": hotkey,
+                    "commit_block": this_commit_block if this_commit_block is not None else float("inf"),
+                }
                 continue
-            valid_models[uid] = {
-                "model": model_repo,
-                "revision": revision,
-                "params_b": None,
-                "hotkey": hotkey,
-                "commit_block": this_commit_block if this_commit_block is not None else float("inf"),
-            }
+        if not _needs_full_check and uid_str in state.evaluated_uids:
             continue
         logger.info(f"Checking {model_repo}...")
         hf_user = model_repo.split("/")[0] if "/" in model_repo else None

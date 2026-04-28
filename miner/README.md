@@ -13,6 +13,9 @@ silx-ai/Quasar-3B-A1B-Preview
 Submitted models must keep the Quasar architecture, tokenizer behavior, and
 shape-compatible safetensors weights from that checkpoint.
 
+Launch scoring uses `Qwen/Qwen3.5-4B` as the KL teacher. The Quasar checkpoint
+remains the required student/base architecture.
+
 Key config values:
 
 ```json
@@ -29,6 +32,7 @@ Key config values:
 
 ```bash
 pip install click huggingface_hub transformers safetensors bittensor
+pip install "git+https://github.com/SILX-LABS/quasar-flash-linear-attention.git"
 
 python miner/check_model.py --model-repo your-org/your-model
 python miner/test_miner.py --model-repo your-org/your-model

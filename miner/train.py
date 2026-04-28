@@ -1,21 +1,22 @@
 #!/usr/bin/env python3
 """
-KL Distillation Training for Bittensor Subnet 24 (distil)
+KL training example for Quasar SN24.
 
 Train a Quasar student model to match a frontier teacher's output distribution
 using forward KL divergence on raw text from karpathy/climbmix-400b-shuffle.
 
 Requirements:
     pip install transformers>=5.3.0 torch datasets wandb
+    pip install "git+https://github.com/SILX-LABS/quasar-flash-linear-attention.git"
 
-Usage (2 GPUs - teacher + student):
-    python distil_kl_train.py --teacher_gpu 0 --student_gpu 1
+Usage (launch teacher + Quasar student):
+    python miner/train.py --teacher_gpu 0 --student_gpu 1
 
 Usage (start from a leaderboard model):
-    python distil_kl_train.py --student some_user/their_model --teacher_gpu 0 --student_gpu 1
+    python miner/train.py --student some_user/their_model --teacher_gpu 0 --student_gpu 1
 
-Usage (local dev with smaller models, e.g. 2x 24GB GPUs):
-    python distil_kl_train.py --teacher Qwen/Qwen3.5-4B --student silx-ai/Quasar-3B-A1B-Preview --teacher_gpu 0 --student_gpu 1
+Usage (CPU/local toy smoke only, not subnet scoring):
+    python miner/train.py --teacher sshleifer/tiny-gpt2 --student sshleifer/tiny-gpt2 --teacher_gpu 0 --student_gpu 1
 
 Hyperparameters:
     --lr              Learning rate (default: 1e-5)
@@ -121,9 +122,9 @@ def main():
     parser.add_argument("--kl_start_pos", type=int, default=KL_START_POS)
     parser.add_argument("--max_steps", type=int, default=0)
     parser.add_argument("--data_offset", type=int, default=0)
-    parser.add_argument("--output_dir", type=str, default="./distil-checkpoints")
+    parser.add_argument("--output_dir", type=str, default="./quasar-checkpoints")
     parser.add_argument("--save_every", type=int, default=SAVE_EVERY)
-    parser.add_argument("--wandb_project", type=str, default="distil-subnet97")
+    parser.add_argument("--wandb_project", type=str, default="quasar-sn24")
     parser.add_argument("--wandb_run", type=str, default=None)
     parser.add_argument("--no_wandb", action="store_true")
     args = parser.parse_args()
@@ -134,7 +135,7 @@ def main():
 
     if not args.no_wandb:
         import wandb
-        wandb.init(project=args.wandb_project, name=args.wandb_run or "distil-kl", config=vars(args))
+        wandb.init(project=args.wandb_project, name=args.wandb_run or "quasar-kl", config=vars(args))
 
     from transformers import AutoModelForCausalLM, AutoTokenizer
 

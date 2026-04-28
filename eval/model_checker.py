@@ -12,11 +12,13 @@ Checks:
 import json
 import hashlib
 import logging
+import os
+import time
 import requests as _requests
 from pathlib import Path
 from typing import Optional
 
-from huggingface_hub import hf_hub_download, model_info
+from huggingface_hub import hf_hub_download, model_info as _raw_model_info
 from eval.runtime import (
     STATE_DIR as RUNTIME_STATE_DIR,
     STUDENT,
@@ -28,6 +30,45 @@ from eval.runtime import (
 )
 
 logger = logging.getLogger("quasar.model_checker")
+
+
+_HF_TOKEN = os.environ.get("HF_TOKEN") or None
+_MODEL_INFO_RETRY_DELAYS = (0.5, 1.5, 4.0)
+
+
+def model_info(model_repo, revision=None, files_metadata=False, token=None, **kwargs):
+    """HF model_info with auth and bounded retries for transient HF errors."""
+    effective_token = token if token is not None else _HF_TOKEN
+    last_exc = None
+    for attempt, delay in enumerate((0.0,) + _MODEL_INFO_RETRY_DELAYS):
+        if delay:
+            time.sleep(delay)
+        try:
+            return _raw_model_info(
+                model_repo,
+                revision=revision,
+                files_metadata=files_metadata,
+                token=effective_token,
+                **kwargs,
+            )
+        except Exception as exc:
+            last_exc = exc
+            msg = str(exc).lower()
+            if not any(k in msg for k in ("429", "rate limit", "too many", "503", "502", "timeout")):
+                raise
+            if attempt == len(_MODEL_INFO_RETRY_DELAYS):
+                raise
+            logger.debug(
+                "model_info(%s@%s) attempt %d hit transient %s; backing off %.1fs",
+                model_repo,
+                revision,
+                attempt + 1,
+                type(exc).__name__,
+                _MODEL_INFO_RETRY_DELAYS[attempt],
+            )
+    if last_exc:
+        raise last_exc
+
 
 BASELINE_VOCAB_SIZE = STUDENT_VOCAB_SIZE or TEACHER_CONFIG_VOCAB_SIZE
 TOKENIZER_REFERENCE_MODEL = STUDENT_BASE_MODEL or TEACHER_MODEL
@@ -457,6 +498,10 @@ def compute_tensor_metadata_hash(model_repo: str, revision: str = None) -> Optio
         logger.warning(f"Tensor metadata hash failed for {model_repo}: {e}")
         return None
 
+_INTEGRITY_CACHE: dict = {}
+_INTEGRITY_CACHE_TTL = 900
+
+
 def verify_model_integrity(
     model_repo: str,
     revision: str = None,
@@ -473,6 +518,24 @@ def verify_model_integrity(
       reason: str
       current_hash: str or None  (git SHA of repo HEAD, or weight hash for legacy)
     """
+    cache_key = (model_repo, revision or "", expected_hash or "")
+    cached = _INTEGRITY_CACHE.get(cache_key)
+    if cached is not None:
+        result, ts = cached
+        if (time.time() - ts) < _INTEGRITY_CACHE_TTL and result.get("pass") and not result.get("transient"):
+            return dict(result)
+    result = _verify_model_integrity_uncached(model_repo, revision, expected_hash)
+    if result.get("pass") and not result.get("transient"):
+        _INTEGRITY_CACHE[cache_key] = (dict(result), time.time())
+    return result
+
+
+def _verify_model_integrity_uncached(
+    model_repo: str,
+    revision: str = None,
+    expected_hash: Optional[str] = None,
+) -> dict:
+    """Inner implementation for verify_model_integrity."""
     try:
         # 1. Check model is still public (HEAD request to repo)
         info = model_info(model_repo, revision=revision)
@@ -592,7 +655,6 @@ TOKENIZER_TEST_STRINGS = [
     "日本語のテスト文字列です。Unicode handling matters.",
     "KL(P||Q) = Σ P(x) log(P(x)/Q(x)) for all x in vocabulary",
 ]
-_teacher_tokenizer = None
 
 
 def assess_vllm_compatibility(config: dict, repo_info=None) -> tuple[bool, str]:
@@ -613,23 +675,11 @@ def assess_vllm_compatibility(config: dict, repo_info=None) -> tuple[bool, str]:
         return True, "native_quasar"
 
     if model_type == "qwen3_5" and "Qwen3_5ForConditionalGeneration" in archs:
-        # preprocessor_config.json is nice-to-have (for full vLLM vision pipeline)
-        # but not required — chat_server.py copies it from base model at serving time
         suffix = "native_qwen3_5_wrapper" if preproc_present else "native_qwen3_5_wrapper_no_preproc"
-        return True, suffix
+        return False, suffix
     if model_type == "qwen3_5_text" and "Qwen3_5ForCausalLM" in archs:
         return False, "text_only_qwen3_5_checkpoint"
     return False, f"unsupported_or_unknown:{model_type}:{','.join(archs) if archs else 'none'}"
-
-
-def _get_teacher_tokenizer():
-    """Lazily load and cache the reference tokenizer."""
-    global _teacher_tokenizer
-    if _teacher_tokenizer is None:
-        from transformers import AutoTokenizer
-        _teacher_tokenizer = AutoTokenizer.from_pretrained(TOKENIZER_REFERENCE_MODEL, trust_remote_code=True)
-    return _teacher_tokenizer
-
 
 def _is_transient_error(exc: Exception) -> bool:
     """Check if an exception is a transient network error that should not DQ."""
@@ -656,11 +706,11 @@ def verify_tokenizer_files(model_repo: str, revision: str = None) -> dict:
       reason: str (if not matching)
     """
     # Download reference tokenizer.json
-    teacher_tok_json_path = hf_hub_download(
+    reference_tok_json_path = hf_hub_download(
         repo_id=TOKENIZER_REFERENCE_MODEL, filename="tokenizer.json"
     )
-    with open(teacher_tok_json_path, "rb") as f:
-        teacher_tok_hash = hashlib.sha256(f.read()).hexdigest()
+    with open(reference_tok_json_path, "rb") as f:
+        reference_tok_hash = hashlib.sha256(f.read()).hexdigest()
 
     # Download student tokenizer.json
     student_tok_json_path = hf_hub_download(
@@ -669,39 +719,39 @@ def verify_tokenizer_files(model_repo: str, revision: str = None) -> dict:
     with open(student_tok_json_path, "rb") as f:
         student_tok_hash = hashlib.sha256(f.read()).hexdigest()
 
-    if student_tok_hash != teacher_tok_hash:
+    if student_tok_hash != reference_tok_hash:
         return {
             "match": False,
             "reason": (
                 f"tokenizer.json mismatch: student hash {student_tok_hash[:16]}... "
-                f"!= reference hash {teacher_tok_hash[:16]}... "
+                f"!= reference hash {reference_tok_hash[:16]}... "
                 f"(vocab/merges/added_tokens differ from {TOKENIZER_REFERENCE_MODEL})"
             ),
         }
 
     # Check tokenizer_config.json (excluding chat_template)
-    teacher_cfg_path = hf_hub_download(
+    reference_cfg_path = hf_hub_download(
         repo_id=TOKENIZER_REFERENCE_MODEL, filename="tokenizer_config.json"
     )
     student_cfg_path = hf_hub_download(
         repo_id=model_repo, filename="tokenizer_config.json", revision=revision
     )
 
-    with open(teacher_cfg_path) as f:
-        teacher_cfg = json.load(f)
+    with open(reference_cfg_path) as f:
+        reference_cfg = json.load(f)
     with open(student_cfg_path) as f:
         student_cfg = json.load(f)
 
     # Remove chat_template from both (checked separately)
-    teacher_cfg.pop("chat_template", None)
+    reference_cfg.pop("chat_template", None)
     student_cfg.pop("chat_template", None)
 
-    if teacher_cfg != student_cfg:
+    if reference_cfg != student_cfg:
         # Find the differing keys for a clear error message
         diff_keys = []
-        all_keys = set(teacher_cfg.keys()) | set(student_cfg.keys())
+        all_keys = set(reference_cfg.keys()) | set(student_cfg.keys())
         for k in sorted(all_keys):
-            if teacher_cfg.get(k) != student_cfg.get(k):
+            if reference_cfg.get(k) != student_cfg.get(k):
                 diff_keys.append(k)
         return {
             "match": False,
@@ -729,21 +779,21 @@ def verify_tokenizer_match(model_repo: str, revision: str = None) -> dict:
     # Load tokenizer.json directly via the `tokenizers` library.
     # This bypasses AutoTokenizer class resolution issues (e.g., TokenizersBackend)
     # while still verifying identical encoding behavior.
-    teacher_path = _hf_dl(TOKENIZER_REFERENCE_MODEL, "tokenizer.json")
-    teacher_tok = RawTokenizer.from_file(teacher_path)
+    reference_path = _hf_dl(TOKENIZER_REFERENCE_MODEL, "tokenizer.json")
+    reference_tok = RawTokenizer.from_file(reference_path)
 
     student_path = _hf_dl(model_repo, "tokenizer.json", revision=revision)
     student_tok = RawTokenizer.from_file(student_path)
 
     for test_str in TOKENIZER_TEST_STRINGS:
-        teacher_ids = teacher_tok.encode(test_str).ids
+        reference_ids = reference_tok.encode(test_str).ids
         student_ids = student_tok.encode(test_str).ids
-        if teacher_ids != student_ids:
+        if reference_ids != student_ids:
             return {
                 "match": False,
                 "reason": (
                     f"Encoding mismatch on test string: "
-                    f"reference produced {len(teacher_ids)} tokens, "
+                    f"reference produced {len(reference_ids)} tokens, "
                     f"student produced {len(student_ids)} tokens"
                 ),
             }
@@ -757,7 +807,7 @@ def check_model_architecture(
     max_total_params_b: float = 3.5,
 ) -> dict:
     """
-    Check if a model meets distillation subnet requirements.
+    Check if a model meets Quasar SN24 requirements.
 
     Checks:
     - Total params ≤ max_total_params_b (prevents huge MoE uploads)
@@ -923,7 +973,7 @@ def check_model_architecture(
 
         # 4b. Cross-validate: config param count vs actual file size
         # A real N-billion param model in bf16 should be ~2*N GB on disk.
-        # If the config says 3B but files are 70GB, the config is lying.
+        # If the config claims a small model but the weight files are huge, the config is lying.
         try:
             total_weight_bytes = 0
             for sibling in (info.siblings or []):
@@ -1011,12 +1061,14 @@ def check_model_architecture(
                     "vocab_size": vocab_size,
                 }
 
-        # 9. Verify chat_template matches the official Quasar template
-        # Prevents exploits via modified chat templates and blocks derivative models
-        # that copy templates from other miners (e.g., slowsnake copying caseus's watermarked template)
-        REFERENCE_TEMPLATE_HASH = "a4aee8afcf2e0711942cf848899be66016f8d14a889ff9ede07bca099c28f715"
+        # 9. Verify chat_template matches the official Quasar template.
+        # Modified templates can change prompt formatting, hide metadata,
+        # or make evaluation behavior differ from the official base.
+        REFERENCE_TEMPLATE_HASH = STUDENT.get(
+            "chatTemplateHash",
+            "a4aee8afcf2e0711942cf848899be66016f8d14a889ff9ede07bca099c28f715",
+        )
         try:
-            import hashlib
             tok_config_path = hf_hub_download(
                 repo_id=model_repo, filename="tokenizer_config.json", revision=revision,
             )
@@ -1038,8 +1090,7 @@ def check_model_architecture(
                     pass  # No standalone template file
 
             if student_template:
-                # Strip leading/trailing whitespace and any comment-only first lines
-                # (catches watermarks like "{# model distilled by caseus #}")
+                # Strip leading/trailing whitespace and comment-only first lines.
                 import re
                 cleaned = re.sub(r'^\s*\{#.*?#\}\s*\n?', '', student_template, flags=re.MULTILINE).strip()
                 template_hash = hashlib.sha256(cleaned.encode()).hexdigest()

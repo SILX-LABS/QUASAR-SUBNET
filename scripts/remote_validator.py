@@ -30,12 +30,12 @@ from scripts.validator.service import run_validator
 @click.option("--hotkey-name", default="validator")
 @click.option("--wallet-path", default="~/.bittensor/wallets/")
 @click.option("--eval-backend", type=click.Choice(["lium", "local"]), default="lium",
-              envvar=["QUASAR_EVAL_BACKEND", "DISTIL_EVAL_BACKEND"], show_default=True,
+              envvar="QUASAR_EVAL_BACKEND", show_default=True,
               help="Where to run GPU evaluation.")
 @click.option("--lium-api-key", envvar="LIUM_API_KEY")
 @click.option("--lium-pod-name", default="quasar-eval")
 @click.option("--local-eval-dir", default=None,
-              envvar=["QUASAR_LOCAL_EVAL_DIR", "DISTIL_LOCAL_EVAL_DIR"],
+              envvar="QUASAR_LOCAL_EVAL_DIR",
               help="Local workspace for --eval-backend local.")
 @click.option("--state-dir", default="state")
 @click.option("--max-params-b", type=float, default=3.5)

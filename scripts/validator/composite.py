@@ -2,7 +2,7 @@
 
 Core idea: a single scalar like KL can be over-optimized until the model is
 useless under autoregressive sampling (the Tiapkin 2025 "Teacher Hacking"
-pathology, empirically visible on the 2026-04-22 king, which rambles
+pathology, empirically visible in prior production rounds where a king rambled
 3–10x longer than the teacher on trivial prompts while passing KL). The
 fix is to score each student on several independent axes and combine them
 with a worst-case rule, so that gaming any single axis penalizes overall
@@ -12,15 +12,13 @@ This module is intentionally pure-Python, no ML deps, safe to import from
 the validator service. It consumes the JSON that ``pod_eval_vllm.py``
 writes per student and emits a ``composite`` score and per-axis breakdown.
 
-Status: PRODUCTION — ranking + dethrone veto.
+Status: PRODUCTION — ranking + dethrone gate.
   * 2026-04-19 (commit 8eec9a2): promoted from shadow to production
     ranking key. ``composite.worst`` orders the leaderboard and selects
     the canonical challenger for display.
-  * 2026-04-22: ``composite.worst`` is now ALSO a dethrone gate. A
-    challenger that passes the KL paired t-test + 3% epsilon is still
-    blocked from taking the crown if its worst composite axis is below
-    ``COMPOSITE_DETHRONE_FLOOR`` (currently 0.20). See
-    ``scripts/validator/results.py::_composite_dethrone_veto``.
+  * Current Quasar policy: ``composite.worst`` is the primary crown key.
+    Tied/saturated worst scores fall back to ``composite.weighted`` with
+    the same dethrone margin. KL is retained as a distillation axis only.
   * Same commit: the ``length`` axis is now always populated even when
     ``THINK_COLLAPSE_PROBE=0``. It falls back to the always-on
     ``chat_probe`` length vs a teacher anchor captured in
@@ -41,7 +39,7 @@ Status: PRODUCTION — ranking + dethrone veto.
     distilled model of a non-SOTA teacher ranked #1 but couldn't do
     grade-school math. New axes score against ground truth so
     overfitting them ⇒ SOTA small model.
-  * 2026-04-24: **Session 3 axes added in SHADOW** (promote +48h):
+  * 2026-04-24: **Session 3 axes promoted live**:
     ``aime_bench`` (AIME olympiad math), ``mbpp_bench`` (MBPP+ code),
     ``tool_use_bench`` (agentic Python tool use), and
     ``self_consistency_bench`` (majority-vote over sampled generations).
@@ -49,12 +47,10 @@ Status: PRODUCTION — ranking + dethrone veto.
     pointing towards a genuinely valuable capability. See
     ``reports/2026-04-24-arena-v3.md`` for the full Affine-Cortex-
     inspired design.
-  * 2026-04-24: **Pareto majority dominance** (SHADOW): in addition
+  * 2026-04-24: **Pareto majority dominance**: in addition
     to the worst-axis floor, a challenger that beats the king on KL
-    but loses on a majority of axes is flagged. Today informational
-    only (logged + surfaced in telemetry). Becomes part of the
-    dethrone gate when ``PARETO_DOMINANCE_GATE=1`` (after +48h
-    notice on Discord).
+    but loses on a majority of axes is blocked. This is part of the
+    dethrone gate by default after the public telemetry window.
   * 2026-04-25: Session 3.1 ``arc_bench`` (AI2 ARC-Challenge
     commonsense science MC), 3.2 ``reasoning_density`` (pass_frac ×
     length_bonus — explicitly penalizes over-think-on-trivia),
@@ -63,9 +59,10 @@ Status: PRODUCTION — ranking + dethrone veto.
     3.5 ``long_context_bench`` (procedural needle-in-haystack
     over ~1400 tokens — literally uncheatable because items are
     generated fresh every round from the block_seed, no fixed
-    dataset exists) — all SHADOW. Each targets a capability that
-    Session 2 + relative axes don't already reward, so climbing
-    them requires genuine model improvement. See
+    dataset exists), and 3.6 ``procedural_bench`` (block-seeded
+    synthetic reasoning / instruction following / factual retrieval).
+    Each targets a capability that Session 2 + relative axes don't
+    already reward, so climbing them requires genuine model improvement. See
     ``reports/2026-04-24-arena-v3.md`` and the ``MINER_FAQ.md``
     playbook.
 
@@ -77,8 +74,11 @@ probe outage to freeze the crown.
 """
 from __future__ import annotations
 
+import logging
 import os
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 
 # Five-axis composite (T1.3). On-policy RKL is the primary distillation
@@ -120,57 +120,99 @@ JUDGE_AXIS_IN_COMPOSITE = os.environ.get("JUDGE_AXIS_IN_COMPOSITE", "1") != "0"
 # normalized to [0, 1] by raw ``pass_frac``. Promoted to composite
 # ranking 2026-04-24 after the planned 48h shadow window (see the
 # 2026-04-24-pareto-holistic-eval-v2.md report section 5 + the
-# Discord 48h announcement).
+    # public launch announcement).
 BENCH_AXIS_WEIGHTS = {
-    "math_bench":      float(os.environ.get("BENCH_MATH_WEIGHT", "0.12")),
-    "code_bench":      float(os.environ.get("BENCH_CODE_WEIGHT", "0.12")),
-    "reasoning_bench": float(os.environ.get("BENCH_REASONING_WEIGHT", "0.08")),
-    "knowledge_bench": float(os.environ.get("BENCH_KNOWLEDGE_WEIGHT", "0.08")),
-    "ifeval_bench":    float(os.environ.get("BENCH_IFEVAL_WEIGHT", "0.05")),
+    # 2026-04-26 (v28) — quality > quantity rebalance. After 6 weeks of
+    # axis sprawl (Sessions 2 + 3 + 3.1-3.7 added 13 bench axes), several
+    # were either eval-setup-fragile (knowledge_bench: 4-option MCs that
+    # the reference 4B base model passed by chance) or duplicative
+    # (procedural_bench overlapped with the post-v27 procedural rewrite
+    # of math_bench / capability). Knowledge_bench is muted to weight 0
+    # but kept in the per-axis report for telemetry; the weight payoff
+    # (0.08) shifts to math (+0.02), code (+0.02), reasoning (+0.02),
+    # ifeval (+0.02) — all axes the user explicitly asked us to make
+    # *more* binding, not less. See ``reports/2026-04-27-eval-quality.md``.
+    "math_bench":      float(os.environ.get("BENCH_MATH_WEIGHT", "0.14")),
+    "code_bench":      float(os.environ.get("BENCH_CODE_WEIGHT", "0.14")),
+    "reasoning_bench": float(os.environ.get("BENCH_REASONING_WEIGHT", "0.10")),
+    "knowledge_bench": float(os.environ.get("BENCH_KNOWLEDGE_WEIGHT", "0.0")),
+    "ifeval_bench":    float(os.environ.get("BENCH_IFEVAL_WEIGHT", "0.07")),
 }
 
 BENCH_AXES_IN_COMPOSITE = os.environ.get("BENCH_AXES_IN_COMPOSITE", "1") != "0"
 
-# ── 2026-04-24 — Arena v3 Session 3 (SHADOW, promote +48h) ────────────
+# ── 2026-04-24 — Arena v3 Session 3 (PRODUCTION) ─────────────────────
 # Four capability-extending axes inspired by Affine Cortex's environment
 # suite. Each scores absolute correctness against a public gold source;
 # the ordering gain is in **coverage** — a model that overfits AIME
 # still had to actually learn olympiad math, a model that overfits
 # tool_use_bench still had to actually learn when to write Python.
-# Tuned weights are conservative (5-8%) so Session 2 + the relative
-# axes keep dominating the composite until the +48h public notice
-# completes. Flip ``ARENA_V3_AXES_IN_COMPOSITE=1`` to promote.
+# Tuned weights are conservative (3-6%) so Session 2 + the relative
+# axes remain important while hard capability coverage is binding.
 ARENA_V3_AXIS_WEIGHTS = {
-    "aime_bench":              float(os.environ.get("BENCH_AIME_WEIGHT", "0.06")),
-    "mbpp_bench":              float(os.environ.get("BENCH_MBPP_WEIGHT", "0.06")),
-    "tool_use_bench":           float(os.environ.get("BENCH_TOOL_USE_WEIGHT", "0.04")),
-    "self_consistency_bench":   float(os.environ.get("BENCH_SC_WEIGHT", "0.04")),
-    # Session 3.1 — ARC-Challenge commonsense science (added 2026-04-25).
-    # Small weight because it overlaps somewhat with ``reasoning_bench``
-    # and ``knowledge_bench`` conceptually, but the dataset is completely
-    # disjoint so it adds real coverage.
-    "arc_bench":                float(os.environ.get("BENCH_ARC_WEIGHT", "0.04")),
-    # Session 3.4 — TruthfulQA hallucination-resistance (added 2026-04-25).
-    # Adversarial factual questions with attractive-but-wrong answers.
-    # This is the only axis that directly rewards the model saying "the
-    # popularly-believed-but-wrong option is wrong"; climbing it via
-    # distillation alone is insufficient because the teacher also has
-    # pretraining priors. Miners who add factuality data to their SFT
-    # mix (TriviaQA-factual, RefuseElseFalse, HaluEval-sft) will climb.
-    "truthful_bench":           float(os.environ.get("BENCH_TRUTHFUL_WEIGHT", "0.03")),
+    # 2026-04-26 (v28) — Quality > Quantity (Directive 2).
+    # We dropped six axes that were either redundant or eval-setup-
+    # fragile, and redirected their composite weight to harder, more
+    # discriminating capability axes. Cuts:
+    #   * ``self_consistency_bench`` (was 0.04): same item pool as
+    #     math_bench, just sampled K-way and majority-voted. Miners who
+    #     beat math_bench beat this; miners who fail math_bench
+    #     occasionally pick up free credit when their k=4 sampler hits a
+    #     correct answer by chance. No marginal signal.
+    #   * ``arc_bench`` (was 0.04): commonsense MC. Reference 4B base
+    #     scored 0.50 by random-pick, ceiling for the king is around
+    #     0.75 — small dynamic range, and the signal it carries is
+    #     dominated by knowledge_bench + reasoning_bench. Conceptually
+    #     duplicative.
+    #   * ``truthful_bench`` (was 0.03): adversarial trivia, narrow
+    #     surface (~50 question categories). Top miner saturated with
+    #     refusal-trained heuristics, not real epistemic discipline.
+    #   * ``procedural_bench`` (was 0.05): now covered by the post-v27
+    #     procedural rewrite of math_bench / capability / reasoning.
+    #     Removing avoids triple-counting the same procedural-arithmetic
+    #     signal across three weighted axes.
+    #   * ``noise_resistance_bench`` (was 0.04): sibling of robustness
+    #     that perturbs surface noise (typos / case). After v23/v24
+    #     code-paraphrase + BBH-shuffle + math paraphrase landed, the
+    #     same signal is captured by robustness_bench at half the
+    #     wall-time cost.
+    # Net cut: 0.20 weight + ~24 items per round (~9 min wall-time).
+    # Redirected:
+    #   aime_bench    +0.04  (0.06 → 0.10) — olympiad math, hard, ~zero
+    #                                        memorisation surface post-v21.
+    #   mbpp_bench    +0.02  (0.06 → 0.08) — programming breadth, complement
+    #                                        to code_bench.
+    #   tool_use_bench +0.02 (0.04 → 0.06) — agentic Python, no proxy axis.
+    #   long_context  +0.01  (0.03 → 0.04) — procedural needle-in-haystack,
+    #                                        uniquely tests retrieval.
+    #   robustness    +0.03  (0.04 → 0.07) — absorbs the cut noise axis;
+    #                                        validator now runs paraphrase +
+    #                                        noise perturbations under one
+    #                                        umbrella.
+    "aime_bench":              float(os.environ.get("BENCH_AIME_WEIGHT", "0.10")),
+    "mbpp_bench":              float(os.environ.get("BENCH_MBPP_WEIGHT", "0.08")),
+    "tool_use_bench":           float(os.environ.get("BENCH_TOOL_USE_WEIGHT", "0.06")),
+    "self_consistency_bench":   float(os.environ.get("BENCH_SC_WEIGHT", "0.0")),
+    "arc_bench":                float(os.environ.get("BENCH_ARC_WEIGHT", "0.0")),
+    "truthful_bench":           float(os.environ.get("BENCH_TRUTHFUL_WEIGHT", "0.0")),
     # Session 3.5 — long-context needle-in-haystack (added 2026-04-25).
-    # Procedural: the items are generated fresh every round from the
-    # block_seed, so there is LITERALLY no training set to memorize. A
-    # model either retrieves from context or hallucinates. Directly tests
-    # a capability every other axis leaves open (all other prompts are
-    # under 1k tokens). Cheap because we reuse _bench_generate with
-    # enable_thinking=False.
-    "long_context_bench":       float(os.environ.get("BENCH_LC_WEIGHT", "0.03")),
+    # Procedural: items are generated fresh every round from block_seed,
+    # so there is LITERALLY no training set to memorize.
+    "long_context_bench":       float(os.environ.get("BENCH_LC_WEIGHT", "0.04")),
+    "procedural_bench":         float(os.environ.get("BENCH_PROCEDURAL_WEIGHT", "0.0")),
+    # Session 3.7 — robustness_bench. Math items asked under K
+    # block-rotated paraphrase + noise wrappers (see v28 unified
+    # generator). Directly punishes prompt-pattern memorisation at the
+    # math/code/aime perimeter without re-evaling anyone.
+    "robustness_bench":         float(os.environ.get("BENCH_ROBUSTNESS_WEIGHT", "0.07")),
+    # noise_resistance kept addressable via env override but defaults
+    # to 0 — paraphrase + surface noise both flow through robustness.
+    "noise_resistance_bench":   float(os.environ.get("BENCH_NOISE_WEIGHT", "0.0")),
 }
 
-ARENA_V3_AXES_IN_COMPOSITE = os.environ.get("ARENA_V3_AXES_IN_COMPOSITE", "0") != "0"
+ARENA_V3_AXES_IN_COMPOSITE = os.environ.get("ARENA_V3_AXES_IN_COMPOSITE", "1") != "0"
 
-# ── 2026-04-25 — Session 3.2 reasoning_density axis (SHADOW) ──────────
+# ── 2026-04-25 — Session 3.2 reasoning_density axis (PRODUCTION) ─────
 # User-reported pathology: "models are too distilled and think for too
 # long about simple questions." The existing ``length`` axis addresses
 # chat-probe length only. Bench probes give us per-axis mean_gen_tokens
@@ -187,9 +229,7 @@ ARENA_V3_AXES_IN_COMPOSITE = os.environ.get("ARENA_V3_AXES_IN_COMPOSITE", "0") !
 # outputs "42" with 5 tokens still needs to get the answer right on a
 # rotating pool; if it does, fine — the axis is neutral).
 #
-# SHADOW until the +48h public notice, then flip
-# ``REASONING_DENSITY_AXIS_IN_COMPOSITE=1`` to promote. Weight tuned
-# low so it's an auxiliary signal, not a dominant one.
+# Live with low weight so it is an auxiliary signal, not a dominant one.
 REASONING_DENSITY_TARGET_TOKENS = {
     "math_bench":            float(os.environ.get("RD_MATH_TARGET", "400")),
     "code_bench":            float(os.environ.get("RD_CODE_TARGET", "300")),
@@ -203,13 +243,22 @@ REASONING_DENSITY_TARGET_TOKENS = {
     "arc_bench":             float(os.environ.get("RD_ARC_TARGET", "50")),
     "truthful_bench":        float(os.environ.get("RD_TRUTHFUL_TARGET", "40")),
     "long_context_bench":    float(os.environ.get("RD_LC_TARGET", "30")),
+    "procedural_bench":      float(os.environ.get("RD_PROCEDURAL_TARGET", "50")),
+    # Session 3.7 — robustness reuses math items so target ≈ math but
+    # tighter (the perturbation prefixes inflate input slightly; a
+    # 380-token cap keeps the comparison fair across wrappers).
+    "robustness_bench":      float(os.environ.get("RD_ROBUSTNESS_TARGET", "400")),
+    # Session 3.7 — noise_resistance reuses math items as well; same
+    # target token budget so reasoning-density comparisons across the
+    # math/robustness/noise triple are apples-to-apples.
+    "noise_resistance_bench": float(os.environ.get("RD_NOISE_TARGET", "400")),
 }
 REASONING_DENSITY_WEIGHT = float(os.environ.get("REASONING_DENSITY_WEIGHT", "0.05"))
 REASONING_DENSITY_IN_COMPOSITE = (
-    os.environ.get("REASONING_DENSITY_IN_COMPOSITE", "0") != "0"
+    os.environ.get("REASONING_DENSITY_IN_COMPOSITE", "1") != "0"
 )
 
-# ── 2026-04-25 — Session 3.3 chat_turns_probe axis (SHADOW) ───────────
+# ── 2026-04-25 — Session 3.3 chat_turns_probe axis (PRODUCTION) ──────
 # Multi-turn coherence probe. Teacher grades a 3-turn transcript on a
 # 1-5 rubric (coherence + consistency + helpfulness). Normalized to
 # [0, 1]; identical shape to judge_probe so axis values are directly
@@ -217,14 +266,19 @@ REASONING_DENSITY_IN_COMPOSITE = (
 # hold context gets flagged by this axis — directly addressing the
 # user-reported "models are too distilled, forget context" pathology.
 #
-# Shadow-first: dashboard shows it alongside judge; promote to composite
-# ranking once we've observed at least one 48h window of stable teacher
-# scoring. See MINER_FAQ.md and reports/2026-04-24-arena-v3.md.
+# Live: single-turn KL specialists should not dethrone if they cannot
+# maintain coherence over a short dialogue.
 CHAT_TURNS_AXIS_WEIGHT = float(os.environ.get("CHAT_TURNS_AXIS_WEIGHT", "0.08"))
 CHAT_TURNS_AXIS_IN_COMPOSITE = (
-    os.environ.get("CHAT_TURNS_AXIS_IN_COMPOSITE", "0") != "0"
+    os.environ.get("CHAT_TURNS_AXIS_IN_COMPOSITE", "1") != "0"
 )
-CHAT_TURNS_MIN_VALID = int(os.environ.get("CHAT_TURNS_MIN_VALID", "3"))
+CHAT_TURNS_MIN_VALID = int(os.environ.get("CHAT_TURNS_MIN_VALID", "2"))
+# Judge-probe min-valid threshold. Default 4 lets it work with reduced
+# budgets (we currently run JUDGE_PROBE_PER_ROUND=6 for speed) without
+# silently dropping the axis. Bug-discovered 2026-04-26: the previous
+# hardcoded 8 was higher than the configured budget, so judge_probe
+# was always None in production.
+JUDGE_PROBE_MIN_VALID = int(os.environ.get("JUDGE_PROBE_MIN_VALID", "4"))
 
 # Per-axis minimum valid-item count below which the axis drops as
 # "insufficient sample". Small pools (code_bench samples only 4 items
@@ -236,22 +290,32 @@ BENCH_MIN_VALID = {
     "reasoning_bench": 4,
     "knowledge_bench": 4,
     "ifeval_bench": 4,
-    # Session 3 axes — small per-round budgets, so very tight floors.
-    "aime_bench": 2,
-    "mbpp_bench": 2,
-    "tool_use_bench": 2,
-    "self_consistency_bench": 2,
+    # Session 3 axes — now live, so require enough items to dampen lucky
+    # pass_frac spikes while still failing open on probe outages.
+    "aime_bench": 3,
+    "mbpp_bench": 3,
+    "tool_use_bench": 3,
+    "self_consistency_bench": 3,
     # Session 3.1 — ARC larger budget (6 per round), keep floor at 4
     # so one parse failure doesn't drop the axis.
     "arc_bench": 4,
     # Session 3.4 — TruthfulQA 4 per round, tight floor at 2.
-    "truthful_bench": 2,
+    "truthful_bench": 3,
     # Session 3.5 — long-context 3 per round, tight floor at 2 since
     # each item is expensive (~1400 input tokens).
     "long_context_bench": 2,
+    "procedural_bench": 4,
+    # Session 3.7 — robustness draws K_perturb generations per item, so
+    # a 4-item budget yields 8+ generations: hold the min_valid floor
+    # at K_perturb so a single item drop doesn't kill the axis.
+    "robustness_bench": 2,
+    # Session 3.7 — noise_resistance has the same shape as robustness
+    # (K perturbations × N items); use the same floor so a single
+    # tokenization or grader edge case can't drop the axis.
+    "noise_resistance_bench": 2,
 }
 
-COMPOSITE_SHADOW_VERSION = 9  # bumped for Session 3.5 long_context_bench
+COMPOSITE_SHADOW_VERSION = 28  # Session 3.21 — quality > quantity rebalance. Six axes muted to weight 0 (knowledge_bench, arc_bench, truthful_bench, procedural_bench, self_consistency_bench, noise_resistance_bench) because they were either eval-setup-fragile (random-pick floors near the king's signal), redundant with the post-v27 procedural rewrite (procedural_bench duplicates capability + math_bench), or the same item pool re-graded under a different aggregator (self_consistency reuses math_bench). Cut weight 0.20 redirected to harder axes the user explicitly asked us to make more binding (aime_bench +0.04, mbpp_bench +0.02, tool_use_bench +0.02, long_context_bench +0.01, robustness_bench +0.03) and to the relative-axis cluster (math_bench +0.02, code_bench +0.02, reasoning_bench +0.02, ifeval_bench +0.02). Per-round item budgets shrunk on the muted axes (knowledge: 10→0, arc: 8→0, truthful: 6→0, procedural: 6→0, self_consistency: 6→0, noise_resistance: 4→0) and bumped on the high-value ones (math: 10→12, aime: 6→8, code: 6→8, mbpp: 6→8). Net effect: ~24 fewer items per round (~9 min wall-time saved) with sharper composite ranking. Mixing v27 and v28 records is unsafe because v27 records carry six axes the v28 ranker now ignores — the king filter (``_KING_SELECTION_MIN_VERSION = 28``) quarantines old records until regraded under v28 so the dethrone gate never compares v27-axes-passed-on-luck to v28-honest-ranking. Session 3.20 — full procedural switch for math_bench / code_bench / reasoning_bench / knowledge_bench / ifeval_bench / aime_bench / mbpp_bench / tool_use_bench / self_consistency_bench / arc_bench / truthful_bench / robustness_bench / noise_resistance_bench. Pre-v27 every benchmark axis sampled from public datasets (GSM8K + MATH-500 + HumanEval + MBPP + BBH + MMLU-Pro + IFEval + AIME + ARC + TruthfulQA). v18-v26 paraphrase / option-shuffle / prompt-rotation hardening rotated the surface form of public items but the (problem, gold) pair on disk was unchanged, so a miner with a {paraphrased_question → answer} lookup over the public corpus could still saturate the axis. v27 generates the bench items per round directly from ``block_seed`` via 6 new procedural generators in ``pod_eval_vllm.py`` (_generate_math_items / _generate_aime_items / _generate_code_items / _generate_reasoning_items / _generate_mc_items / _generate_ifeval_items). The (parameters, gold) pair is fresh every round and exists nowhere on disk — there is no dataset to memorise. The public datasets remain available for ``scripts/eval_pod/auto_benchmark.sh`` post-hoc evalscope verification against the king on a separate Lium pod, but the validator never trains-or-evals against the public items. Round duration unchanged because per-item generation is microseconds. Mixing v26 and v27 records would let a v26 memoriser keep their inflated public-pool floor under the old grading while honest miners regrade against fresh procedural items every round — the king filter (``_KING_SELECTION_MIN_VERSION = 27``) quarantines old records until regraded under v27. Session 3.19 — on_policy_rkl per-round chat-domain prompt paraphrase. After v25 closed the judge_probe / chat_turns_probe surfaces, ``on_policy_rkl`` (composite weight 0.35 — the SINGLE-LARGEST axis weight in the entire composite, larger than the next two combined) was the largest remaining un-rotated public-prompt-pool axis. The 80-prompt ``ON_POLICY_RKL_POOL`` is fully baked into the open-source ``pod_eval_vllm.py``; pre-v17 the per-round 16-of-80 sample was deterministic on ``block_seed`` but the rollout-sampling seed was a constant ``42``, so a miner could pre-compute their student's exact deterministic rollout per pool entry and surgically train weights to align with the teacher's high-prob tokens at every position of that exact trajectory. v17 (Session 3.10) defeated *that specific* attack by rotating the rollout-sampling seed per ``block_seed`` (XOR with ``ON_POLICY_RKL_SEED``) — but it did NOT defeat the more fundamental Goodhart vector that prompt rotation alone defeats: a miner who pre-distils their student onto ``teacher_logprobs(prompt)`` for the canonical wording of all 80 pool entries can saturate ``on_policy_rkl`` regardless of sampling-seed rotation, because the student has been trained to place teacher-likely tokens at every position the teacher would. Rotating the *surface form* of the prompt every round forces a student that wants to keep its low-KL floor to actually generalise across phrasings — which is the entire point of distillation. v26 wires the v25 ``_paraphrase_chat_prompt`` helper into ``_pick_on_policy_rkl_prompts`` so each of the 16 sampled prompts gets a chat-domain synonym swap (``_CHAT_INSTRUCTION_SYNONYMS``: explain/describe/outline, give/provide/offer, list/enumerate, briefly/concisely, etc.) keyed on ``(block_seed, sha(prompt))``. The helper is region-aware so translation answer keys ("Translate to French: The cat sat on the mat.") are PROTECTED — only conversational PROSE rotates, the quoted source text and the language tag survive byte-identical so the gold output of a translation prompt is unchanged. JSON-output specs ("Output a JSON object with keys 'name' and 'age'..."), function-signature requests, and bash one-liner prompts likewise survive because their format constraints sit inside protected single-quoted regions. The math-domain default synonym table is *not* layered in (the helper uses ``_apply_chat_synonyms``) so verbs like ``find``/``calculate``/``determine`` in the on_policy_rkl reasoning sub-pool ("Is 97 prime? Answer with reasoning.") read naturally because they are NOT rewritten — only chat-domain prose rotates. Mixing v25 and v26 records would let an on_policy_rkl wording-memoriser keep their inflated low-KL floor under the old grading while honest miners regrade against rotated phrasings — the king filter quarantines old records until regraded under v26. Session 3.18 — judge_probe / chat_turns_probe canonical-response paraphrase. After v18-v24 closed every benchmark-axis canonical-wording attack vector, the two largest remaining un-rotated public-prompt-pool axes were ``judge_probe`` (composite weight 0.15, drawn from a 65-prompt static pool baked into ``pod_eval_vllm.py``) and ``chat_turns_probe`` (composite weight 0.08, drawn from a ~25-conversation static pool of 3-turn dialogues). Combined attack surface = 0.23 weight, larger than ``code_bench`` + ``reasoning_bench`` combined (0.20). Both axes are graded by the teacher rubric on a 1-5 scale of "correct + clear + addresses the question + appropriate length" — a miner who pre-trains on canonical 5/5-quality responses to all ~90 prompts can saturate both axes from a ``{prompt_text → canonical_response}`` lookup without doing any genuine chat work, the same canonical-wording memorisation Goodhart vector closed for math / code / BBH in v18-v24, just on a smaller surface. v25 introduces ``_paraphrase_chat_prompt`` which is region-aware: it splits each prompt into alternating PROSE / PROTECTED chunks (anything inside triple-backtick fences, single-backtick code, single or double quoted strings, or inline ``{...}`` JSON-like blocks is PROTECTED) and applies a chat-domain synonym swap (``_CHAT_INSTRUCTION_SYNONYMS``: explain/describe/outline, give/provide/offer, show/demonstrate/illustrate, list/enumerate, briefly/concisely, suggest/recommend, etc.) ONLY to PROSE chunks. Code identifiers (``range(5)`` / ``list(...)``), function names (``is_palindrome``), format specifiers (``'PROS: <a, b>; CONS: <c, d>'``), regex literals (``\\d{5}``), inline JSON (``{"name": "Ada", "langs": ["py", "go"]}``), and tight format constraints ("no other text" / "only the JSON" / "exactly N words") are all preserved verbatim — so the rubric-graded format adherence is unchanged and the answer key implicit in code-output prompts (``print(list(range(3, 10, 2)))``) still matches. The math-domain default synonym table is *not* layered in for chat (the helper uses ``_apply_chat_synonyms`` which bypasses the math defaults) because English homonyms (``"find a movie"`` / ``"calculate the cost"``) make indiscriminate ``find/calculate/determine`` rewrites read awkward in conversational prose. Per-prompt seed is mixed via ``_stable_seed_from_text`` so cross-validator agreement is preserved while the swap rotates per ``block_seed``. Each turn of a chat_turns_probe conversation is paraphrased independently so a memoriser keyed on "Give me a simple recipe for chocolate chip cookies." → "Provide a simple recipe..." on round N → "Offer a simple recipe..." on round N+1 sees a different surface every round across all three turns. Mixing v24 and v25 records would let a chat-prompt memoriser keep their inflated ``judge_probe=0.95`` / ``chat_turns_probe=0.95`` floor while honest miners regrade against rotated phrasings — the king filter quarantines old records until regraded under v25. Session 3.17 — reasoning_bench (BBH) inline-MC option shuffle per round. After v23 closed the code surface, ``reasoning_bench`` (0.08 weight, 21 BBH subtasks) was the largest remaining un-rotated MC public-pool axis. ~12 of the 21 BBH subtasks (logical_deduction_*, tracking_shuffled_objects_*, disambiguation_qa, geometric_shapes, hyperbaton, movie_recommendation, penguins_in_a_table, ruin_names, snarks, temporal_sequences) ship with a fixed correct-letter per item, encoded INLINE in the question text as ``Options:\\n(A) ...\\n(B) ...``. The round-20 ``_shuffle_mc_options_for_round`` helper couldn't be reused because BBH stores options inline rather than as a separate ``options`` field. Schema-version-0 records (pre any Goodhart hardening) reached ``reasoning_bench=0.88`` paired with ``capability=0.99`` / ``arc_bench=0`` / ``code_bench=0`` — the textbook saturated-on-memorisable-axis Goodhart signature. v24 introduces ``_shuffle_bbh_mc_options`` which parses the inline ``Options:\\n(A) ...`` block via a dedicated regex, shuffles option contents per ``(block_seed XOR sha256(question))`` to match v20's keying convention, and remaps the gold letter to point at where the original correct content lands. Boolean / numeric subtasks (boolean_expressions, object_counting, web_of_lies, navigate) have no inline options block and pass through unchanged so the helper degrades gracefully on the entire BBH pool. The rebuilt question keeps the canonical ``Options:\\n(A) ...\\n(B) ...`` shape so the model sees a familiar BBH format and the existing answer-extraction regex (``\\(?[A-Z]\\)?``) keeps working. Mixing v23 and v24 records would let a BBH letter-memoriser keep their inflated ``reasoning_bench=0.88`` floor while honest miners regrade against rotated letters; the king filter quarantines old records until regraded. Session 3.16 — code_bench (HumanEval) and mbpp_bench prompt paraphrase per round. After v18-v22 closed the math / multiple-choice / tool-use / self-consistency surfaces, ``code_bench`` (164 fully-public HumanEval items) and ``mbpp_bench`` (378 MBPP+ items) became the largest remaining un-rotated axis pair on the validator. ``code_bench`` carries weight 0.12 (tied with ``math_bench`` for the largest single axis weight) and the entire pool plus answer key is open-source, so a miner can build a ``{prompt → solution}`` lookup keyed on canonical docstring wording and saturate the axis without ever passing the prompt through a Python compiler. Round-18 prose-stripping closed the conversational-wrapper bypass; round 23 closes the prompt-memorisation bypass that prose-stripping could not. v23 introduces ``_paraphrase_code_problem`` which is structurally aware: it tokenises the prompt line-by-line, classifies each line as PROSE or CODE (function signatures, ``import``/``from``/``class``/``@``/``return``/``assert`` lines, ``>>>`` doctest inputs, doctest outputs, and bare triple-quote markers all classified as CODE), and applies the math-domain synonym swap PLUS a code-domain extension (``_CODE_INSTRUCTION_SYNONYMS``: "write a function" / "check if" / "given a" rotations) ONLY to PROSE lines. Function signatures, type hints, parameter names, doctest examples, and the test harness in MBPP ``assert`` blocks are preserved verbatim — a genuine solver still passes the gold tests. Cross-validator agreement: same ``(prompt, block_seed)`` → identical paraphrased prompt because the per-prompt seed is mixed via ``_stable_seed_from_text``. Mixing v22 and v23 records would let a HumanEval/MBPP wording-memoriser keep their stale code_bench=1.0 floor while honest miners regrade against rotated phrasings — the king filter requires v23+ to claim the crown so the gamed records are quarantined until regraded. Session 3.15 — math_bench / tool_use_bench / self_consistency_bench problem paraphrase per round. The round-21 paraphrase defence covered ``aime_bench`` (~90 public items) but left the much larger math-bench surface (1 319 GSM8K + 500 MATH-500 = 1 819 public items) wide open. ``math_bench`` is also the heaviest single bench weight at 0.12 (vs ``robustness_bench`` at 0.04), so a miner who memorised canonical wording could saturate it for a +0.12 weight payoff and only lose 0.04 on robustness — net +0.08 weight gain even after the round-21 audit. v22 applies the same math-domain-safe paraphrase helpers (``_apply_instruction_synonyms`` + ``_imperative_to_question``) to math_bench, tool_use_bench, and self_consistency_bench items at round-start, keyed on ``(block_seed, sha(question))``. All three axes pull from the GSM8K / MATH-500 pool, so they share the same canonical-wording attack surface — closing all three together stops the +0.20 cumulative weight payoff the previous gap allowed. Numeric constants, LaTeX (``$...$``, ``\\boxed{...}``), GSM8K ``####`` answer markers, and the ``\\n\\n`` format suffix are preserved verbatim by the helpers, so a model that genuinely understands the problem still scores; only ``{problem_text → answer}`` lookups break. Mixing v21 and v22 records would let a wording memoriser keep their math_bench=0.9 floor under the old grading while honest miners regrade against rotated phrasings — re-grounding via the king filter is required. Session 3.14 — AIME problem paraphrase per round. Pre-v21 ``aime_bench`` used the canonical AIME problem wording verbatim. The pool is ~90 public items from ``HuggingFaceH4/aime_2025`` + ``Maxwell-Jia/AIME_2024`` + ``AI-MO/aimo-validation-aime`` with integer answers 0–999. A miner who pre-trains on the public datasets can build a ``{problem_text → answer}`` lookup keyed on canonical wording. AIME isn't currently the dominant Goodhart vector (round-18 logs show top score 0.25 = 2/6, suggesting partial memorization but not full saturation) but the attack scales linearly with how much of the public pool a miner caches. v21+ wraps each AIME problem with the same math-domain-safe paraphrase helpers used by robustness_bench (``_apply_instruction_synonyms`` + ``_imperative_to_question``) keyed on ``(block_seed, sha(question))``. The synonym table only touches instruction verbs (``find``/``calculate``/``determine``) and the imperative→question rewrite only edits the closing sentence — digits, LaTeX, and boxed format are preserved so the math is unchanged. A genuine reasoner solves it; a memoriser keyed on canonical wording fails. Session 3.13 — per-round MC option shuffle for arc_bench / knowledge_bench / truthful_bench. Pre-v20 the ARC and MMLU-Pro pools shipped with a fixed correct-letter per question (the original dataset order), and ``truthful_bench`` shuffled per-question only at load time. A miner who pre-trained on the public ``allenai/ai2_arc`` and ``TIGER-Lab/MMLU-Pro`` datasets could build a ``{question_text → correct_letter}`` lookup and saturate ``arc_bench`` without parsing the options. Round 18 logs caught this in the wild: 8 distinct miners scored ``arc_bench=1.000`` while their ``knowledge_bench`` was 0.0–0.25 (uids 11/22/40/42/61/64/69/79). Rotating the option order per ``(block_seed, sha256(question))`` forces the correct letter to change every round so a memorised lookup is wrong on every refresh; the model has to actually parse the option text. Cross-validator agreement preserved (every validator with the same block_seed produces the same shuffle). Session 3.12 — capability_probe procedural rebalance. Pre-v19 the capability axis (composite weight 0.25, the second-highest after on_policy_rkl) drew 24 of its 36 items per round from a static trivia pool baked into the open-source pod_eval_vllm.py. The pool rotates 24/200 items per round but the pool is public, so a miner can pre-train answers to every entry and saturate this axis. Round 18 evidence (composite_scores.json) confirmed the attack: ``ty4321/cc`` scored capability=1.000 perfect while bombing math_bench=0.500, code_bench=0.500, aime_bench=0.000, knowledge_bench=0.500 — a textbook overfit-one-axis Goodhart signature. Several other ty4321 commitments showed the same pattern: capability ≥ 0.95 with reasoning_bench / knowledge_bench < 0.30. v19+ flips the static/procedural ratio (CAPABILITY_PROBE_N=12 down from 24, CAPABILITY_PROBE_N_PROC_MATH=24 up from 12) and broadens the procedural generator (``_procedural_capability_prompts``) beyond arithmetic to number theory, string ops (count chars / vowels), list ops (min/max/count), and comparison. All procedural items are block_seed-derived so the (operands, items) tuple is fresh every round and cannot be memorized; total per-round count stays at 36 so wall-clock cost is unchanged. Mixing v18 and v19 records would let an old static-pool memorizer keep their capability=1.0 floor while honest miners regrade against the harder mix — ranking re-grounded by the king filter. Session 3.11 — MBPP+HumanEval prose-stripping. Pre-v18 the sandbox accepted the model generation almost-verbatim: ``_strip_code_fences`` peeled markdown fences and an auto-indent path repaired bare unindented bodies, but a chatty model that wrapped a CORRECT solution in conversational prose ("Sure, here's the function:" / "Hope this helps!") tripped a SyntaxError instead of being graded on its code. Confirmed via synthetic repro on ``def is_sorted(...)`` and seen in real eval logs as IndentationError on Qwen-class HumanEval/13 outputs. That penalises coding ability on the basis of pedantic instruction-following — already measured separately in ``ifeval_bench`` — so it is a textbook Goodhart vector. v18+ adds ``_find_parseable_gen_window`` which uses ``ast.parse`` to find the largest contiguous gen line range that, concatenated to the prompt, parses cleanly. Conservative: never invents code, never re-orders lines, and the empty-prompt MBPP variant additionally requires the entry-point ``def`` to survive the trim. Mixing v17 and v18 records would let a model whose chatty wrapping was previously masked recover the earned-but-blocked passes — composite scores need to be re-grounded on a uniform sandbox. The ``_strip_code_fences`` helper was also hardened to handle paired fences with both leading and trailing prose (regex over the whole string) and to disambiguate the single-marker fallback by preferring the side that precedes the bare ``\`\`\``` marker. Session 3.10 — on_policy_rkl per-round seed rotation. Pre-v17 the student rollout-sampling seed was the constant ``ON_POLICY_RKL_SEED=42`` for every round. Combined with the prompt-pool rotation, that meant ``torch.manual_seed(42 + p_idx)`` was the SAME across rounds for every prompt position — a miner who knew the public 80-prompt pool could pre-compute their model's exact rollout (deterministic given weights + sampling seed + prompt) and surgically train weights to place teacher-high-prob tokens onto that exact sampled trajectory. That's a direct attack on the highest-weight axis (on_policy_rkl is composite-weighted higher than every benchmark axis). v17+ derives the sampling seed from ``XOR(ON_POLICY_RKL_SEED, block_seed) & 0xFFFFFFFF`` so the trajectory rotates per round (every validator agrees but per-round-rollout overfitting is impractical, requiring intra-round retraining). Mixing v16 and v17 records would let a per-round-overfitter inherit the crown via inflated on_policy_rkl. v16 robustness paraphrase, v15 prompt-injection defense, and v14 code_bench auto-indent fix carry forward unchanged.
 
 # ── Pareto majority dominance (Session 3 shadow) ──────────────────────
 # An extra dethrone consideration: a challenger must beat the king on a
@@ -262,7 +326,29 @@ COMPOSITE_SHADOW_VERSION = 9  # bumped for Session 3.5 long_context_bench
 # public notice.
 PARETO_DOMINANCE_MARGIN = float(os.environ.get("PARETO_DOMINANCE_MARGIN", "0.02"))
 PARETO_DOMINANCE_MIN_COMPARABLE = int(os.environ.get("PARETO_DOMINANCE_MIN_COMPARABLE", "5"))
-PARETO_DOMINANCE_GATE = os.environ.get("PARETO_DOMINANCE_GATE", "0") != "0"
+PARETO_DOMINANCE_GATE = os.environ.get("PARETO_DOMINANCE_GATE", "1") != "0"
+
+# ── King regression health (2026-04-24, SHADOW) ──────────────────────────
+# Upstream review question: "Why is the king safe when it scores
+# poorly on your axis test, in fact worse than the base model?" The
+# composite ranking blocks a challenger from taking the crown unless the
+# full score improves. This health block adds telemetry for cases where the
+# incumbent's weakest axis regresses toward the base-model floor.
+#
+# Minimal fix (shadow-first): compute a ``king_health`` summary each round
+# and stamp it on the king's composite row. Two flags:
+#   * ``below_floor``     — king's worst axis < KING_COMPOSITE_FLOOR
+#   * ``worse_than_base`` — king's worst axis < base model's worst axis
+# Consecutive at-risk rounds accumulate in ``state.king_regression_streak``
+# (per king_uid). Dashboard + /api/miner/{uid} surface the streak so
+# miners and spectators can see it.
+#
+# When ``KING_REGRESSION_GATE=1`` and streak ≥ ``KING_REGRESSION_MIN_STREAK``,
+# the king is force-dethroned in favor of the highest-composite challenger
+# in the current round that also passed the structural gates.
+KING_COMPOSITE_FLOOR = float(os.environ.get("KING_COMPOSITE_FLOOR", "0.20"))
+KING_REGRESSION_MIN_STREAK = int(os.environ.get("KING_REGRESSION_MIN_STREAK", "3"))
+KING_REGRESSION_GATE = os.environ.get("KING_REGRESSION_GATE", "1") != "0"
 
 # ── Teacher sanity gate (2026-04-23) ──────────────────────────────────────
 # For each ranking axis we can optionally compute the axis value for the
@@ -281,6 +367,26 @@ PARETO_DOMINANCE_GATE = os.environ.get("PARETO_DOMINANCE_GATE", "0") != "0"
 # stochasticity in the teacher's own generations (temperature=0 helps but
 # vLLM sampling can still jitter), while still catching outright bugs.
 TEACHER_SANITY_FLOOR = 0.70
+
+# Reference-broken-axes filter. When a reference row is present, it runs
+# through the same bench probes the students do. If the reference scores
+# ``pass_frac == 0``
+# on a bench axis, that axis is *not* measuring student skill — it is
+# measuring an eval-setup bug (token truncation, malformed prompt,
+# unsolvable item set, etc.). Audit 2026-04-26 of last_eval.json showed
+# the reference scoring 0 on aime_bench (token truncation), code_bench,
+# tool_use_bench, and noise_resistance_bench — locking ``worst() == 0``
+# for all 36 current-schema records and making the dethrone gate
+# degenerate. By dropping such axes from ``worst()`` we restore signal
+# without giving miners a free pass: the axes still appear in the
+# ``axes`` dict and contribute to ``weighted`` aggregation.
+#
+# We're more conservative than ``TEACHER_SANITY_FLOOR`` (0.70) here
+# because the reference model is a *small* base model (Qwen3.5-4B) — it
+# legitimately fails some hard items. Only the ``pass_frac == 0`` exact
+# floor is treated as eval-broken; partial scores 0.25-0.50 are kept so
+# students who outperform the reference are properly rewarded.
+REFERENCE_BROKEN_BENCH_FLOOR = 0.0
 
 
 def _axis_kl(student: dict, king_kl: float | None) -> float | None:
@@ -381,12 +487,18 @@ def _axis_judge_probe(student: dict) -> float | None:
     """Teacher-as-judge normalized score in [0, 1]. 2026-04-23 shadow axis.
 
     Returns the ``normalized`` field from the eval script's judge probe
-    payload: teacher scores each of 16 rotated prompts on a 1-5 rubric,
-    valid scores are averaged, mapped via ``(mean - 1) / 4``. If too
-    many prompts failed to parse (``n_valid < 8``) we drop the axis —
-    that's a rubric/teacher drift signal and the telemetry is more
-    meaningful than a noisy score. ``None`` if the probe didn't run or
-    didn't report.
+    payload: teacher scores N rotated prompts on a 1-5 rubric, valid
+    scores are averaged, mapped via ``(mean - 1) / 4``. If too many
+    prompts failed to parse (``n_valid < JUDGE_PROBE_MIN_VALID``) we
+    drop the axis — that's a rubric/teacher drift signal and the
+    telemetry is more meaningful than a noisy score. ``None`` if the
+    probe didn't run or didn't report.
+
+    Bug fix 2026-04-26: the threshold was hardcoded to 8, but the
+    deployed config uses ``JUDGE_PROBE_PER_ROUND=6`` → max ``n_valid``
+    is 6 < 8 so the axis was silently dropped every round. Made the
+    threshold env-configurable with a default of 4 (half the legacy
+    16-prompt budget) so it scales with whatever budget is set.
     """
     jp = student.get("judge_probe") or {}
     if not jp:
@@ -394,7 +506,7 @@ def _axis_judge_probe(student: dict) -> float | None:
     norm = jp.get("normalized")
     if norm is None:
         return None
-    if (jp.get("n_valid") or 0) < 8:
+    if (jp.get("n_valid") or 0) < JUDGE_PROBE_MIN_VALID:
         return None
     return max(0.0, min(1.0, float(norm)))
 
@@ -493,6 +605,18 @@ def _axis_truthful_bench(student: dict) -> float | None:
 
 def _axis_long_context_bench(student: dict) -> float | None:
     return _axis_bench_pass_frac(student, "long_context_bench")
+
+
+def _axis_procedural_bench(student: dict) -> float | None:
+    return _axis_bench_pass_frac(student, "procedural_bench")
+
+
+def _axis_robustness_bench(student: dict) -> float | None:
+    return _axis_bench_pass_frac(student, "robustness_bench")
+
+
+def _axis_noise_resistance_bench(student: dict) -> float | None:
+    return _axis_bench_pass_frac(student, "noise_resistance_bench")
 
 
 def _axis_reasoning_density(student: dict) -> float | None:
@@ -622,8 +746,66 @@ def compute_axes(student: dict, king_kl: float | None = None,
         "arc_bench": _axis_arc_bench(student),
         "truthful_bench": _axis_truthful_bench(student),
         "long_context_bench": _axis_long_context_bench(student),
+        "procedural_bench": _axis_procedural_bench(student),
+        "robustness_bench": _axis_robustness_bench(student),
+        "noise_resistance_bench": _axis_noise_resistance_bench(student),
         "reasoning_density": _axis_reasoning_density(student),
     }
+
+
+def resolve_reference_broken_axes(reference_student_row: dict | None) -> set[str]:
+    """Identify bench axes where the configured reference model scored 0.
+
+    The reference model (``REFERENCE_UID = -1``) is the configured
+    undistilled control when included in the round. It is expected to be a
+    base model,
+    so we expect it to fail some hard items — that's *real* signal a
+    distilled student can pick up. But if the reference scores
+    ``pass_frac == 0`` on a bench axis, the axis is broken at the
+    eval-setup level (token truncation, malformed prompt, unsolvable
+    items): the *base* model can't even partially attempt it, so any
+    student score on that axis is noise.
+
+    Audit 2026-04-26 found:
+      * aime_bench: reference 0/3 — 256-token cap truncates derivations
+      * code_bench: reference 0/3 — also token-bound
+      * tool_use_bench: reference 0/3 — 192-token cap + tool format
+      * noise_resistance_bench: reference 0/6 — perturbation strength
+
+    These four axes alone caused 100 % of current-schema records to sit
+    at ``worst == 0``, breaking the dethrone gate. Dropping them from
+    ``worst()`` (but keeping them in ``weighted`` and the per-axis
+    dashboard) restores signal without giving miners a free pass.
+
+    Returns the set of axis names to exclude. Empty set if the
+    reference row is absent (round did not include reference) or all
+    reference scores are non-zero.
+    """
+    if not reference_student_row:
+        return set()
+    broken: set[str] = set()
+    # Axes we consider eval-setup-fragile. Relative axes (kl, rkl,
+    # capability, length, degeneracy) reference at 1.0 by definition,
+    # so they're never in this set.
+    bench_axes = {
+        "aime_bench", "mbpp_bench", "code_bench", "math_bench",
+        "knowledge_bench", "reasoning_bench", "tool_use_bench",
+        "robustness_bench", "noise_resistance_bench", "ifeval_bench",
+        "self_consistency_bench", "arc_bench", "truthful_bench",
+        "long_context_bench", "procedural_bench",
+    }
+    for axis in bench_axes:
+        bench = reference_student_row.get(axis)
+        if not isinstance(bench, dict):
+            continue
+        n = bench.get("n") or 0
+        pass_frac = bench.get("pass_frac")
+        # Only flag if the reference *attempted* the axis (n>0) and
+        # scored exactly 0. ``n == 0`` means the axis didn't run at all,
+        # which is a different failure mode.
+        if n > 0 and pass_frac is not None and float(pass_frac) <= REFERENCE_BROKEN_BENCH_FLOOR:
+            broken.add(axis)
+    return broken
 
 
 def resolve_teacher_broken_axes(teacher_student_row: dict | None,
@@ -684,12 +866,27 @@ def compute_composite(student: dict, king_kl: float | None = None,
       useful during the grace period so we don't suddenly dethrone the
       current king while miners re-tool.
 
-    ``broken_axes`` (2026-04-23): axes where the teacher itself failed
-    the sanity floor this round. They are computed + logged per-student
-    but excluded from ``worst`` / ``weighted`` aggregation. Caller is
-    responsible for passing the result of ``resolve_teacher_broken_axes``
-    once per round (it only depends on the teacher row and the king
-    anchors).
+    ``broken_axes`` (2026-04-23 / refined 2026-04-26): axes that should
+    not gate the dethrone decision. Two distinct sources:
+      * teacher-broken — the teacher itself failed the sanity floor this
+        round (``resolve_teacher_broken_axes``).
+      * reference-broken — the configured reference model scored 0 on the axis
+        (``resolve_reference_broken_axes``). This indicates an
+        eval-setup signal (token truncation, parsing bug, unsolvable
+        items), not student skill.
+
+    Filter semantics (refined 2026-04-26):
+      * ``worst`` excludes broken axes — otherwise the worst-axis
+        anti-gaming rule degenerates to ``min == 0`` for every student
+        whenever an axis hits a setup floor.
+      * ``weighted`` KEEPS broken axes when computable — a student who
+        scores >0 on a broken axis (e.g. they actually solved
+        tool_use_bench while Qwen base couldn't) still gets credit in
+        the soft aggregator. Only axes a student didn't even score
+        (None) drop out of weighted.
+
+    Caller is responsible for passing the union of teacher-broken and
+    reference-broken sets via ``broken_axes``.
     """
     axes = compute_axes(student, king_kl, king_rkl)
     # Build effective weights. Shadow-only axes flip in when their
@@ -712,11 +909,21 @@ def compute_composite(student: dict, king_kl: float | None = None,
         effective_weights["reasoning_density"] = REASONING_DENSITY_WEIGHT
     if CHAT_TURNS_AXIS_IN_COMPOSITE and CHAT_TURNS_AXIS_WEIGHT > 0:
         effective_weights["chat_turns_probe"] = CHAT_TURNS_AXIS_WEIGHT
+    # ``ranked`` = axes used by ``worst()``: drops broken axes so the
+    # min is not artificially floored by an axis the eval setup itself
+    # can't pass (the dethrone gate degenerates to 0=0=0 otherwise).
     ranked = {
         k: v for k, v in axes.items()
         if v is not None
         and k in effective_weights
         and (not broken_axes or k not in broken_axes)
+    }
+    # ``weighted_axes`` = axes used by ``weighted``: KEEP broken axes
+    # so a student who beats the reference on a broken axis still gets
+    # credit in the soft aggregator. Only None values drop out.
+    weighted_axes = {
+        k: v for k, v in axes.items()
+        if v is not None and k in effective_weights
     }
     if not ranked:
         return {"version": COMPOSITE_SHADOW_VERSION, "axes": axes,
@@ -728,8 +935,11 @@ def compute_composite(student: dict, king_kl: float | None = None,
                 "reasoning_density_in_composite": REASONING_DENSITY_IN_COMPOSITE,
                 "chat_turns_in_composite": CHAT_TURNS_AXIS_IN_COMPOSITE}
     worst = min(ranked.values())
-    total_w = sum(effective_weights[k] for k in ranked)
-    weighted = sum(effective_weights[k] * v for k, v in ranked.items()) / total_w if total_w else None
+    total_w = sum(effective_weights[k] for k in weighted_axes)
+    weighted = (
+        sum(effective_weights[k] * v for k, v in weighted_axes.items()) / total_w
+        if total_w else None
+    )
 
     # 2026-04-25 — anti-gaming visibility. Two informational scores that
     # tell operators when a student is unusually narrow:
@@ -908,9 +1118,63 @@ def _resolve_king_rkl(king_kl: float | None,
     return None
 
 
+def compute_king_health(
+    king_composite: dict | None,
+    base_composite: dict | None,
+) -> dict | None:
+    """Summarize the king's composite health vs floor + base model.
+
+    Shadow telemetry for upstream feedback.
+    Two signals:
+      * ``below_floor``     — worst axis < KING_COMPOSITE_FLOOR
+      * ``worse_than_base`` — worst axis < base model's worst axis
+                              (the base model is always in every round as
+                              a reference anchor, so this is the most
+                              direct "is the king regressing?" check)
+
+    Returns None when either composite is missing or has no populated
+    axes — fail open, never block on noisy probe data.
+    """
+    if not king_composite or king_composite.get("worst") is None:
+        return None
+    king_worst = float(king_composite["worst"])
+    king_axes = king_composite.get("axes") or {}
+    king_worst_axis = min(
+        ((k, v) for k, v in king_axes.items() if v is not None),
+        key=lambda kv: kv[1],
+        default=(None, None),
+    )[0]
+    base_worst: float | None = None
+    base_worst_axis: str | None = None
+    if base_composite and base_composite.get("worst") is not None:
+        base_worst = float(base_composite["worst"])
+        base_axes = base_composite.get("axes") or {}
+        base_worst_axis = min(
+            ((k, v) for k, v in base_axes.items() if v is not None),
+            key=lambda kv: kv[1],
+            default=(None, None),
+        )[0]
+    below_floor = king_worst < KING_COMPOSITE_FLOOR
+    worse_than_base = base_worst is not None and king_worst < base_worst
+    return {
+        "king_worst": king_worst,
+        "king_worst_axis": king_worst_axis,
+        "base_worst": base_worst,
+        "base_worst_axis": base_worst_axis,
+        "floor": KING_COMPOSITE_FLOOR,
+        "below_floor": below_floor,
+        "worse_than_base": worse_than_base,
+        "at_risk": bool(below_floor or worse_than_base),
+        "gate_active": KING_REGRESSION_GATE,
+        "min_streak": KING_REGRESSION_MIN_STREAK,
+    }
+
+
 def annotate_h2h_with_composite(h2h_results: list[dict], king_kl: float | None,
                                 students_data: dict[Any, dict],
-                                teacher_student_row: dict | None = None) -> None:
+                                teacher_student_row: dict | None = None,
+                                reference_model: str | None = None,
+                                reference_uid: Any = None) -> None:
     """Mutates h2h_results in place to add ``composite`` per entry.
 
     ``students_data`` maps model_name -> the raw per-student dict from
@@ -936,6 +1200,26 @@ def annotate_h2h_with_composite(h2h_results: list[dict], king_kl: float | None,
     """
     king_rkl = _resolve_king_rkl(king_kl, students_data, h2h_results)
     broken = resolve_teacher_broken_axes(teacher_student_row, king_kl, king_rkl)
+    # Layer 2: reference-broken axes. The configured reference model
+    # (REFERENCE_UID = -1) runs the same bench probes as
+    # students; an axis where the reference scores 0 is testing the eval
+    # setup, not student skill. Drop it from worst() / weighted to keep
+    # the dethrone gate from degenerating to "everyone is at 0".
+    reference_row = None
+    if reference_model and reference_model in students_data:
+        reference_row = students_data[reference_model]
+    reference_broken = resolve_reference_broken_axes(reference_row)
+    if reference_broken:
+        try:
+            logger.info(
+                "composite: dropping reference-broken axes this round: "
+                f"{sorted(reference_broken)} (reference={reference_model} "
+                "scored pass_frac=0 on each — eval-setup signal, not "
+                "student skill)"
+            )
+        except Exception:
+            pass
+    broken = (broken or set()) | reference_broken
 
     king_model = None
     king_entry = next((r for r in h2h_results if r.get("is_king")), None)
@@ -963,3 +1247,27 @@ def annotate_h2h_with_composite(h2h_results: list[dict], king_kl: float | None,
                 challenger_raw_axes, king_raw_axes, include_shadow=True,
             )
         entry["composite"] = comp
+
+    # ── King health (2026-04-24 shadow) ─────────────────────────────
+    # Stamp ``composite.king_health`` on the king's row with a worst-axis
+    # summary vs floor + base model. Shadow only — state_manager tracks
+    # the consecutive streak; dashboard + /api/miner/{uid} surface it.
+    # When the gate is off (default), this is pure telemetry.
+    # Callers pass in the reference model/UID so this module stays
+    # ML-dep free (see module docstring).
+    try:
+        king_comp = king_entry["composite"] if king_entry and "composite" in king_entry else None
+        base_entry = None
+        if reference_uid is not None or reference_model is not None:
+            base_entry = next(
+                (r for r in h2h_results
+                 if (reference_uid is not None and r.get("uid") == reference_uid)
+                 or (reference_model is not None and r.get("model") == reference_model)),
+                None,
+            )
+        base_comp = base_entry.get("composite") if base_entry else None
+        health = compute_king_health(king_comp, base_comp)
+        if health and king_comp is not None:
+            king_comp["king_health"] = health
+    except Exception:
+        pass  # telemetry failure must never break ranking

@@ -84,7 +84,7 @@ def root():
 
 Response includes:
 - `status`: `ok` if the API is running
-- `king_uid` / `king_kl`: Current king and their KL score (lower = better)
+- `king_uid` / `king_kl`: Current king and KL telemetry for the KL axis
 - `n_scored` / `n_disqualified`: Number of active vs disqualified miners
 - `last_eval_block` / `last_eval_age_min`: When the last eval happened
 - `eval_active`: Whether an evaluation round is in progress right now
@@ -128,7 +128,7 @@ def health():
     return {
         "status": "ok",
         "netuid": NETUID,
-        "dethrone_method": "paired_t_test",
+        "dethrone_method": "composite_single_eval",
         "king_uid": king_uid,
         "king_kl": round(king_kl, 6) if king_kl is not None else None,
         "n_scored": n_scored,

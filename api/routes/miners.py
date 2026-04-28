@@ -17,7 +17,7 @@ from state_store import (
     last_eval,
     read_state,
     scores as load_scores,
-    top4_leaderboard,
+    composite_scores,
     uid_hotkey_map,
 )
 
@@ -56,11 +56,11 @@ def get_commitments():
     return fetch_commitments_data()
 
 
-@router.get("/api/scores", tags=["Miners"], summary="Current KL scores and disqualifications",
-         description="""Returns the latest KL-divergence scores for all evaluated miners, plus disqualification status.
+@router.get("/api/scores", tags=["Miners"], summary="Current KL-axis telemetry and disqualifications",
+         description="""Returns the latest KL-axis telemetry for all evaluated miners, plus disqualification status.
 
 Response includes:
-- `scores`: Map of UID → KL score (lower is better)
+- `scores`: Map of UID → KL-axis telemetry
 - `ema_scores`: Same as scores (backward compat)
 - `disqualified`: Map of UID → disqualification reason
 - `last_eval`: Details of the most recent evaluation round
@@ -119,7 +119,7 @@ def get_model_info(model_path: str):
 Response includes:
 - `hotkey` / `coldkey`: On-chain keys
 - `commitment`: Model repo, revision, and commitment block
-- `kl_score`: Current KL-divergence score (lower = better)
+- `kl_score`: KL-axis telemetry
 - `disqualified`: Disqualification status and reason (if any)
 - `h2h_history`: Last 10 head-to-head rounds involving this UID
 - `in_top5`: Whether this UID is in the top 5 (king or contender)
@@ -183,22 +183,29 @@ def get_miner(uid: int):
         dq_reason = dq.get(uid_str) or dq.get(hotkey) if hotkey else dq.get(uid_str)
     result["disqualified"] = dq_reason
 
-    # Top 5 / king status
-    top4 = top4_leaderboard()
-    king = top4.get("king") or {}
-    contenders = top4.get("contenders") or []
-    result["is_king"] = king.get("uid") == uid
+    # Composite top set / king status
+    latest = h2h_latest()
+    king_uid = latest.get("king_uid")
+    result["is_king"] = king_uid == uid
     top5_uids = set()
-    if king.get("uid") is not None:
-        top5_uids.add(king["uid"])
-    for c in contenders:
-        if c.get("uid") is not None:
-            top5_uids.add(c["uid"])
+    if king_uid is not None:
+        top5_uids.add(king_uid)
+    comp_rows = []
+    for comp_uid, rec in (composite_scores() or {}).items():
+        try:
+            comp_uid_i = int(comp_uid)
+            worst = rec.get("worst")
+            weighted = rec.get("weighted")
+            if comp_uid_i not in (-1, king_uid) and worst is not None:
+                comp_rows.append((float(worst), float(weighted or 0), comp_uid_i))
+        except (TypeError, ValueError):
+            continue
+    comp_rows.sort(reverse=True)
+    top5_uids.update(comp_uid for _, _, comp_uid in comp_rows[:4])
     result["in_top5"] = uid in top5_uids
 
     # Eval status: why (not) evaluated
     h2h_tracker = h2h_tested_against_king()
-    latest = h2h_latest()
     current_king_uid = latest.get("king_uid")
     current_block = latest.get("block", 0)
     tracker_entry = h2h_tracker.get(uid_str, {})
@@ -256,8 +263,7 @@ def get_miner(uid: int):
     ]
     result["h2h_history"] = relevant
 
-    # Composite axes (Arena v3) — per miner request from #distil-97 on
-    # 2026-04-24: miners want to see their per-axis scores without parsing
+    # Composite axes: miners want to see their per-axis scores without parsing
     # /api/eval-data. Pull the latest matching entry straight from
     # h2h_latest.results, which ``annotate_h2h_with_composite`` stamps
     # every round.

@@ -65,16 +65,17 @@
       "AutoConfig": "configuration_quasar.QuasarConfig",
       "AutoModelForCausalLM": "modeling_quasar.QuasarForCausalLM"
     },
+    "chatTemplateHash": "a4aee8afcf2e0711942cf848899be66016f8d14a889ff9ede07bca099c28f715",
     "allowedCustomCodeFiles": [
       "configuration_quasar.py",
       "modeling_quasar.py"
     ]
   },
   "teacher": {
-    "model": "Qwen/Qwen3.5-35B-A3B",
-    "architecture": "qwen3_5_moe",
-    "totalParams": 35000000000,
-    "activeParams": 3000000000,
+    "model": "Qwen/Qwen3.5-4B",
+    "architecture": "qwen3_5",
+    "totalParams": 4000000000,
+    "activeParams": 4000000000,
     "vocabSize": 248044,
     "configVocabSize": 248320
   },
@@ -89,7 +90,7 @@
     "pairedTestAlpha": 0.03,
     "staleH2hEpochs": 50,
     "topNAlwaysInclude": 5,
-    "referenceModel": "Qwen/Qwen3.5-4B",
+    "referenceModel": "silx-ai/Quasar-3B-A1B-Preview",
     "referenceUid": -1,
     "activationCopyThreshold": 0.99999,
     "roleId": ""

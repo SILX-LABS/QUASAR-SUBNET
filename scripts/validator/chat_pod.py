@@ -18,8 +18,8 @@ CHAT_SERVER_SRC = REPO_ROOT / "scripts" / "chat_pod" / "chat_server.py"
 # tunnel to the chat pod's vLLM and shells the affine-benchmark runner. The
 # validator just fires-and-forgets at trigger time, and sync_benchmarks.sh
 # pulls uid_*_summary.json back from this pod on a timer.
-EVAL_POD_HOST = os.environ.get("DISTIL_EVAL_POD_HOST", "213.13.7.110")
-EVAL_POD_SSH_PORT = int(os.environ.get("DISTIL_EVAL_POD_SSH_PORT", "6039"))
+EVAL_POD_HOST = os.environ.get("QUASAR_EVAL_POD_HOST", "213.13.7.110")
+EVAL_POD_SSH_PORT = int(os.environ.get("QUASAR_EVAL_POD_SSH_PORT", "6039"))
 
 
 def _ssh(host: str, port: int, cmd: str, timeout: int = 30, label: str = "pod") -> str:

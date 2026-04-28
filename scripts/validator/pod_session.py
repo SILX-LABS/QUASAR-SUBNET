@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import json
 import logging
 import os
@@ -10,14 +12,20 @@ from eval.state import ValidatorState, log_event
 from scripts.validator.config import MAX_NEW_TOKENS, TEACHER_MODEL, VLLM_CONCURRENCY
 
 # Opt-in teacher tensor-parallel size. 0 = let pod autodetect from torch.cuda.device_count().
-TP_SIZE = int(os.environ.get("DISTIL_TP_SIZE", "0") or "0")
+TP_SIZE = int(os.environ.get("QUASAR_TP_SIZE", os.environ.get("DISTIL_TP_SIZE", "0")) or "0")
 # Same-point early-stop floor; 0 disables (matches legacy behaviour).
-EARLY_STOP_MIN = int(os.environ.get("DISTIL_EARLY_STOP_MIN", "0") or "0")
+EARLY_STOP_MIN = int(os.environ.get("QUASAR_EARLY_STOP_MIN", os.environ.get("DISTIL_EARLY_STOP_MIN", "0")) or "0")
 
 logger = logging.getLogger("quasar.validator")
 
 
-def run_eval_on_pod(pod: PodManager, models_to_eval: dict, king_uid, n_prompts: int, prompt_texts: list, state: ValidatorState, is_full_eval: bool, use_vllm: bool, eval_script: str, block_seed: int | None = None):
+def run_eval_on_pod(pod: PodManager, models_to_eval: dict, king_uid, n_prompts: int, prompt_texts: list, state: ValidatorState, is_full_eval: bool, use_vllm: bool, eval_script: str, block_seed: int | None = None, resume_pod_eval: dict | None = None):
+    """Drive a pod/local eval to completion, downloading results when done.
+
+    When ``resume_pod_eval`` contains a previous run directory and remote
+    paths, attach to that live run instead of cleaning the pod and starting
+    over. This keeps validator restarts from killing a long production eval.
+    """
     import shutil
     import threading
 
@@ -31,6 +39,12 @@ def run_eval_on_pod(pod: PodManager, models_to_eval: dict, king_uid, n_prompts: 
     challenger_uids_sorted = sorted([uid for uid in models_to_eval if uid != king_uid], key=lambda uid: models_to_eval[uid].get("commit_block", float("inf")))
     ordered_uids.extend(challenger_uids_sorted)
     now = time.time()
+    is_resuming = isinstance(resume_pod_eval, dict) and bool(resume_pod_eval.get("run_dir"))
+    if is_resuming:
+        try:
+            now = float(resume_pod_eval.get("started_at") or now)
+        except (TypeError, ValueError):
+            pass
     est_teacher_s = 90
     est_per_student_s = 5 * n_prompts
     est_total_s = est_teacher_s + est_per_student_s * len(models_to_eval)
@@ -55,29 +69,45 @@ def run_eval_on_pod(pod: PodManager, models_to_eval: dict, king_uid, n_prompts: 
         "estimated_completion": now + est_total_s,
     }
     state.save_progress(progress)
-    run_dir = f"{run_base_dir}/distil_eval_{int(now)}_{os.getpid()}"
-    if hasattr(pod, "register_run_dir"):
-        pod.register_run_dir(run_dir)
-    prompts_remote = f"{run_dir}/prompts.json"
-    remote_eval_script = f"{run_dir}/pod_eval.py"
-    progress_remote = f"{run_dir}/eval_progress.json"
-    results_remote = f"{run_dir}/eval_results.json"
-    done_marker_remote = f"{run_dir}/eval_done.marker"
-    log_remote = f"{run_dir}/eval_output.log"
-    eval_data_remote = f"{run_dir}/eval_data.json"
-    teacher_cache_remote = f"{run_dir}/teacher_cache.pt"
-    pid_remote = f"{run_dir}/pod_eval.pid"
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as handle:
-        json.dump(prompt_texts, handle)
-        handle.flush()
-        os.fsync(handle.fileno())
-        prompts_file = handle.name
-    try:
-        pod.exec(f"mkdir -p {shlex.quote(run_dir)}", timeout=30)
-        pod.upload(prompts_file, prompts_remote, max_attempts=3)
-    finally:
-        os.unlink(prompts_file)
-    pod.upload(eval_script, remote_eval_script, max_attempts=5)
+    if is_resuming:
+        run_dir = str(resume_pod_eval.get("run_dir"))
+        prompts_remote = resume_pod_eval.get("prompts_remote") or f"{run_dir}/prompts.json"
+        remote_eval_script = resume_pod_eval.get("remote_eval_script") or f"{run_dir}/pod_eval.py"
+        progress_remote = resume_pod_eval.get("progress_remote") or f"{run_dir}/eval_progress.json"
+        results_remote = resume_pod_eval.get("results_remote") or f"{run_dir}/eval_results.json"
+        done_marker_remote = resume_pod_eval.get("done_marker_remote") or f"{run_dir}/eval_done.marker"
+        log_remote = resume_pod_eval.get("log_remote") or f"{run_dir}/eval_output.log"
+        eval_data_remote = resume_pod_eval.get("eval_data_remote") or f"{run_dir}/eval_data.json"
+        teacher_cache_remote = resume_pod_eval.get("teacher_cache_remote") or f"{run_dir}/teacher_cache.pt"
+        pid_remote = resume_pod_eval.get("pid_remote") or f"{run_dir}/pod_eval.pid"
+        logger.info(
+            "run_eval_on_pod RESUME: attaching to existing %s eval run_dir=%s pid_remote=%s",
+            backend_label, run_dir, pid_remote,
+        )
+    else:
+        run_dir = f"{run_base_dir}/quasar_eval_{int(now)}_{os.getpid()}"
+        prompts_remote = f"{run_dir}/prompts.json"
+        remote_eval_script = f"{run_dir}/pod_eval.py"
+        progress_remote = f"{run_dir}/eval_progress.json"
+        results_remote = f"{run_dir}/eval_results.json"
+        done_marker_remote = f"{run_dir}/eval_done.marker"
+        log_remote = f"{run_dir}/eval_output.log"
+        eval_data_remote = f"{run_dir}/eval_data.json"
+        teacher_cache_remote = f"{run_dir}/teacher_cache.pt"
+        pid_remote = f"{run_dir}/pod_eval.pid"
+        if hasattr(pod, "register_run_dir"):
+            pod.register_run_dir(run_dir)
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as handle:
+            json.dump(prompt_texts, handle)
+            handle.flush()
+            os.fsync(handle.fileno())
+            prompts_file = handle.name
+        try:
+            pod.exec(f"mkdir -p {shlex.quote(run_dir)}", timeout=30)
+            pod.upload(prompts_file, prompts_remote, max_attempts=3)
+        finally:
+            os.unlink(prompts_file)
+        pod.upload(eval_script, remote_eval_script, max_attempts=5)
     # 2026-04-24 — Pareto holistic eval v2 ships two small helper modules
     # alongside pod_eval.py: a vendored IFEval verifier set and a HumanEval
     # subprocess sandbox. They live next to pod_eval.py so the bench
@@ -86,13 +116,33 @@ def run_eval_on_pod(pod: PodManager, models_to_eval: dict, king_uid, n_prompts: 
         ("scripts/ifeval_vendor.py", "ifeval_vendor.py"),
         ("scripts/humaneval_sandbox.py", "humaneval_sandbox.py"),
     ]
-    for local_aux, remote_name in _aux_modules:
-        if os.path.isfile(local_aux):
-            try:
-                pod.upload(local_aux, f"{run_dir}/{remote_name}", max_attempts=3)
-            except Exception as exc:
-                logger.warning(f"Failed to upload {local_aux} (bench probes will skip): {exc}")
-    if is_local_backend:
+    if not is_resuming:
+        for local_aux, remote_name in _aux_modules:
+            if os.path.isfile(local_aux):
+                try:
+                    pod.upload(local_aux, f"{run_dir}/{remote_name}", max_attempts=3)
+                except Exception as exc:
+                    logger.warning(f"Failed to upload {local_aux} (bench probes will skip): {exc}")
+    if is_resuming:
+        try:
+            pid_probe = pod.exec(
+                f"if [ -f {shlex.quote(done_marker_remote)} ]; then echo DONE; "
+                f"elif [ -f {shlex.quote(pid_remote)} ] && kill -0 \"$(cat {shlex.quote(pid_remote)})\" 2>/dev/null; then echo ALIVE; "
+                "else echo MISSING; fi",
+                timeout=30,
+            )
+            pid_status = (pid_probe.get("stdout") or "").strip()
+        except Exception as exc:
+            logger.warning("Resume probe failed: %s — falling back to fresh run", exc)
+            return run_eval_on_pod(pod, models_to_eval, king_uid, n_prompts, prompt_texts, state, is_full_eval, use_vllm, eval_script, block_seed=block_seed, resume_pod_eval=None)
+        if pid_status not in ("ALIVE", "DONE"):
+            logger.warning(
+                "Resume target pid_remote=%s reports status=%r — falling back to fresh run",
+                pid_remote, pid_status,
+            )
+            return run_eval_on_pod(pod, models_to_eval, king_uid, n_prompts, prompt_texts, state, is_full_eval, use_vllm, eval_script, block_seed=block_seed, resume_pod_eval=None)
+        logger.info("Resume probe: %s eval is %s — skipping cleanup/upload/start", backend_label, pid_status)
+    elif is_local_backend:
         logger.info("Local backend: skipping broad pre-eval process cleanup")
     else:
         try:
@@ -110,13 +160,44 @@ def run_eval_on_pod(pod: PodManager, models_to_eval: dict, king_uid, n_prompts: 
             #   3. fall back on nvidia-smi: if anything is still holding the GPU
             #      and it looks like a vllm/python worker, nuke it.
             pod.exec(
-                "pkill -9 -f pod_eval 2>/dev/null; "
-                "pkill -9 -f 'vllm.entrypoints' 2>/dev/null; "
-                "pkill -9 -f 'VllmWorker' 2>/dev/null; "
-                "pkill -9 -f 'VLLM::EngineCore' 2>/dev/null; "
-                "pkill -9 -x 'VLLM::EngineCor' 2>/dev/null; "  # match comm (15-char trunc)
+                "preserve=''; "
+                "live_chat_pid=$(ss -tlnp 'sport = :8100' 2>/dev/null "
+                "  | grep -oE 'pid=[0-9]+' | head -1 | cut -d= -f2); "
+                "if [ -n \"$live_chat_pid\" ]; then "
+                "  preserve=\"$live_chat_pid\"; "
+                "  for desc in $(pgrep -P $live_chat_pid 2>/dev/null); do "
+                "    preserve=\"$preserve $desc\"; "
+                "    for gdesc in $(pgrep -P $desc 2>/dev/null); do preserve=\"$preserve $gdesc\"; done; "
+                "  done; "
+                "  for pid in $(pgrep -f 'chat_server.py' 2>/dev/null); do "
+                "    preserve=\"$preserve $pid\"; "
+                "    for desc in $(pgrep -P $pid 2>/dev/null); do preserve=\"$preserve $desc\"; done; "
+                "  done; "
+                "fi; "
+                "if [ -z \"$preserve\" ]; then "
+                "  for pid in $(pgrep -f 'chat_server.py' 2>/dev/null) "
+                "               $(pgrep -f 'served-model-name quasar-king' 2>/dev/null) "
+                "               $(pgrep -f 'port 8100' 2>/dev/null); do "
+                "    preserve=\"$preserve $pid\"; "
+                "    for desc in $(pgrep -P $pid 2>/dev/null); do "
+                "      preserve=\"$preserve $desc\"; "
+                "      for gdesc in $(pgrep -P $desc 2>/dev/null); do preserve=\"$preserve $gdesc\"; done; "
+                "    done; "
+                "  done; "
+                "fi; "
+                "kill_unless_preserved() { "
+                "  for pid in \"$@\"; do "
+                "    case \" $preserve \" in (*\" $pid \"*) ;; (*) kill -9 $pid 2>/dev/null ;; esac; "
+                "  done; "
+                "}; "
+                "kill_unless_preserved $(pgrep -f '[p]od_eval.py' 2>/dev/null); "
+                "kill_unless_preserved $(pgrep -f '[v]llm.entrypoints' 2>/dev/null); "
+                "kill_unless_preserved $(pgrep -f '[V]llmWorker' 2>/dev/null); "
+                "kill_unless_preserved $(pgrep -f '[V]LLM::EngineCore' 2>/dev/null); "
+                "kill_unless_preserved $(pgrep -x 'VLLM::EngineCor' 2>/dev/null); "  # match comm (15-char trunc)
                 "sleep 2; "
                 "for pid in $(nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null); do "
+                "  case \" $preserve \" in (*\" $pid \"*) continue ;; esac; "
                 "  comm=$(cat /proc/$pid/comm 2>/dev/null); "
                 "  cmd=$(tr '\\0' ' ' < /proc/$pid/cmdline 2>/dev/null); "
                 "  case \"$cmd$comm\" in "
@@ -130,42 +211,44 @@ def run_eval_on_pod(pod: PodManager, models_to_eval: dict, king_uid, n_prompts: 
                 "survivors=$(nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null); "
                 "if [ -n \"$survivors\" ]; then "
                 "  for pid in $survivors; do "
+                "    case \" $preserve \" in (*\" $pid \"*) continue ;; esac; "
                 "    echo \"[cleanup] gpu still held by pid=$pid comm=$(cat /proc/$pid/comm 2>/dev/null) cmd=$(tr '\\0' ' ' < /proc/$pid/cmdline 2>/dev/null | head -c 200)\" >&2; "
                 "    kill -9 $pid 2>/dev/null; "
                 "  done; "
                 "  sleep 2; "
                 "fi; "
-                "rm -rf /dev/shm/vllm* 2>/dev/null; "
+                "if [ -z \"$preserve\" ]; then rm -rf /dev/shm/vllm* 2>/dev/null; fi; "
                 "rm -f /home/pod_eval.py /home/prompts.json /home/eval_output.log /home/eval_results.json /home/eval_progress.json /home/teacher_cache.pt 2>/dev/null; "
                 "sleep 1",
                 timeout=40,
             )
-            logger.info("Killed existing eval/vllm processes and removed stale /home files")
+            logger.info("Killed existing eval/vllm processes and removed stale /home files (chat server preserved when present)")
         except Exception as exc:
             logger.debug(f"Pre-eval cleanup: {exc}")
-    try:
-        pod.exec(
-            f"rm -f {shlex.quote(progress_remote)} {shlex.quote(results_remote)} {shlex.quote(log_remote)} "
-            f"{shlex.quote(eval_data_remote)} {shlex.quote(teacher_cache_remote)} {shlex.quote(pid_remote)} "
-            f"{shlex.quote(done_marker_remote)}"
-        )
-        logger.info("Cleared all pod artifacts (eval_results, teacher_cache, progress)")
-    except Exception:
-        pass
-    try:
-        disk_pct = pod.disk_cleanup(TEACHER_MODEL)
-        if disk_pct is not None:
-            log_event(f"{backend_label} disk: {disk_pct}% used after cleanup", state_dir=str(state.state_dir))
-    except Exception as exc:
-        log_event(f"{backend_label} disk cleanup failed: {str(exc)[:100]}", level="warn", state_dir=str(state.state_dir))
-    pod.clear_gpu()
-    if not is_local_backend:
+    if not is_resuming:
         try:
-            verify = pod.exec("pgrep -af pod_eval 2>/dev/null; ls /home/pod_eval.py 2>/dev/null; echo VERIFY_DONE", timeout=15)
+            pod.exec(
+                f"rm -f {shlex.quote(progress_remote)} {shlex.quote(results_remote)} {shlex.quote(log_remote)} "
+                f"{shlex.quote(eval_data_remote)} {shlex.quote(teacher_cache_remote)} {shlex.quote(pid_remote)} "
+                f"{shlex.quote(done_marker_remote)}"
+            )
+            logger.info("Cleared all pod artifacts (eval_results, teacher_cache, progress)")
+        except Exception:
+            pass
+        try:
+            disk_pct = pod.disk_cleanup(TEACHER_MODEL)
+            if disk_pct is not None:
+                log_event(f"{backend_label} disk: {disk_pct}% used after cleanup", state_dir=str(state.state_dir))
+        except Exception as exc:
+            log_event(f"{backend_label} disk cleanup failed: {str(exc)[:100]}", level="warn", state_dir=str(state.state_dir))
+        pod.clear_gpu()
+    if not is_resuming and not is_local_backend:
+        try:
+            verify = pod.exec("pgrep -af '[p]od_eval.py' 2>/dev/null; ls /home/pod_eval.py 2>/dev/null; echo VERIFY_DONE", timeout=15)
             vout = verify.get("stdout", "")
             if "/home/pod_eval.py" in vout or ("pod_eval" in vout and "VERIFY_DONE" in vout and vout.strip() != "VERIFY_DONE"):
                 logger.warning("Stale competing eval detected after cleanup, killing again")
-                pod.exec("pkill -9 -f pod_eval 2>/dev/null; rm -f /home/pod_eval.py 2>/dev/null; sleep 2", timeout=20)
+                pod.exec("pkill -9 -f '[p]od_eval.py' 2>/dev/null; rm -f /home/pod_eval.py 2>/dev/null; sleep 2", timeout=20)
         except Exception:
             pass
     student_list = ",".join(models_to_eval[uid]["model"] for uid in ordered_uids)
@@ -173,7 +256,8 @@ def run_eval_on_pod(pod: PodManager, models_to_eval: dict, king_uid, n_prompts: 
     king_flag = ""
     vllm_flag = " --no-vllm"
     if use_vllm:
-        vllm_flag = " --vllm-gpu-util 0.90"
+        eval_gpu_util = os.environ.get("VLLM_EVAL_GPU_UTIL", "0.90")
+        vllm_flag = f" --vllm-gpu-util {eval_gpu_util}"
         if not is_full_eval and king_uid is not None and king_uid in models_to_eval:
             king_flag = f" --king {models_to_eval[king_uid]['model']}"
     tp_flag = f" --tensor-parallel-size {TP_SIZE}" if TP_SIZE > 0 else ""
@@ -206,13 +290,13 @@ def run_eval_on_pod(pod: PodManager, models_to_eval: dict, king_uid, n_prompts: 
         f"for _ in 1 2 3 4 5 6 7 8 9 10; do "
         f"  [ -s {shlex.quote(pid_remote)} ] && break; sleep 0.2; "
         f"done; "
-        f"echo DISTIL_PID:$(cat {shlex.quote(pid_remote)} 2>/dev/null)"
+        f"echo QUASAR_PID:$(cat {shlex.quote(pid_remote)} 2>/dev/null)"
     )
     status_inner = (
-        f"if [ -f {shlex.quote(done_marker_remote)} ]; then echo DISTIL_STATUS:done; "
-        f"elif [ ! -f {shlex.quote(pid_remote)} ]; then echo DISTIL_STATUS:starting; "
-        f"elif kill -0 \"$(cat {shlex.quote(pid_remote)})\" 2>/dev/null; then echo DISTIL_STATUS:running; "
-        "else echo DISTIL_STATUS:dead; fi"
+        f"if [ -f {shlex.quote(done_marker_remote)} ]; then echo QUASAR_STATUS:done; "
+        f"elif [ ! -f {shlex.quote(pid_remote)} ]; then echo QUASAR_STATUS:starting; "
+        f"elif kill -0 \"$(cat {shlex.quote(pid_remote)})\" 2>/dev/null; then echo QUASAR_STATUS:running; "
+        "else echo QUASAR_STATUS:dead; fi"
     )
     status_cmd = f"bash -lc {shlex.quote(status_inner)}"
     poll_stop = threading.Event()
@@ -228,6 +312,10 @@ def run_eval_on_pod(pod: PodManager, models_to_eval: dict, king_uid, n_prompts: 
     # like — see scripts/pod_eval_vllm.py::_atomic_json_write for the
     # matching writer-side fix).
     _poll_last_err: dict = {"kind": None, "at": 0.0}
+    _poll_started_at = time.time()
+
+    class _ProgressNotReady(Exception):
+        pass
 
     def _poll_log_err(kind: str, msg: str):
         now = time.time()
@@ -246,6 +334,11 @@ def run_eval_on_pod(pod: PodManager, models_to_eval: dict, king_uid, n_prompts: 
                 try:
                     pod.download(progress_remote, tmp_path)
                 except Exception as exc:
+                    msg = str(exc).lower()
+                    if (time.time() - _poll_started_at) < 120 and (
+                        "no such file" in msg or "not found" in msg
+                    ):
+                        raise _ProgressNotReady()
                     _poll_log_err("download_failed", f"{type(exc).__name__}: {exc}")
                     raise
                 try:
@@ -253,6 +346,8 @@ def run_eval_on_pod(pod: PodManager, models_to_eval: dict, king_uid, n_prompts: 
                 except OSError:
                     size = -1
                 if size <= 0:
+                    if (time.time() - _poll_started_at) < 120:
+                        raise _ProgressNotReady()
                     _poll_log_err(
                         "empty_progress_file",
                         f"remote {progress_remote} downloaded as {size}-byte file — "
@@ -297,7 +392,9 @@ def run_eval_on_pod(pod: PodManager, models_to_eval: dict, king_uid, n_prompts: 
                     _poll_last_err["kind"] = None
                     _poll_last_err["at"] = 0.0
             except Exception as exc:
-                if _poll_last_err["kind"] is None:
+                if isinstance(exc, _ProgressNotReady):
+                    pass
+                elif _poll_last_err["kind"] is None:
                     _poll_log_err("unclassified", f"{type(exc).__name__}: {exc}")
             finally:
                 if tmp_path:
@@ -315,9 +412,9 @@ def run_eval_on_pod(pod: PodManager, models_to_eval: dict, king_uid, n_prompts: 
             if not is_local_backend:
                 try:
                     pod.exec(
-                        "for p in $(pgrep -f 'pod_eval' 2>/dev/null); do "
+                        "for p in $(pgrep -f '[p]od_eval.py' 2>/dev/null); do "
                         "  cmdline=$(cat /proc/$p/cmdline 2>/dev/null | tr '\\0' ' '); "
-                        "  case \"$cmdline\" in *distil_eval_*) ;; *) kill -9 $p 2>/dev/null;; esac; "
+                        "  case \"$cmdline\" in *quasar_eval_*) ;; *) kill -9 $p 2>/dev/null;; esac; "
                         "done; "
                         "rm -f /home/pod_eval.py /home/prompts.json /home/pod_eval_vllm.py 2>/dev/null",
                         timeout=15,
@@ -333,12 +430,86 @@ def run_eval_on_pod(pod: PodManager, models_to_eval: dict, king_uid, n_prompts: 
     logger.info(f"Running eval on {backend_label} ({n_eval_models} models, {n_prompts} prompts, timeout={eval_timeout // 60}m)")
     log_event(f"Running eval on {backend_label}: king vs {n_eval_models - 1} challengers, {n_prompts} prompts", state_dir=str(state.state_dir))
     eval_env = {"HF_TOKEN": os.environ.get("HF_TOKEN", ""), "TOKENIZERS_PARALLELISM": "false"}
+    for _propagate in (
+        "BENCH_BATTERY_ENABLED",
+        "BENCH_BATTERY_SHADOW_AXES",
+        "BENCH_BATTERY_LITE",
+        "POD_PER_MODEL_TIMEOUT",
+        "ARENA_V3_AXES_IN_COMPOSITE",
+        "REASONING_DENSITY_IN_COMPOSITE",
+        "JUDGE_AXIS_IN_COMPOSITE",
+        "CHAT_TURNS_AXIS_IN_COMPOSITE",
+        "PARETO_DOMINANCE_GATE",
+        "KING_REGRESSION_GATE",
+        "BENCH_MATH_PER_ROUND",
+        "BENCH_CODE_PER_ROUND",
+        "BENCH_REASONING_PER_ROUND",
+        "BENCH_KNOWLEDGE_PER_ROUND",
+        "BENCH_IFEVAL_PER_ROUND",
+        "BENCH_AIME_PER_ROUND",
+        "BENCH_MBPP_PER_ROUND",
+        "BENCH_TOOL_USE_PER_ROUND",
+        "BENCH_SELF_CONSISTENCY_PER_ROUND",
+        "BENCH_SELF_CONSISTENCY_SAMPLES",
+        "BENCH_ARC_PER_ROUND",
+        "BENCH_TRUTHFUL_PER_ROUND",
+        "BENCH_LC_PER_ROUND",
+        "BENCH_PROCEDURAL_PER_ROUND",
+        "BENCH_ROBUSTNESS_PER_ROUND",
+        "BENCH_ROBUSTNESS_PERTURB_K",
+        "BENCH_NOISE_PER_ROUND",
+        "BENCH_NOISE_PERTURB_K",
+        "BENCH_MATH_MAX_TOKENS",
+        "BENCH_CODE_MAX_TOKENS",
+        "BENCH_REASONING_MAX_TOKENS",
+        "BENCH_KNOWLEDGE_MAX_TOKENS",
+        "BENCH_IFEVAL_MAX_TOKENS",
+        "BENCH_AIME_MAX_TOKENS",
+        "BENCH_MBPP_MAX_TOKENS",
+        "BENCH_TOOL_USE_MAX_TOKENS",
+        "BENCH_SELF_CONSISTENCY_MAX_TOKENS",
+        "BENCH_ARC_MAX_TOKENS",
+        "BENCH_TRUTHFUL_MAX_TOKENS",
+        "BENCH_LC_MAX_TOKENS",
+        "BENCH_PROCEDURAL_MAX_TOKENS",
+        "BENCH_ROBUSTNESS_MAX_TOKENS",
+        "BENCH_NOISE_MAX_TOKENS",
+        "JUDGE_PROBE_PER_ROUND",
+        "JUDGE_PROBE_MAX_TOKENS",
+        "CHAT_TURNS_PROBE_PER_ROUND",
+        "CHAT_TURNS_PROBE_MAX_TOKENS",
+        "CHAT_TURNS_PROBE",
+    ):
+        _v = os.environ.get(_propagate)
+        if _v is not None:
+            eval_env[_propagate] = _v
     try:
-        start_res = pod.exec(start_cmd, env=eval_env, timeout=120)
-        if not start_res.get("success"):
-            logger.error("Failed to start detached eval: %s", start_res)
-            return None
-        logger.info("Detached GPU eval started: %s", (start_res.get("stdout") or "").strip()[:200])
+        if is_resuming:
+            logger.info(
+                "RESUME: skipping start_cmd; attaching to existing %s eval at %s",
+                backend_label, run_dir,
+            )
+        else:
+            start_res = pod.exec(start_cmd, env=eval_env, timeout=120)
+            if not start_res.get("success"):
+                logger.error("Failed to start detached eval: %s", start_res)
+                return None
+            logger.info("Detached GPU eval started: %s", (start_res.get("stdout") or "").strip()[:200])
+        try:
+            if isinstance(state.current_round, dict):
+                state.current_round["pod_eval"] = {
+                    "run_dir": run_dir,
+                    "pid_remote": pid_remote,
+                    "done_marker_remote": done_marker_remote,
+                    "log_remote": log_remote,
+                    "progress_remote": progress_remote,
+                    "results_remote": results_remote,
+                    "eval_data_remote": eval_data_remote,
+                    "started_at": now,
+                }
+                state.save_round()
+        except Exception as _save_exc:
+            logger.warning("Failed to persist pod_eval meta (non-fatal): %s", _save_exc)
         result = {"stdout": "", "stderr": "", "exit_code": -1, "success": False}
         dead_streak = 0
         starting_streak = 0
@@ -347,17 +518,17 @@ def run_eval_on_pod(pod: PodManager, models_to_eval: dict, king_uid, n_prompts: 
         while time.time() < deadline:
             status = pod.exec(status_cmd, timeout=90)
             out = status.get("stdout", "") or ""
-            if "DISTIL_STATUS:done" in out:
+            if "QUASAR_STATUS:done" in out:
                 result = {"stdout": "", "stderr": "", "exit_code": 0, "success": True}
                 break
-            if "DISTIL_STATUS:dead" in out:
+            if "QUASAR_STATUS:dead" in out:
                 dead_streak += 1
                 starting_streak = 0
                 if dead_streak >= 3:
                     logger.error("Eval worker on pod exited before writing eval_results.json")
                     result = {"stdout": "", "stderr": "worker_dead", "exit_code": -1, "success": False}
                     break
-            elif "DISTIL_STATUS:starting" in out:
+            elif "QUASAR_STATUS:starting" in out:
                 dead_streak = 0
                 starting_streak += 1
                 if starting_streak >= 15 and (time.time() - eval_started_at) > 180:
@@ -393,7 +564,7 @@ def run_eval_on_pod(pod: PodManager, models_to_eval: dict, king_uid, n_prompts: 
                     )
                     pod.exec(kill_cmd, timeout=30)
                 else:
-                    pod.exec("pkill -9 -f pod_eval.py; echo killed", timeout=30)
+                    pod.exec("pkill -9 -f '[p]od_eval.py'; echo killed", timeout=30)
             except Exception:
                 pass
             try:
@@ -421,7 +592,7 @@ def run_eval_on_pod(pod: PodManager, models_to_eval: dict, king_uid, n_prompts: 
                 "echo '== files ==' && "
                 f"ls -l {shlex.quote(results_remote)} {shlex.quote(progress_remote)} {shlex.quote(log_remote)} 2>/dev/null || true && "
                 "echo '== ps ==' && "
-                "pgrep -af \"pod_eval.py|vllm.entrypoints.openai.api_server\" || true && "
+                "pgrep -af \"[p]od_eval.py|[v]llm.entrypoints.openai.api_server\" || true && "
                 "echo '== tail ==' && "
                 f"tail -120 {shlex.quote(log_remote)} 2>/dev/null || true",
                 timeout=60,

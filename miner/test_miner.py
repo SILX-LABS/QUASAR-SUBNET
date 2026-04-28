@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-test_miner.py — Pre-submission validation for distillation subnet miners.
+test_miner.py — Pre-submission validation for Quasar SN24 miners.
 
 Runs ALL the same checks the validator does so you can verify your model
 BEFORE committing (commitment is permanent and irreversible).
@@ -460,16 +460,16 @@ def check_tokenizer_encoding(results: CheckResults, model_repo: str, revision: s
     """Check 11: Tokenizer encoding matches official base on test strings."""
     from transformers import AutoTokenizer
     try:
-        teacher_tok = AutoTokenizer.from_pretrained(TOKENIZER_REFERENCE_MODEL, trust_remote_code=True)
+        reference_tok = AutoTokenizer.from_pretrained(TOKENIZER_REFERENCE_MODEL, trust_remote_code=True)
         student_tok = AutoTokenizer.from_pretrained(model_repo, revision=revision, trust_remote_code=False)
 
         mismatches = []
         for i, test_str in enumerate(TOKENIZER_TEST_STRINGS):
-            teacher_ids = teacher_tok.encode(test_str)
+            reference_ids = reference_tok.encode(test_str)
             student_ids = student_tok.encode(test_str)
-            if teacher_ids != student_ids:
+            if reference_ids != student_ids:
                 mismatches.append(
-                    f"String {i + 1}: base={len(teacher_ids)} tokens, student={len(student_ids)} tokens"
+                    f"String {i + 1}: base={len(reference_ids)} tokens, student={len(student_ids)} tokens"
                 )
 
         if mismatches:
@@ -738,19 +738,19 @@ def run_all_checks(model_repo: str, revision: str = None,
 # ── CLI entry point ────────────────────────────────────────────────────
 def main():
     parser = argparse.ArgumentParser(
-        description="Pre-submission validator for distillation subnet miners.\n"
+        description="Pre-submission validator for Quasar SN24 miners.\n"
                     "Runs all the same checks the validator does, so you can verify\n"
                     "your model BEFORE committing (commitment is permanent).",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Examples:\n"
-            "  python test_miner.py --model-repo user/my-distilled-qwen\n"
+            "  python test_miner.py --model-repo user/my-quasar-model\n"
             "  python test_miner.py --model-repo user/my-model --revision abc123def456\n"
             "  python test_miner.py --model-repo user/my-model --wallet-name default --hotkey-name default\n"
         ),
     )
     parser.add_argument("--model-repo", required=True,
-                        help="HuggingFace model repo (e.g., 'user/distilled-qwen')")
+                        help="HuggingFace model repo (e.g., 'user/my-quasar-model')")
     parser.add_argument("--revision", default=None,
                         help="HF commit SHA (uses latest if omitted)")
     parser.add_argument("--wallet-name", default=None,

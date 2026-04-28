@@ -75,13 +75,13 @@ TOP_N_ALWAYS_INCLUDE = _env_int("QUASAR_TOP_N_ALWAYS_INCLUDE", VALIDATOR["topNAl
 REFERENCE_MODEL = _env_str("QUASAR_REFERENCE_MODEL", VALIDATOR["referenceModel"])
 REFERENCE_UID = _env_int("QUASAR_REFERENCE_UID", VALIDATOR["referenceUid"])
 ACTIVATION_COPY_THRESHOLD = _env_float("QUASAR_ACTIVATION_COPY_THRESHOLD", VALIDATOR["activationCopyThreshold"])
-DISTIL_ROLE_ID = VALIDATOR.get("roleId", VALIDATOR.get("distilRoleId", ""))
+QUASAR_ROLE_ID = VALIDATOR.get("roleId", VALIDATOR.get("distilRoleId", ""))
 
 CACHE_TTL = API["cacheTtl"]
 TMC_BASE = API["tmcBase"]
-PUBLIC_API_URL = os.environ.get("QUASAR_PUBLIC_API_URL") or os.environ.get("DISTIL_PUBLIC_API_URL") or API["publicUrl"]
-DASHBOARD_URL = os.environ.get("QUASAR_DASHBOARD_URL") or os.environ.get("DISTIL_DASHBOARD_URL") or API["dashboardUrl"]
-_allowed_origins_env = os.environ.get("QUASAR_ALLOWED_ORIGINS") or os.environ.get("DISTIL_ALLOWED_ORIGINS")
+PUBLIC_API_URL = os.environ.get("QUASAR_PUBLIC_API_URL") or API["publicUrl"]
+DASHBOARD_URL = os.environ.get("QUASAR_DASHBOARD_URL") or API["dashboardUrl"]
+_allowed_origins_env = os.environ.get("QUASAR_ALLOWED_ORIGINS")
 ALLOWED_ORIGINS = [item.strip() for item in _allowed_origins_env.split(",") if item.strip()] if _allowed_origins_env else list(API["allowedOrigins"])
 
 CHAT_POD_HOST = os.environ.get("CHAT_POD_HOST", "91.224.44.207")
@@ -89,7 +89,7 @@ CHAT_POD_SSH_PORT = int(os.environ.get("CHAT_POD_SSH_PORT", "40070"))
 CHAT_POD_APP_PORT = CHAT["appPort"]
 CHAT_POD_SSH_KEY = os.environ.get("CHAT_POD_SSH_KEY", os.path.expanduser("~/.ssh/id_ed25519"))
 
-STATE_DIR = os.environ.get("QUASAR_STATE_DIR") or os.environ.get("DISTIL_STATE_DIR", str(REPO_ROOT / "state"))
+STATE_DIR = os.environ.get("QUASAR_STATE_DIR", str(REPO_ROOT / "state"))
 DISK_CACHE_DIR = os.path.join(STATE_DIR, "api_cache")
 os.makedirs(DISK_CACHE_DIR, exist_ok=True)
 

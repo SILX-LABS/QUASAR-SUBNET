@@ -38,7 +38,7 @@ Public API for [Quasar]({DASHBOARD_URL}), a Bittensor subnet where miners compet
 
 ## How It Works
 
-Miners submit distilled models and a validator evaluates them head-to-head against the reigning **king** model using KL-divergence on shared prompts. Lower KL = better distillation = higher rewards.
+Miners submit Quasar-compatible models and validators score them with the composite evaluator. KL is one distillation axis, while king selection uses composite worst/weighted scores.
 
 ## Quick Start
 

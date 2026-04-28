@@ -1,6 +1,8 @@
 import json
 import os
 import sys
+import time
+from pathlib import Path
 
 from config import DISK_CACHE_DIR, STATE_DIR
 
@@ -16,6 +18,7 @@ from eval.state import (
     H2H_HISTORY_FILE,
     H2H_LATEST_FILE,
     H2H_TESTED_KING_FILE,
+    COMPOSITE_SCORES_FILE,
     MODEL_HASHES_FILE,
     MODEL_SCORE_HISTORY_FILE,
     SCORE_HISTORY_FILE,
@@ -26,10 +29,49 @@ from eval.state import (
 from helpers.sanitize import _safe_json_load
 
 
+REMOTE_STATE_BASE_URL = os.environ.get("QUASAR_STATE_BASE_URL", "").rstrip("/")
+REMOTE_STATE_TTL = int(os.environ.get("QUASAR_STATE_REMOTE_TTL", "10"))
+REMOTE_STATE_TIMEOUT = float(os.environ.get("QUASAR_STATE_REMOTE_TIMEOUT", "5"))
+
+
 def _read(path, default=None):
     if default is None:
         default = {}
     return _safe_json_load(path, default)
+
+
+def _remote_cache_path(filename):
+    safe = filename.replace("\\", "/").strip("/").replace("/", "__")
+    return os.path.join(DISK_CACHE_DIR, "remote_state", safe)
+
+
+def _read_remote_state(filename, default=None):
+    if default is None:
+        default = {}
+    if not REMOTE_STATE_BASE_URL:
+        return default
+    cache_file = _remote_cache_path(filename)
+    now = time.time()
+    try:
+        if os.path.exists(cache_file) and now - os.path.getmtime(cache_file) <= REMOTE_STATE_TTL:
+            return _safe_json_load(cache_file, default)
+    except OSError:
+        pass
+    url = f"{REMOTE_STATE_BASE_URL}/{filename.lstrip('/')}"
+    try:
+        import requests
+
+        response = requests.get(url, timeout=REMOTE_STATE_TIMEOUT)
+        response.raise_for_status()
+        data = response.json()
+        Path(cache_file).parent.mkdir(parents=True, exist_ok=True)
+        with open(cache_file, "w") as handle:
+            json.dump(data, handle)
+        return data
+    except Exception:
+        if os.path.exists(cache_file):
+            return _safe_json_load(cache_file, default)
+    return default
 
 
 def state_path(filename):
@@ -41,7 +83,10 @@ def cache_path(name):
 
 
 def read_state(filename, default=None):
-    return _read(state_path(filename), default)
+    path = state_path(filename)
+    if os.path.exists(path):
+        return _read(path, default)
+    return _read_remote_state(filename, default)
 
 
 def read_cache(name, default=None):
@@ -84,6 +129,10 @@ def score_history():
 
 def top4_leaderboard():
     return read_state(TOP4_LEADERBOARD_FILE, {})
+
+
+def composite_scores():
+    return read_state(COMPOSITE_SCORES_FILE, {})
 
 
 def uid_hotkey_map():
