@@ -37,7 +37,7 @@ Validators run the Quasar evaluation loop for SN24. They watch on-chain model co
 - Quasar attention dependency:
 
 ```bash
-pip install "git+https://github.com/SILX-LABS/quasar-flash-linear-attention.git"
+python -m pip install -r requirements-validator.txt
 ```
 
 ---
@@ -77,8 +77,7 @@ QUASAR_LIUM_POD_NAME=quasar-eval
 ```bash
 git clone https://github.com/SILX-LABS/QUASAR-SUBNET.git
 cd QUASAR-SUBNET
-pip install -e .
-pip install "git+https://github.com/SILX-LABS/quasar-flash-linear-attention.git"
+python -m pip install -r requirements-validator.txt
 bash scripts/run_validator.sh
 ```
 

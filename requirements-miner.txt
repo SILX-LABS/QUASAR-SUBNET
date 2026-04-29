@@ -1,0 +1,15 @@
+--extra-index-url https://download.pytorch.org/whl/cu128
+
+torch==2.11.0+cu128
+transformers==5.7.0
+flash-linear-attention @ git+https://github.com/SILX-LABS/quasar-flash-linear-attention.git@84ad1cc5a7428609d7e0e56d4041a775cd19b7bb
+safetensors==0.7.0
+huggingface-hub==1.12.2
+bittensor==9.12.0
+click==8.3.3
+datasets==4.8.5
+numpy==2.4.4
+requests==2.33.1
+rich==14.3.4
+packaging==26.2
+fsspec==2026.2.0

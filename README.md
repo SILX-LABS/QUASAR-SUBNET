@@ -84,11 +84,10 @@ Requirements:
 - Hugging Face account for model hosting.
 - Training infrastructure of your choice.
 
-Install the subnet package and Quasar attention dependency:
+Install the miner dependencies:
 
 ```bash
-pip install -e .
-pip install "git+https://github.com/SILX-LABS/quasar-flash-linear-attention.git"
+python -m pip install -r requirements-miner.txt
 ```
 
 Check your model before committing:
@@ -125,8 +124,7 @@ Requirements:
 Quick start:
 
 ```bash
-pip install -e .
-pip install "git+https://github.com/SILX-LABS/quasar-flash-linear-attention.git"
+python -m pip install -r requirements-validator.txt
 bash scripts/run_validator.sh
 ```
 

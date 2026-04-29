@@ -31,8 +31,7 @@ Key config values:
 ## Quick Start
 
 ```bash
-pip install click huggingface_hub transformers safetensors bittensor
-pip install "git+https://github.com/SILX-LABS/quasar-flash-linear-attention.git"
+python -m pip install -r requirements-miner.txt
 
 python miner/check_model.py --model-repo your-org/your-model
 python miner/test_miner.py --model-repo your-org/your-model

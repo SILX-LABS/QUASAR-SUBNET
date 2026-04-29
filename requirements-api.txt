@@ -6,6 +6,5 @@ requests
 httpx
 boto3
 bittensor
-bittensor-wallet
 huggingface-hub
 rich

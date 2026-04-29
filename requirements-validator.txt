@@ -1,0 +1,4 @@
+-r requirements-miner.txt
+
+boto3
+lium.io==0.0.8
