@@ -1,7 +1,7 @@
 [project]
 name = "quasar"
 version = "0.8.0"
-description = "Quasar SN24 - Bittensor subnet for competitive Qwen knowledge distillation"
+description = "Quasar SN24 - Bittensor subnet built to crush the long-context barrier"
 readme = "README.md"
 requires-python = ">=3.10"
 license = {text = "MIT"}
@@ -14,7 +14,7 @@ dependencies = [
     "fastapi",
     "huggingface-hub",
     "httpx",
-    "lium",
+    "lium.io",
     "numpy",
     "pydantic",
     "requests",
@@ -36,4 +36,4 @@ gpu = [
 
 [tool.setuptools.packages.find]
 include = ["eval*", "api*"]
-exclude = ["state*", "scripts*", "distillation*", "neurons*"]
+exclude = ["state*", "scripts*", "neurons*"]

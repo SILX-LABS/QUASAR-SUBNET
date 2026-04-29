@@ -842,7 +842,7 @@ def apply_results_and_weights(
             # single-eval announcement read "KL: 0.000000" (impossible) and
             # breaks trust with miners.
             # The dashboard already exposes composite scores separately, so
-            # the announcement KL should be the actual distillation distance.
+            # the announcement KL should be the actual teacher-distance score.
             winner_kl_global = state.scores.get(str(composite_king_uid))
             if winner_kl_global is not None and winner_kl_global > 0:
                 winner_kl = float(winner_kl_global)
@@ -960,7 +960,14 @@ def run_validator(network, netuid, wallet_name, hotkey_name, wallet_path,
     if eval_backend == "lium":
         if not lium_api_key:
             raise ValueError("LIUM_API_KEY is required when eval_backend='lium'")
-        from lium import Config, Lium
+        try:
+            from lium import Config, Lium
+        except ImportError as exc:
+            raise RuntimeError(
+                "QUASAR_EVAL_BACKEND=lium requires the Lium SDK. "
+                "Install it with: pip install -e . "
+                "or pip install lium.io"
+            ) from exc
 
         cfg = Config(api_key=lium_api_key, ssh_key_path=Path.home() / ".ssh" / "id_ed25519")
         pod = init_pod(Lium(config=cfg), lium_pod_name, TEACHER_MODEL)
@@ -1104,7 +1111,7 @@ def run_validator(network, netuid, wallet_name, hotkey_name, wallet_path,
                     continue
 
             # Mix climbmix-public prompts with a private holdout subset so
-            # miners can't fully precompute distillation against the eval set.
+            # miners can't fully precompute distribution matching against the eval set.
             # Validator-only state/private_prompt_pool.json drives the
             # private side; we commit its hash before running eval and reveal
             # the per-prompt hashes after, so miners can audit non-retrofit.
