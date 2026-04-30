@@ -7,6 +7,7 @@ flash-linear-attention @ git+https://github.com/SILX-LABS/quasar-flash-linear-at
 safetensors==0.7.0
 huggingface-hub==1.12.2
 bittensor==9.12.0
+async-substrate-interface==2.0.3
 click==8.3.3
 datasets==4.8.5
 numpy==2.4.4
