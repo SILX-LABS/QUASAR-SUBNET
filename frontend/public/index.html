@@ -107,7 +107,7 @@ body {
 .scroll-box::-webkit-scrollbar { width: 4px; }
 .scroll-box::-webkit-scrollbar-thumb { background: var(--ink); }
 .scroll-queue { max-height: 200px; }
-.scroll-validators { max-height: 180px; }
+
 .scroll-hist { max-height: 60vh; }
 
 table {
@@ -210,7 +210,7 @@ th:last-child, td:last-child { text-align: right; }
     .chart-wrap { aspect-ratio: 3 / 2; }
     .scroll-box { overflow-x: auto; }
     .scroll-hist table,
-    .scroll-validators table,
+
     .scroll-queue table { table-layout: auto; min-width: 500px; }
     .scroll-hist table { min-width: 700px; }
     .scroll-hist th:nth-child(6),
@@ -266,15 +266,7 @@ th:last-child, td:last-child { text-align: right; }
         <div id="last-winner" style="font-size:12px;line-height:1.8;min-height:48px;display:flex;flex-wrap:wrap;gap:0 16px;">--</div>
     </div>
 
-    <div>
-        <div class="section-label">Validators</div>
-        <div class="scroll-box scroll-validators">
-            <table>
-                <thead><tr><th>UID</th><th>Hotkey</th><th>Stake</th><th>Trust</th><th>Dividends</th></tr></thead>
-                <tbody id="validators"></tbody>
-            </table>
-        </div>
-    </div>
+
 
     <div>
         <div class="section-label">Queue</div>
@@ -541,13 +533,7 @@ function render(d) {
         lwEl.textContent = "NO DETHRONING YET";
     }
 
-    var vEl = document.getElementById("validators");
-    var validators = d.validators || [];
-    vEl.innerHTML = validators.length === 0
-        ? '<tr><td colspan="5" style="text-align:center;padding:16px">No validators found</td></tr>'
-        : validators.map(function(v) {
-            return '<tr><td>' + (v.uid != null ? v.uid : "--") + '</td><td>' + hotkeyLink(v.hotkey) + '</td><td>' + fmtNum(v.stake, 2) + '</td><td>' + fmtNum(v.validator_trust, 4) + '</td><td>' + fmtNum(v.dividends, 4) + '</td></tr>';
-        }).join("");
+
 
     var qEl = document.getElementById("queue");
     var q = d.queue || [];
