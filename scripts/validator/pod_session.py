@@ -258,6 +258,9 @@ def run_eval_on_pod(pod: PodManager, models_to_eval: dict, king_uid, n_prompts: 
     if use_vllm:
         eval_gpu_util = os.environ.get("VLLM_EVAL_GPU_UTIL", "0.90")
         vllm_flag = f" --vllm-gpu-util {eval_gpu_util}"
+        vllm_max_model_len = os.environ.get("QUASAR_VLLM_MAX_MODEL_LEN", "").strip()
+        if vllm_max_model_len:
+            vllm_flag += f" --vllm-max-model-len {shlex.quote(vllm_max_model_len)}"
         if not is_full_eval and king_uid is not None and king_uid in models_to_eval:
             king_flag = f" --king {models_to_eval[king_uid]['model']}"
     tp_flag = f" --tensor-parallel-size {TP_SIZE}" if TP_SIZE > 0 else ""

@@ -139,7 +139,7 @@ def set_weights(subtensor, wallet, netuid: int, n_uids: int,
             ok = result[0] if isinstance(result, (tuple, list)) else bool(result)
             if ok:
                 logger.info("✓ Weights set on-chain!")
-                return
+                return True
             last_err = result[1] if isinstance(result, (tuple, list)) and len(result) > 1 else str(result)
             logger.warning(f"Attempt {attempt + 1}: rejected — {last_err}")
         except Exception as e:

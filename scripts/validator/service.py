@@ -163,8 +163,7 @@ def _safe_set_weights(subtensor, wallet, netuid, n_uids, weights, winner_uid, st
     """Call set_weights and surface SetWeightsError as a log_event so the epoch
     loop can sleep + retry instead of silently leaving stale weights."""
     try:
-        set_weights(subtensor, wallet, netuid, n_uids, weights, winner_uid)
-        return True
+        return bool(set_weights(subtensor, wallet, netuid, n_uids, weights, winner_uid))
     except SetWeightsError as exc:
         logger.error(f"set_weights failed: {exc}")
         log_event(f"set_weights failed: {str(exc)[:200]}", level="error", state_dir=state_dir)
@@ -525,7 +524,7 @@ def _run_resumed_round(subtensor, wallet, netuid, state, pod, resume_round,
     }
 
     try:
-        winner_uid, winner_kl, h2h_results, king_h2h_kl, king_per_prompt, uid_to_model = (
+        winner_uid, winner_kl, h2h_results, king_h2h_kl, king_per_prompt, uid_to_model, weights_set = (
             apply_results_and_weights(
                 subtensor, wallet, netuid, n_uids,
                 results, models_to_eval, king_uid, king_kl,
@@ -855,8 +854,9 @@ def apply_results_and_weights(
                     winner_kl = float(weighted)
                 elif worst is not None:
                     winner_kl = float(worst)
+    weights_set = False
     if winner_uid is not None:
-        _safe_set_weights(
+        weights_set = _safe_set_weights(
             subtensor, wallet, netuid, n_uids,
             build_winner_take_all_weights(n_uids, winner_uid),
             winner_uid, state_dir,
@@ -864,7 +864,7 @@ def apply_results_and_weights(
     else:
         logger.info("No valid miners — skipping weight setting")
     state.save()
-    return winner_uid, winner_kl, h2h_results, king_h2h_kl, king_per_prompt, uid_to_model
+    return winner_uid, winner_kl, h2h_results, king_h2h_kl, king_per_prompt, uid_to_model, weights_set
 
 
 def post_round(
@@ -1198,7 +1198,7 @@ def run_validator(network, netuid, wallet_name, hotkey_name, wallet_path,
                 time.sleep(tempo)
                 continue
 
-            winner_uid, winner_kl, h2h_results, king_h2h_kl, king_per_prompt, uid_to_model = (
+            winner_uid, winner_kl, h2h_results, king_h2h_kl, king_per_prompt, uid_to_model, weights_set = (
                 apply_results_and_weights(
                     subtensor, wallet, netuid, n_uids,
                     results, models_to_eval, king_uid, king_kl,
@@ -1225,13 +1225,14 @@ def run_validator(network, netuid, wallet_name, hotkey_name, wallet_path,
             if king_changed:
                 log_event(
                     f"Round complete. New king: UID {winner_uid} ({winner_model}), "
-                    f"KL={winner_score:.6f}. Dethroned UID {king_uid}.",
+                    f"KL={winner_score:.6f}. Dethroned UID {king_uid}. "
+                    f"{'Weights set.' if weights_set else 'Weights not submitted.'}",
                     state_dir=state_dir,
                 )
             else:
                 log_event(
                     f"Round complete. Winner: UID {winner_uid}, KL={winner_score:.6f}. "
-                    f"Weights set.",
+                    f"{'Weights set.' if weights_set else 'Weights not submitted.'}",
                     state_dir=state_dir,
                 )
             if once:

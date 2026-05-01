@@ -7,16 +7,6 @@ ENV_FILE="${QUASAR_ENV_FILE:-${DISTIL_ENV_FILE:-$HOME/.secrets/quasar.env}}"
 if [ ! -f "$ENV_FILE" ] && [ -f "$HOME/.secrets/distil.env" ]; then
     ENV_FILE="$HOME/.secrets/distil.env"
 fi
-PYTHON_BIN="${QUASAR_PYTHON:-${DISTIL_PYTHON:-}}"
-
-if [ -z "$PYTHON_BIN" ]; then
-    for candidate in "$REPO_ROOT/.venv/bin/python" "/opt/quasar/venv/bin/python" "/opt/distil/venv/bin/python" "$(command -v python3)"; do
-        if [ -n "$candidate" ] && [ -x "$candidate" ]; then
-            PYTHON_BIN="$candidate"
-            break
-        fi
-    done
-fi
 
 cd "$REPO_ROOT"
 
@@ -27,6 +17,17 @@ if [ -f "$ENV_FILE" ]; then
     # shellcheck disable=SC1090
     source "$ENV_FILE"
     set +a
+fi
+
+PYTHON_BIN="${QUASAR_PYTHON:-${DISTIL_PYTHON:-}}"
+
+if [ -z "$PYTHON_BIN" ]; then
+    for candidate in "$REPO_ROOT/.venv/bin/python" "/opt/quasar/venv/bin/python" "/opt/distil/venv/bin/python" "$(command -v python3)"; do
+        if [ -n "$candidate" ] && [ -x "$candidate" ]; then
+            PYTHON_BIN="$candidate"
+            break
+        fi
+    done
 fi
 
 export HF_TOKEN="${HF_TOKEN:-$(cat "$HOME/.cache/huggingface/token" 2>/dev/null || echo '')}"

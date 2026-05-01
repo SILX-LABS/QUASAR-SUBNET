@@ -32,12 +32,18 @@ def _iso(value):
 def _commitments_by_uid():
     cached = _get_stale("commitments") or {}
     commitments = cached.get("commitments", {})
-    uid_map = uid_hotkey_map()
+    uid_map = uid_hotkey_map() or {}
+    metagraph = _get_stale("metagraph") or {}
+    for row in metagraph.get("neurons", []):
+        if row.get("uid") is not None and row.get("hotkey"):
+            uid_map.setdefault(str(row["uid"]), row["hotkey"])
     by_uid = {}
     for uid_str, hotkey in uid_map.items():
         try:
             uid = int(uid_str)
         except (TypeError, ValueError):
+            continue
+        if not hotkey:
             continue
         row = dict(commitments.get(hotkey, {}) or {})
         if row:
@@ -174,6 +180,23 @@ def _queue(commitments, history_rows):
     return rows
 
 
+def _validators():
+    metagraph = _get_stale("metagraph") or {}
+    rows = []
+    for row in metagraph.get("neurons", []):
+        if not row.get("is_validator"):
+            continue
+        rows.append({
+            "uid": row.get("uid"),
+            "hotkey": row.get("hotkey"),
+            "stake": row.get("stake") or 0,
+            "validator_trust": row.get("validator_trust") or 0,
+            "dividends": row.get("dividends") or 0,
+            "emission": row.get("emission") or 0,
+        })
+    return sorted(rows, key=lambda item: item.get("stake") or 0, reverse=True)
+
+
 @router.get("/api/dashboard.json", tags=["Dashboard"], summary="Compact static dashboard payload")
 def get_dashboard_json():
     commitments = _commitments_by_uid()
@@ -204,6 +227,7 @@ def get_dashboard_json():
         },
         "current_eval": _current_eval(normalize_eval_progress(eval_progress() or {}), commitments),
         "queue": _queue(commitments, hist_rows),
+        "validators": _validators(),
         "history": hist_rows,
     }
     return JSONResponse(
