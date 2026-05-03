@@ -1,0 +1,14 @@
+--extra-index-url https://download.pytorch.org/whl/cu128
+
+# Isolated vLLM teacher-serving environment.
+# Keep this separate from requirements-validator.txt so vLLM's CUDA stack does
+# not mutate the validator wallet/chain/model-checking environment.
+torch==2.10.0+cu128
+vllm==0.18.1
+transformers==4.57.6
+tokenizers==0.22.2
+safetensors==0.7.0
+huggingface_hub==0.36.2
+triton==3.6.0
+numpy==2.2.6
+ninja

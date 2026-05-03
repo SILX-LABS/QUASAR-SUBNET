@@ -54,7 +54,7 @@ def model_info(model_repo, revision=None, files_metadata=False, token=None, **kw
         except Exception as exc:
             last_exc = exc
             msg = str(exc).lower()
-            if not any(k in msg for k in ("429", "rate limit", "too many", "503", "502", "timeout")):
+            if not any(k in msg for k in ("429", "rate limit", "too many", "503", "502", "500", "internal server error", "server error", "timeout")):
                 raise
             if attempt == len(_MODEL_INFO_RETRY_DELAYS):
                 raise
@@ -567,7 +567,7 @@ def _verify_model_integrity_uncached(
             }
         # Transient errors should not DQ
         err_lower = err.lower()
-        if any(k in err_lower for k in ["429", "rate limit", "too many", "timeout", "503", "502", "connection"]):
+        if any(k in err_lower for k in ["429", "rate limit", "too many", "timeout", "503", "502", "500", "internal server error", "server error", "connection"]):
             return {
                 "pass": True,
                 "reason": f"transient_error: {err}",
@@ -686,6 +686,8 @@ def _is_transient_error(exc: Exception) -> bool:
     err_str = str(exc).lower()
     return any(k in err_str for k in [
         "429", "rate limit", "too many requests",
+        "500", "internal server error", "server error",
+        "503", "502", "temporary", "unavailable",
         "timeout", "timed out",
         "connection", "connectionerror", "connecttimeout",
     ])
@@ -1155,7 +1157,8 @@ def check_model_architecture(
         # Transient errors (rate limits, network issues) should NOT disqualify
         is_transient = any(k in err_str for k in [
             "429", "rate limit", "too many requests",
-            "connection", "timeout", "503", "502",
+            "connection", "timeout", "503", "502", "500",
+            "internal server error", "server error",
             "temporary", "unavailable",
         ])
         if is_transient:

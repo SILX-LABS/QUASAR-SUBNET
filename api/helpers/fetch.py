@@ -70,20 +70,97 @@ def _fetch_commitments():
     import subprocess
     script = """
 import bittensor as bt, json, sys
+from scalecodec.utils.ss58 import ss58_encode
 sub = bt.Subtensor(network="finney")
-revealed = sub.get_all_revealed_commitments(__NETUID__)
 commits = {}
-for hotkey, entries in revealed.items():
-    if not entries:
-        continue
+
+def _decode_hotkey(key):
+    if isinstance(key, str):
+        raw = key.removeprefix("0x")
+        if len(key) > 20 and not all(c in "0123456789abcdefABCDEF" for c in raw):
+            return key
+        return ss58_encode(raw, 42)
+    key_value = getattr(key, "value", key)
+    if isinstance(key_value, str):
+        return _decode_hotkey(key_value)
+    if isinstance(key_value, (bytes, bytearray)):
+        return ss58_encode(bytes(key_value).hex(), 42)
     try:
-        # Take the LATEST revealed commitment for this hotkey.
-        # Using the first/original entry leaves the dashboard permanently stale
-        # when a miner updates their model.
-        block, data_str = max(entries, key=lambda x: x[0])
-    except (ValueError, TypeError) as e:
-        print(f"[commitments] bad entry for {hotkey}: {e}", file=sys.stderr)
+        if isinstance(key_value, (list, tuple)) and len(key_value) == 32 and all(isinstance(x, int) for x in key_value):
+            return ss58_encode(bytes(key_value).hex(), 42)
+    except Exception:
+        pass
+    account = next(iter(key_value))
+    if isinstance(account, str):
+        account = account.removeprefix("0x")
+        return ss58_encode(account, 42)
+    if isinstance(account, (list, tuple)):
+        account = bytes(account).hex()
+    elif isinstance(account, (bytes, bytearray)):
+        account = bytes(account).hex()
+    return ss58_encode(account, 42)
+
+def _scale_offset(data):
+    if not data:
+        return 0
+    mode = data[0] & 0b11
+    if mode == 0:
+        return 1
+    if mode == 1:
+        return 2
+    return 4
+
+def _decode_message(raw):
+    if isinstance(raw, str):
+        s = raw.removeprefix("0x")
+        try:
+            raw = bytes.fromhex(s)
+        except Exception:
+            if raw and raw[0] not in "{[":
+                try:
+                    raw_bytes = raw.encode("latin1", errors="ignore")
+                    return raw_bytes[_scale_offset(raw_bytes):].decode("utf-8", errors="ignore")
+                except Exception:
+                    pass
+            return raw
+    elif isinstance(raw, (list, tuple)):
+        raw = bytes(raw)
+    elif isinstance(raw, bytearray):
+        raw = bytes(raw)
+    if isinstance(raw, bytes):
+        return raw[_scale_offset(raw):].decode("utf-8", errors="ignore")
+    return str(raw)
+
+try:
+    query = sub.query_map(
+        module="Commitments",
+        name="RevealedCommitments",
+        params=[__NETUID__],
+    )
+except Exception as e:
+    raise RuntimeError(f"raw commitments query failed: {e}") from e
+
+for pair in query:
+    try:
+        key, data = pair
+        hotkey = _decode_hotkey(key)
+        entries = getattr(data, "value", data) or []
+    except Exception as e:
+        print(f"[commitments] bad query row: {e}", file=sys.stderr)
         continue
+    decoded_entries = []
+    for entry in entries:
+        try:
+            raw_msg, block = entry
+            decoded_entries.append((int(block), _decode_message(raw_msg)))
+        except Exception as e:
+            print(f"[commitments] bad entry for {hotkey}: {e}", file=sys.stderr)
+            continue
+    if not decoded_entries:
+        continue
+    # Take the LATEST revealed commitment for this hotkey. Using the first
+    # entry leaves the dashboard stale when a miner updates their model.
+    block, data_str = max(decoded_entries, key=lambda x: x[0])
     # Robust parsing: try JSON first, then hex decode, then raw string
     parsed = None
     if isinstance(data_str, str):

@@ -121,12 +121,43 @@ Requirements:
 - GPU capacity for the current evaluator.
 - Local wallet keys kept on the validator host.
 
-Quick start:
+Quick start for local-GPU validators:
 
 ```bash
+python3 -m venv .venv
+. .venv/bin/activate
+python -m pip install -U pip
 python -m pip install -r requirements-validator.txt
+
+python3 -m venv .venv-vllm
+.venv-vllm/bin/python -m pip install -U pip
+.venv-vllm/bin/python -m pip install -r requirements-vllm.txt
+```
+
+Create an environment file outside the repo:
+
+```bash
+mkdir -p ~/.secrets
+cat > ~/.secrets/quasar.env <<'EOF'
+QUASAR_EVAL_BACKEND=local
+QUASAR_NETWORK=finney
+QUASAR_NETUID=24
+QUASAR_WALLET_NAME=validator
+QUASAR_HOTKEY_NAME=validator
+QUASAR_WALLET_PATH=$HOME/.bittensor/wallets
+QUASAR_STATE_DIR=$PWD/state
+EOF
+
 bash scripts/run_validator.sh
 ```
+
+Do not install `vllm` manually into the validator environment. The local
+backend uses `.venv-vllm/bin/python` automatically when it exists. Only set
+`QUASAR_PYTHON` or `QUASAR_VLLM_PYTHON` if you intentionally use non-standard
+virtualenv names.
+
+For remote Lium evaluation, set `QUASAR_EVAL_BACKEND=lium` and provide
+`LIUM_API_KEY` in the same environment file.
 
 Common validator settings:
 

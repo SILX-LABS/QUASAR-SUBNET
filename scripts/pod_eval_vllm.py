@@ -112,12 +112,18 @@ def free_gpu():
     """Free GPU memory: garbage collect, empty cache, synchronize."""
     gc.collect()
     if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+        try:
+            torch.cuda.empty_cache()
+        except Exception as e:
+            print(f"[gpu] empty_cache failed during cleanup: {e}", flush=True)
         try:
             torch.cuda.ipc_collect()
-        except Exception:
-            pass
-        torch.cuda.synchronize()
+        except Exception as e:
+            print(f"[gpu] ipc_collect failed during cleanup: {e}", flush=True)
+        try:
+            torch.cuda.synchronize()
+        except Exception as e:
+            print(f"[gpu] synchronize failed during cleanup: {e}", flush=True)
 
 
 def ensure_disk_space(teacher_name, threshold=85):
@@ -2814,7 +2820,8 @@ def _bench_load_pools(verbose: bool = True):
     if all(_BENCH_POOLS[k] for k in _BENCH_POOLS):
         return
     try:
-        os.environ.setdefault("HF_DATASETS_OFFLINE", "1")
+        if os.environ.get("QUASAR_BENCH_DATASETS_OFFLINE", "").strip().lower() in {"1", "true", "yes"}:
+            os.environ["HF_DATASETS_OFFLINE"] = "1"
         from datasets import load_dataset  # type: ignore
     except Exception as e:
         if verbose:
@@ -8888,6 +8895,9 @@ def start_vllm_server(model_name, gpu_memory_utilization=0.90, max_model_len=163
         "--reasoning-parser", "qwen3",
         "--max-logprobs", "128",
     ]
+    gdn_backend = os.environ.get("QUASAR_VLLM_GDN_PREFILL_BACKEND", "").strip().lower()
+    if gdn_backend:
+        cmd.extend(["--gdn-prefill-backend", gdn_backend])
     model_impl = os.environ.get("QUASAR_VLLM_MODEL_IMPL", "auto").strip().lower()
     if model_impl and model_impl != "auto":
         cmd.extend(["--model-impl", model_impl])
@@ -8898,7 +8908,37 @@ def start_vllm_server(model_name, gpu_memory_utilization=0.90, max_model_len=163
 
     log_f = open("/tmp/vllm_teacher.log", "w")
     env = os.environ.copy()
-    env["VLLM_ATTENTION_BACKEND"] = "FLASH_ATTN"
+    compile_cache_root = Path(
+        os.environ.get("QUASAR_COMPILE_CACHE_DIR")
+        or os.environ.get("QUASAR_VLLM_CACHE_DIR")
+        or (Path.home() / ".cache" / "quasar-compile")
+    ).expanduser()
+    for cache_name, env_key in (
+        ("tmp", "TMPDIR"),
+        ("triton", "TRITON_CACHE_DIR"),
+        ("torchinductor", "TORCHINDUCTOR_CACHE_DIR"),
+        ("nv", "CUDA_CACHE_PATH"),
+    ):
+        cache_path = compile_cache_root / cache_name
+        try:
+            cache_path.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+        current_cache = (env.get(env_key) or "").strip()
+        if env_key == "TMPDIR":
+            if not current_cache or current_cache == "/tmp":
+                env[env_key] = str(cache_path)
+        elif not current_cache:
+            env[env_key] = str(cache_path)
+    vllm_bin = os.path.dirname(os.path.abspath(vllm_python))
+    python_bin = os.path.dirname(os.path.abspath(sys.executable))
+    path_parts = env.get("PATH", "").split(os.pathsep) if env.get("PATH") else []
+    for bin_dir in (vllm_bin, python_bin):
+        if bin_dir and bin_dir not in path_parts:
+            path_parts.insert(0, bin_dir)
+    env["PATH"] = os.pathsep.join(path_parts)
+    if shutil.which("ninja", path=env.get("PATH")) is None:
+        print("[vllm] WARNING: ninja not found in PATH; install requirements-vllm.txt before running local vLLM", flush=True)
     if offline_ok:
         env["HF_HUB_OFFLINE"] = "1"
         env["TRANSFORMERS_OFFLINE"] = "1"
@@ -9523,6 +9563,25 @@ def _write_phase(progress_path, students, phase, teacher_done=None, **extra):
     _atomic_json_write(progress_path, data)
 
 
+_CUDA_CONTEXT_POISON_PATTERNS = (
+    "illegal memory access",
+    "cudaerrorillegaladdress",
+    "device-side assert",
+    "misaligned address",
+)
+
+
+def _is_cuda_context_poisoned(exc_or_msg) -> bool:
+    """CUDA illegal-address/device-assert errors poison the whole process.
+
+    After one of these errors, torch.cuda.empty_cache()/synchronize() cannot
+    make the process trustworthy again. The only safe recovery is to persist
+    the current result and resume the remaining students in a fresh process.
+    """
+    msg = str(exc_or_msg).lower()
+    return any(pattern in msg for pattern in _CUDA_CONTEXT_POISON_PATTERNS)
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # §11  Main
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -10088,6 +10147,39 @@ def main():
         _atomic_json_write(progress_path, snapshot)
     _write_progress()
 
+    def _save_incremental_results():
+        results["timings"] = {k: round(v, 1) for k, v in timings.items()}
+        with open(args.output, "w") as f:
+            json.dump(results, f, indent=2)
+
+    def _request_fresh_process(student_name, status, reason):
+        """Ask the parent validator to retry this student in a fresh process.
+
+        CUDA illegal-address/device-assert errors poison the whole Python
+        process. They are not evidence that the model failed anti-finetune or
+        scoring. Keep already-completed students durable, but remove the current
+        student from results so --resume retries it cleanly instead of turning a
+        corrupted-process error into a permanent DQ.
+        """
+        results["students"].pop(student_name, None)
+        _save_incremental_results()
+        live_progress["phase"] = "cuda_restart"
+        live_progress["current"] = {
+            "student_name": student_name,
+            "status": status,
+            "retry_required": True,
+            "reason": reason[:300],
+        }
+        _write_progress()
+        marker = Path(args.output).with_name("eval_restart.marker")
+        marker.write_text(f"cuda_restart {student_name} {status}: {reason[:300]}\n")
+        print(
+            f"[eval] CUDA context poisoned while scoring {student_name}; "
+            f"wrote completed prior results and requested fresh-process retry.",
+            flush=True,
+        )
+        raise SystemExit(42)
+
     # Early stopping state. args.early_stop_min <= 0 disables it outright.
     best_kl_so_far = None
     best_kl_per_prompt_cumulative = None
@@ -10180,6 +10272,7 @@ def main():
                 _write_progress()
                 try: del student
                 except: pass
+                student = None
                 free_gpu()
                 clean_model_cache(student_name, args.teacher)
                 continue
@@ -10193,6 +10286,7 @@ def main():
                     "status": "fraud_vram", "reason": msg,
                     "vram_gb": round(student_vram_gb, 1), "kl_global_avg": float('inf')}
                 del student
+                student = None
                 free_gpu()
                 clean_model_cache(student_name, args.teacher)
                 continue
@@ -10237,6 +10331,12 @@ def main():
                     "loss": probe["loss"],
                 }
                 if not probe["pass"]:
+                    if _is_cuda_context_poisoned(probe.get("reason", "")):
+                        _request_fresh_process(
+                            student_name,
+                            "finetune_probe_cuda_retry",
+                            f"anti_finetune:{probe.get('reason', '')}",
+                        )
                     results["students"][student_name].update({
                         "status": "anti_finetune",
                         "reason": f"anti_finetune:{probe['reason']}",
@@ -10253,10 +10353,17 @@ def main():
                         del student
                     except Exception:
                         pass
+                    student = None
                     free_gpu()
                     clean_model_cache(student_name, args.teacher)
                     continue
             except Exception as e:
+                if _is_cuda_context_poisoned(e):
+                    _request_fresh_process(
+                        student_name,
+                        "finetune_probe_cuda_error",
+                        f"finetune_probe:{e}",
+                    )
                 print(f"[eval] Finetune probe error (non-fatal, allowing): {e}", flush=True)
 
         # ── Chat-collapse probe (CoT-collapse defense) ──
@@ -10310,10 +10417,17 @@ def main():
                         del student
                     except Exception:
                         pass
+                    student = None
                     free_gpu()
                     clean_model_cache(student_name, args.teacher)
                     continue
             except Exception as e:
+                if _is_cuda_context_poisoned(e):
+                    _request_fresh_process(
+                        student_name,
+                        "chat_probe_cuda_error",
+                        f"chat_probe:{e}",
+                    )
                 print(f"[eval] Chat probe error (non-fatal, allowing): {e}", flush=True)
 
         # Thinking-collapse probe DISABLED as of 2026-04-19. See reports/
@@ -10378,6 +10492,12 @@ def main():
                         flush=True,
                     )
             except Exception as e:
+                if _is_cuda_context_poisoned(e):
+                    _request_fresh_process(
+                        student_name,
+                        "think_probe_cuda_error",
+                        f"think_probe:{e}",
+                    )
                 print(f"[eval] Think probe error (non-fatal, allowing): {e}", flush=True)
 
         # ── Capability probe (SHADOW axis, not gating) ─────────────────
@@ -10419,6 +10539,12 @@ def main():
                     "items": cap.get("items", []),
                 }
             except Exception as e:
+                if _is_cuda_context_poisoned(e):
+                    _request_fresh_process(
+                        student_name,
+                        "capability_probe_cuda_error",
+                        f"capability_probe:{e}",
+                    )
                 print(f"[eval] Capability probe error (non-fatal): {e}", flush=True)
 
         # ── Judge probe — student-side response collection (SHADOW) ──
@@ -10455,6 +10581,12 @@ def main():
                         flush=True,
                     )
             except Exception as e:
+                if _is_cuda_context_poisoned(e):
+                    _request_fresh_process(
+                        student_name,
+                        "judge_probe_cuda_error",
+                        f"judge_probe:{e}",
+                    )
                 print(f"[eval] Judge probe collection error (non-fatal): {e}", flush=True)
 
         # ── Multi-turn coherence probe (Phase A — student) ────────────
@@ -10499,6 +10631,12 @@ def main():
                         flush=True,
                     )
             except Exception as e:
+                if _is_cuda_context_poisoned(e):
+                    _request_fresh_process(
+                        student_name,
+                        "chat_turns_probe_cuda_error",
+                        f"chat_turns_probe:{e}",
+                    )
                 print(f"[eval] Chat-turns probe collection error "
                       f"(non-fatal): {e}", flush=True)
 
@@ -10575,6 +10713,12 @@ def main():
                         flush=True,
                     )
             except Exception as e:
+                if _is_cuda_context_poisoned(e):
+                    _request_fresh_process(
+                        student_name,
+                        "bench_cuda_error",
+                        f"bench:{e}",
+                    )
                 print(f"[eval] Bench battery error (non-fatal): {e}", flush=True)
 
         # ── Activation fingerprint (for functional copy detection) ──
@@ -10587,6 +10731,12 @@ def main():
                     results["students"].setdefault(student_name, {})["activation_fingerprint"] = fp
                     print(f"[eval] Fingerprint computed in {fp_time:.1f}s", flush=True)
             except Exception as e:
+                if _is_cuda_context_poisoned(e):
+                    _request_fresh_process(
+                        student_name,
+                        "fingerprint_cuda_error",
+                        f"fingerprint:{e}",
+                    )
                 print(f"[eval] Fingerprint failed: {e}", flush=True)
 
         # ── Score: per-prompt with early stopping ──
@@ -10734,6 +10884,12 @@ def main():
                             flush=True,
                         )
                         early_stop_reason = "runtime"
+                    if _is_cuda_context_poisoned(e):
+                        _request_fresh_process(
+                            student_name,
+                            "scoring_cuda_error",
+                            f"scoring:{e}",
+                        )
                     free_gpu()
                     break
                 except Exception as e:
@@ -10743,6 +10899,12 @@ def main():
                         flush=True,
                     )
                     early_stop_reason = "scoring_error"
+                    if _is_cuda_context_poisoned(e):
+                        _request_fresh_process(
+                            student_name,
+                            "scoring_cuda_error",
+                            f"scoring:{e}",
+                        )
                     free_gpu()
                     break
 
@@ -11004,6 +11166,7 @@ def main():
         # Cleanup — DON'T unload king
         if not is_king:
             del student
+            student = None
             free_gpu()
             clean_model_cache(student_name, args.teacher)
         else:

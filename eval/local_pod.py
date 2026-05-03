@@ -1,9 +1,10 @@
 """
 Local GPU backend for validator evaluation.
 
-This implements the same small interface used by ``scripts.validator.pod_session``
-without going through a rented Lium pod. It intentionally avoids broad GPU or
-cache cleanup by default because the local machine may be doing other work.
+Runs the same evaluator interface as a remote pod, but on the validator host.
+The validator Python environment stays stable; vLLM teacher serving is isolated
+in a small side virtualenv so its torch/transformers pins cannot mutate the
+chain/wallet/model-checking environment.
 """
 from __future__ import annotations
 
@@ -23,34 +24,19 @@ logger = logging.getLogger("quasar.local_pod")
 
 
 class LocalPodManager:
-    """Run validator GPU evaluation on the local machine.
-
-    The name is deliberately shaped like ``PodManager`` so the validator
-    orchestration can use either backend through ``exec/upload/download``.
-    """
-
     is_local = True
     backend_name = "local"
 
-    def __init__(
-        self,
-        work_dir: str | os.PathLike | None = None,
-        python_bin: str | None = None,
-        clear_gpu: bool | None = None,
-    ):
+    def __init__(self, work_dir: str | os.PathLike | None = None):
         self.run_base_dir = str(Path(work_dir or "state/local_eval_runs").expanduser().resolve())
-        self.python_bin = python_bin or os.environ.get("QUASAR_LOCAL_PYTHON") or sys.executable
-        self.clear_gpu_enabled = (
-            clear_gpu
-            if clear_gpu is not None
-            else os.environ.get("QUASAR_LOCAL_CLEAR_GPU", "").lower() in {"1", "true", "yes"}
-        )
+        self.python_bin = os.environ.get("QUASAR_LOCAL_PYTHON") or sys.executable
+        self.vllm_python = os.environ.get("QUASAR_VLLM_PYTHON", "")
         self.pod = SimpleNamespace(name=f"local-gpu:{socket.gethostname()}", id="local")
         self.current_run_dir: str | None = None
 
     def connect(self):
         Path(self.run_base_dir).mkdir(parents=True, exist_ok=True)
-        logger.info("Using local eval workspace: %s", self.run_base_dir)
+        logger.info("Local eval workspace: %s", self.run_base_dir)
 
     def reconnect(self):
         self.connect()
@@ -63,73 +49,53 @@ class LocalPodManager:
         src = Path(local).expanduser()
         dst = Path(remote).expanduser()
         dst.parent.mkdir(parents=True, exist_ok=True)
-        if src.resolve() == dst.resolve():
-            return
-        shutil.copy2(src, dst)
-        logger.info("Copied %s -> %s", src, dst)
+        if src.resolve() != dst.resolve():
+            shutil.copy2(src, dst)
 
     def download(self, remote: str, local: str, max_attempts: int = 3):
         del max_attempts
         src = Path(remote).expanduser()
         dst = Path(local).expanduser()
         dst.parent.mkdir(parents=True, exist_ok=True)
-        if src.resolve() == dst.resolve():
-            return
-        shutil.copy2(src, dst)
-        logger.info("Copied %s -> %s", src, dst)
-
-    def _prep_command(self, command: str, env: dict | None = None) -> tuple[str, dict]:
-        run_env = os.environ.copy()
-        if env:
-            run_env.update({key: str(value) for key, value in env.items()})
-        return command, run_env
+        if src.resolve() != dst.resolve():
+            shutil.copy2(src, dst)
 
     def exec(self, command: str, env: dict = None, timeout: int = None):
-        """Execute a shell command locally and return the PodManager-style dict."""
-        full_command, run_env = self._prep_command(command, env)
+        run_env = os.environ.copy()
+        if env:
+            run_env.update({k: str(v) for k, v in env.items()})
         shell = os.environ.get("QUASAR_LOCAL_SHELL", "/bin/bash")
         try:
-            if "nohup " in full_command and "disown" in full_command:
-                # Background eval starts can inherit stdout/stderr fds. If those fds
-                # are pipes, subprocess.run waits for the long-running child even
-                # after the shell exits. File-backed capture lets the shell return
-                # immediately while the eval keeps writing to its own log file.
-                with tempfile.NamedTemporaryFile("w+", encoding="utf-8") as stdout_file, \
-                        tempfile.NamedTemporaryFile("w+", encoding="utf-8") as stderr_file:
-                    completed = subprocess.run(
-                        [shell, "-lc", full_command],
+            if "nohup " in command and "disown" in command:
+                with tempfile.NamedTemporaryFile("w+", encoding="utf-8") as out_f, \
+                        tempfile.NamedTemporaryFile("w+", encoding="utf-8") as err_f:
+                    r = subprocess.run(
+                        [shell, "-lc", command],
                         env=run_env,
                         text=True,
-                        stdout=stdout_file,
-                        stderr=stderr_file,
+                        stdout=out_f,
+                        stderr=err_f,
                         timeout=timeout,
                         check=False,
                     )
-                    stdout_file.seek(0)
-                    stderr_file.seek(0)
-                    stdout = stdout_file.read()
-                    stderr = stderr_file.read()
+                    out_f.seek(0)
+                    err_f.seek(0)
+                    stdout = out_f.read()
+                    stderr = err_f.read()
             else:
-                completed = subprocess.run(
-                    [shell, "-lc", full_command],
+                r = subprocess.run(
+                    [shell, "-lc", command],
                     env=run_env,
                     text=True,
                     capture_output=True,
                     timeout=timeout,
                     check=False,
                 )
-                stdout = completed.stdout or ""
-                stderr = completed.stderr or ""
+                stdout = r.stdout or ""
+                stderr = r.stderr or ""
+            return {"stdout": stdout, "stderr": stderr, "exit_code": r.returncode, "success": r.returncode == 0}
         except subprocess.TimeoutExpired as exc:
-            logger.error("Local eval command timed out after %ss: %s", timeout, command[:120])
-            raise TimeoutError(f"Local eval command timed out after {timeout}s") from exc
-
-        return {
-            "stdout": stdout,
-            "stderr": stderr,
-            "exit_code": completed.returncode,
-            "success": completed.returncode == 0,
-        }
+            raise TimeoutError(f"Local command timed out after {timeout}s") from exc
 
     def is_alive(self, timeout: int = 15) -> bool:
         try:
@@ -138,27 +104,87 @@ class LocalPodManager:
         except Exception:
             return False
 
+    def _vllm_venv_dir(self) -> Path:
+        return Path(os.environ.get("QUASAR_VLLM_VENV", Path.cwd() / ".venv-vllm")).expanduser()
+
+    def _ensure_vllm_env(self) -> str:
+        if self.vllm_python:
+            vllm_python = self.vllm_python
+        else:
+            venv_dir = self._vllm_venv_dir()
+            vllm_python = str(venv_dir / "bin" / "python")
+            if not Path(vllm_python).exists():
+                self.exec(f"{shlex.quote(self.python_bin)} -m venv {shlex.quote(str(venv_dir))}", timeout=180)
+
+        quoted = shlex.quote(vllm_python)
+        verify = self.exec(
+            f"{quoted} -c 'import torch, vllm, vllm._C; "
+            f"print(f\"vllm={{vllm.__version__}} torch={{torch.__version__}} "
+            f"cuda={{torch.version.cuda}} available={{torch.cuda.is_available()}}\")'",
+            timeout=120,
+        )
+        if not verify.get("success"):
+            req_file = Path.cwd() / "requirements-vllm.txt"
+            if not req_file.exists():
+                raise RuntimeError(f"missing {req_file}; cannot provision local vLLM env")
+            install = self.exec(
+                f"{quoted} -m pip install --upgrade pip setuptools wheel packaging -q && "
+                f"TMPDIR={shlex.quote(os.environ.get('TMPDIR', '/tmp'))} "
+                f"{quoted} -m pip install -r {shlex.quote(str(req_file))} -q",
+                timeout=1800,
+            )
+            if not install.get("success"):
+                detail = (install.get("stderr") or install.get("stdout") or "").strip()[-2000:]
+                raise RuntimeError(f"local vLLM env install failed: {detail}")
+            verify = self.exec(
+                f"{quoted} -c 'import torch, vllm, vllm._C; "
+                f"print(f\"vllm={{vllm.__version__}} torch={{torch.__version__}} "
+                f"cuda={{torch.version.cuda}} available={{torch.cuda.is_available()}}\")'",
+                timeout=120,
+            )
+            if not verify.get("success"):
+                detail = (verify.get("stderr") or verify.get("stdout") or "").strip()[-2000:]
+                raise RuntimeError(f"local vLLM import check failed: {detail}")
+
+        self.vllm_python = vllm_python
+        os.environ["QUASAR_VLLM_PYTHON"] = vllm_python
+        logger.info("Local vLLM env: %s", (verify.get("stdout") or "").strip())
+        return vllm_python
+
     def ensure_dependencies(self, teacher_model: str = "Qwen/Qwen3.5-4B"):
         del teacher_model
-        check = (
-            "import importlib.util, torch; "
-            "missing=[m for m in ('transformers','safetensors','huggingface_hub','fla') "
-            "if importlib.util.find_spec(m) is None]; "
-            "vllm=importlib.util.find_spec('vllm') is not None; "
-            "print(f'torch={torch.__version__} cuda={torch.cuda.is_available()} "
-            "devices={torch.cuda.device_count()} vllm={vllm}'); "
-            "raise SystemExit('missing dependencies: '+','.join(missing)+'; install SILX FLA from https://github.com/SILX-LABS/quasar-flash-linear-attention' if missing else 0)"
+        py = shlex.quote(self.python_bin)
+        check = self.exec(
+            f"{py} -c 'import torch, transformers, fla; "
+            f"print(f\"validator torch={{torch.__version__}} transformers={{transformers.__version__}} "
+            f"fla=ok cuda={{torch.cuda.is_available()}}\")'",
+            timeout=120,
         )
+        if not check.get("success"):
+            detail = (check.get("stderr") or check.get("stdout") or "").strip()[-2000:]
+            raise RuntimeError(f"local validator dependency check failed: {detail}")
+        logger.info("Local deps: %s", (check.get("stdout") or "").strip())
+        self._ensure_vllm_env()
+
+    def disk_cleanup(self, teacher_name: str, threshold: int = 85):
+        del teacher_name
         try:
-            result = self.exec(f"{shlex.quote(self.python_bin)} -c {shlex.quote(check)}", timeout=60)
-            out = (result.get("stdout") or "").strip()
-            err = (result.get("stderr") or "").strip()
-            if result.get("success"):
-                logger.info("Local deps: %s", out)
-            else:
-                logger.warning("Local dependency check failed: %s%s", out, f" {err}" if err else "")
+            Path(self.run_base_dir).mkdir(parents=True, exist_ok=True)
+            usage = shutil.disk_usage(self.run_base_dir)
+            used_pct = int(((usage.total - usage.free) / usage.total) * 100)
+            logger.info("Local eval disk: %s%% used at %s", used_pct, self.run_base_dir)
+            if used_pct > threshold:
+                logger.warning("Local eval disk above threshold: %s%%", used_pct)
+            return used_pct
         except Exception as exc:
-            logger.warning("Local dependency check failed (non-fatal): %s", exc)
+            logger.warning("Local disk check failed: %s", exc)
+            return 0
+
+    def clear_gpu(self):
+        logger.info("Local backend: skipping broad pre-eval process cleanup")
+
+    def resume_background_tasks(self):
+        return None
 
     def _pid_is_running(self, pid_path: Path) -> bool:
         try:
@@ -184,52 +210,15 @@ class LocalPodManager:
             return
         shutil.rmtree(path, ignore_errors=True)
 
-    def _prune_old_runs(self, max_age_hours: int = 48):
-        root = Path(self.run_base_dir)
-        if not root.exists():
-            return
-        cutoff = time.time() - max_age_hours * 3600
-        for path in root.glob("quasar_eval_*"):
-            try:
-                if path.is_dir() and path.stat().st_mtime < cutoff:
-                    self._remove_run_dir(path)
-            except Exception as exc:
-                logger.debug("Failed to prune old local eval run %s: %s", path, exc)
-
-    def disk_cleanup(self, teacher_name: str, threshold: int = 85):
-        del teacher_name, threshold
-        try:
-            Path(self.run_base_dir).mkdir(parents=True, exist_ok=True)
-            self._prune_old_runs()
-            usage = shutil.disk_usage(self.run_base_dir)
-            used_pct = int(((usage.total - usage.free) / usage.total) * 100)
-            logger.info("Local eval disk: %s%% used at %s", used_pct, self.run_base_dir)
-            return used_pct
-        except Exception as exc:
-            logger.warning("Local disk check failed (non-fatal): %s", exc)
-            return 0
-
-    def clear_gpu(self):
-        """Optionally clear previous local eval jobs; disabled by default."""
-        if not self.clear_gpu_enabled:
-            logger.info("Local GPU cleanup skipped (set QUASAR_LOCAL_CLEAR_GPU=1 to enable)")
-            return
-        cmd = (
-            "for p in $(pgrep -f 'quasar_eval_.*pod_eval.py' 2>/dev/null); do "
-            "  kill -9 \"$p\" 2>/dev/null || true; "
-            "done; echo 'Local eval GPU jobs cleared'"
-        )
-        try:
-            self.exec(cmd, timeout=30)
-        except Exception as exc:
-            logger.warning("Local GPU cleanup failed (non-fatal): %s", exc)
-
-    def resume_background_tasks(self):
-        return None
-
     def post_eval_cleanup(self, teacher_name: str):
         del teacher_name
         if self.current_run_dir:
             self._remove_run_dir(self.current_run_dir)
             self.current_run_dir = None
-        self._prune_old_runs()
+        cutoff = time.time() - 48 * 3600
+        for path in Path(self.run_base_dir).glob("quasar_eval_*"):
+            try:
+                if path.is_dir() and path.stat().st_mtime < cutoff:
+                    self._remove_run_dir(path)
+            except Exception:
+                pass

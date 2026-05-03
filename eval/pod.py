@@ -16,7 +16,10 @@ import time
 from pathlib import Path
 
 logger = logging.getLogger("quasar.pod")
-QUASAR_FLA_PACKAGE = "git+https://github.com/SILX-LABS/quasar-flash-linear-attention.git"
+QUASAR_FLA_PACKAGE = (
+    "git+https://github.com/SILX-LABS/"
+    "quasar-flash-linear-attention.git@84ad1cc5a7428609d7e0e56d4041a775cd19b7bb"
+)
 
 # Patterns for sanitizing GPU logs before public exposure
 _ANSI_RE = re.compile(r'\x1b\[[0-9;]*m')
@@ -194,8 +197,8 @@ class PodManager:
             logger.info("Ensuring pod dependencies...")
             dep_result = self.exec(
                 "python3 -m pip install --break-system-packages --upgrade pip setuptools wheel ninja packaging -q && "
-                "python3 -m pip install --break-system-packages 'vllm>=0.19' accelerate -q && "
-                "python3 -m pip install --break-system-packages 'transformers>=5.0' -q && "
+                "python3 -m pip install --break-system-packages 'vllm==0.18.1' accelerate -q && "
+                "python3 -m pip install --break-system-packages 'transformers==5.7.0' 'huggingface-hub==1.12.2' 'safetensors==0.7.0' -q && "
                 f"python3 -m pip install --break-system-packages '{QUASAR_FLA_PACKAGE}' -q && "
                 "python3 -c 'import torch; import transformers; import vllm; import fla; "
                 "print(f\"torch={torch.__version__} transformers={transformers.__version__} "

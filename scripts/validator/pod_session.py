@@ -76,6 +76,7 @@ def run_eval_on_pod(pod: PodManager, models_to_eval: dict, king_uid, n_prompts: 
         progress_remote = resume_pod_eval.get("progress_remote") or f"{run_dir}/eval_progress.json"
         results_remote = resume_pod_eval.get("results_remote") or f"{run_dir}/eval_results.json"
         done_marker_remote = resume_pod_eval.get("done_marker_remote") or f"{run_dir}/eval_done.marker"
+        restart_marker_remote = resume_pod_eval.get("restart_marker_remote") or f"{run_dir}/eval_restart.marker"
         log_remote = resume_pod_eval.get("log_remote") or f"{run_dir}/eval_output.log"
         eval_data_remote = resume_pod_eval.get("eval_data_remote") or f"{run_dir}/eval_data.json"
         teacher_cache_remote = resume_pod_eval.get("teacher_cache_remote") or f"{run_dir}/teacher_cache.pt"
@@ -91,6 +92,7 @@ def run_eval_on_pod(pod: PodManager, models_to_eval: dict, king_uid, n_prompts: 
         progress_remote = f"{run_dir}/eval_progress.json"
         results_remote = f"{run_dir}/eval_results.json"
         done_marker_remote = f"{run_dir}/eval_done.marker"
+        restart_marker_remote = f"{run_dir}/eval_restart.marker"
         log_remote = f"{run_dir}/eval_output.log"
         eval_data_remote = f"{run_dir}/eval_data.json"
         teacher_cache_remote = f"{run_dir}/teacher_cache.pt"
@@ -265,7 +267,7 @@ def run_eval_on_pod(pod: PodManager, models_to_eval: dict, king_uid, n_prompts: 
             king_flag = f" --king {models_to_eval[king_uid]['model']}"
     tp_flag = f" --tensor-parallel-size {TP_SIZE}" if TP_SIZE > 0 else ""
     early_stop_flag = f" --early-stop-min {EARLY_STOP_MIN}" if EARLY_STOP_MIN > 0 else ""
-    inner_eval = (
+    inner_eval_base = (
         f"cd {shlex.quote(run_dir)} && {shlex.quote(python_bin)} -u {shlex.quote(remote_eval_script)} "
         f"--teacher {TEACHER_MODEL} "
         f"--students {student_list} "
@@ -281,20 +283,27 @@ def run_eval_on_pod(pod: PodManager, models_to_eval: dict, king_uid, n_prompts: 
         f"{vllm_flag}"
         f"{f' --block-seed {block_seed}' if block_seed is not None else ''}"
     )
-    inner_q = shlex.quote(inner_eval)
-    wrapped = (
-        f"{{ echo $$ > {shlex.quote(pid_remote)}; "
-        f"exec bash -c {inner_q}; }}"
-    )
-    start_cmd = (
-        f"rm -f {shlex.quote(pid_remote)} && : > {shlex.quote(log_remote)} && "
-        f"nohup bash -c {shlex.quote(wrapped)} >> {shlex.quote(log_remote)} 2>&1 & "
-        f"disown; "
-        f"for _ in 1 2 3 4 5 6 7 8 9 10; do "
-        f"  [ -s {shlex.quote(pid_remote)} ] && break; sleep 0.2; "
-        f"done; "
-        f"echo QUASAR_PID:$(cat {shlex.quote(pid_remote)} 2>/dev/null)"
-    )
+
+    def _make_start_cmd(resume: bool = False):
+        inner_eval = inner_eval_base + (" --resume" if resume else "")
+        inner_q = shlex.quote(inner_eval)
+        wrapped = (
+            f"{{ echo $$ > {shlex.quote(pid_remote)}; "
+            f"exec bash -c {inner_q}; }}"
+        )
+        log_init = f"touch {shlex.quote(log_remote)}" if resume else f": > {shlex.quote(log_remote)}"
+        return (
+            f"rm -f {shlex.quote(pid_remote)} {shlex.quote(done_marker_remote)} "
+            f"{shlex.quote(restart_marker_remote)} && {log_init} && "
+            f"nohup bash -c {shlex.quote(wrapped)} >> {shlex.quote(log_remote)} 2>&1 & "
+            f"disown; "
+            f"for _ in 1 2 3 4 5 6 7 8 9 10; do "
+            f"  [ -s {shlex.quote(pid_remote)} ] && break; sleep 0.2; "
+            f"done; "
+            f"echo QUASAR_PID:$(cat {shlex.quote(pid_remote)} 2>/dev/null)"
+        )
+
+    start_cmd = _make_start_cmd(False)
     status_inner = (
         f"if [ -f {shlex.quote(done_marker_remote)} ]; then echo QUASAR_STATUS:done; "
         f"elif [ ! -f {shlex.quote(pid_remote)} ]; then echo QUASAR_STATUS:starting; "
@@ -433,6 +442,9 @@ def run_eval_on_pod(pod: PodManager, models_to_eval: dict, king_uid, n_prompts: 
     logger.info(f"Running eval on {backend_label} ({n_eval_models} models, {n_prompts} prompts, timeout={eval_timeout // 60}m)")
     log_event(f"Running eval on {backend_label}: king vs {n_eval_models - 1} challengers, {n_prompts} prompts", state_dir=str(state.state_dir))
     eval_env = {"HF_TOKEN": os.environ.get("HF_TOKEN", ""), "TOKENIZERS_PARALLELISM": "false"}
+    vllm_python = getattr(pod, "vllm_python", None) or os.environ.get("QUASAR_VLLM_PYTHON")
+    if vllm_python:
+        eval_env["QUASAR_VLLM_PYTHON"] = vllm_python
     for _propagate in (
         "BENCH_BATTERY_ENABLED",
         "BENCH_BATTERY_SHADOW_AXES",
@@ -504,6 +516,7 @@ def run_eval_on_pod(pod: PodManager, models_to_eval: dict, king_uid, n_prompts: 
                     "run_dir": run_dir,
                     "pid_remote": pid_remote,
                     "done_marker_remote": done_marker_remote,
+                    "restart_marker_remote": restart_marker_remote,
                     "log_remote": log_remote,
                     "progress_remote": progress_remote,
                     "results_remote": results_remote,
@@ -516,6 +529,8 @@ def run_eval_on_pod(pod: PodManager, models_to_eval: dict, king_uid, n_prompts: 
         result = {"stdout": "", "stderr": "", "exit_code": -1, "success": False}
         dead_streak = 0
         starting_streak = 0
+        cuda_restarts = 0
+        max_cuda_restarts = max(1, len(models_to_eval) + 1)
         deadline = time.time() + eval_timeout
         eval_started_at = time.time()
         while time.time() < deadline:
@@ -528,6 +543,32 @@ def run_eval_on_pod(pod: PodManager, models_to_eval: dict, king_uid, n_prompts: 
                 dead_streak += 1
                 starting_streak = 0
                 if dead_streak >= 3:
+                    try:
+                        marker_probe = pod.exec(
+                            f"if [ -f {shlex.quote(restart_marker_remote)} ]; then "
+                            f"echo QUASAR_RESTART:yes; cat {shlex.quote(restart_marker_remote)} 2>/dev/null; "
+                            "else echo QUASAR_RESTART:no; fi",
+                            timeout=30,
+                        )
+                        marker_out = marker_probe.get("stdout", "") or ""
+                    except Exception:
+                        marker_out = ""
+                    if "QUASAR_RESTART:yes" in marker_out and cuda_restarts < max_cuda_restarts:
+                        cuda_restarts += 1
+                        logger.warning(
+                            "Eval worker requested fresh CUDA process restart %s/%s: %s",
+                            cuda_restarts,
+                            max_cuda_restarts,
+                            sanitize_gpu_log(marker_out).strip()[:300],
+                        )
+                        restart_res = pod.exec(_make_start_cmd(resume=True), env=eval_env, timeout=120)
+                        if restart_res.get("success"):
+                            logger.info("Detached GPU eval resumed: %s", (restart_res.get("stdout") or "").strip()[:200])
+                            dead_streak = 0
+                            starting_streak = 0
+                            eval_started_at = time.time()
+                            continue
+                        logger.error("Failed to restart eval worker after CUDA poison: %s", restart_res)
                     logger.error("Eval worker on pod exited before writing eval_results.json")
                     result = {"stdout": "", "stderr": "worker_dead", "exit_code": -1, "success": False}
                     break

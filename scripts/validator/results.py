@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import math
+import os
 import time
 from pathlib import Path
 
@@ -577,6 +578,14 @@ def process_results(results, models_to_eval, king_uid, state: ValidatorState, ui
             disqualify(hotkey, reason, state.dq_reasons, commit_block=commit_block)
             state.scores[str(uid)] = MAX_KL_THRESHOLD + 1
             state.evaluated_uids.add(str(uid))
+            continue
+        if student_result.get("cuda_restart_required") or str(student_result.get("status", "")).startswith("cuda_"):
+            logger.warning(
+                f"UID {uid} ({model_name}): CUDA restart marker reached result processing; "
+                "treating as retryable eval failure, not DQ"
+            )
+            rev = models_to_eval.get(uid, {}).get("revision", "main")
+            record_failure(uid, state.failures, state.failure_models, f"{model_name}@{rev}")
             continue
         if student_result.get("status") == "anti_finetune":
             probe = student_result.get("finetune_probe", {}) or {}

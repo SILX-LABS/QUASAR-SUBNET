@@ -1038,6 +1038,12 @@ def run_validator(network, netuid, wallet_name, hotkey_name, wallet_path,
             write_api_commitments_cache(commitments, state_dir)
             logger.info(f"Found {len(commitments)} miner commitments")
             if not commitments:
+                state.save_progress({
+                    "active": False,
+                    "stage": "no_commitments",
+                    "commitments_total": 0,
+                    "updated_at": time.time(),
+                })
                 if once:
                     break
                 time.sleep(tempo)
@@ -1055,6 +1061,14 @@ def run_validator(network, netuid, wallet_name, hotkey_name, wallet_path,
             )
             if not valid_models:
                 logger.info("No valid models after pre-checks")
+                state.save_progress({
+                    "active": False,
+                    "stage": "no_valid_models",
+                    "commitments_total": len(commitments),
+                    "valid_models": 0,
+                    "disqualified": len(disqualified),
+                    "updated_at": time.time(),
+                })
                 state.save()
                 if once:
                     break
