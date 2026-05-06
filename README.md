@@ -156,6 +156,9 @@ backend uses `.venv-vllm/bin/python` automatically when it exists. Only set
 `QUASAR_PYTHON` or `QUASAR_VLLM_PYTHON` if you intentionally use non-standard
 virtualenv names.
 
+If another service already uses the default vLLM port, set `QUASAR_VLLM_PORT`
+to a free local port, for example `QUASAR_VLLM_PORT=9101`.
+
 For remote Lium evaluation, set `QUASAR_EVAL_BACKEND=lium` and provide
 `LIUM_API_KEY` in the same environment file.
 

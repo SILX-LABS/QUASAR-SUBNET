@@ -90,7 +90,7 @@ ACTIVATION_FP_SEQ_LEN = 64
 ACTIVATION_FP_VOCAB_SIZE = 248320  # Qwen tokenizer vocab
 
 # -- vLLM server --
-VLLM_PORT = 9100
+VLLM_PORT = int(os.environ.get("QUASAR_VLLM_PORT", "9100"))
 VLLM_URL = f"http://localhost:{VLLM_PORT}"
 VLLM_STARTUP_TIMEOUT = 900  # 15 min
 VLLM_REQUEST_TIMEOUT = 300
