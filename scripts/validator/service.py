@@ -104,33 +104,36 @@ def _resolve_king(valid_models, state):
                 bootstrap_composite_from_h2h(state)
             except Exception as exc:
                 logger.warning(f"single-eval bootstrap failed (non-fatal): {exc}")
-        # Trust the king persisted by the previous round's apply_results
-        # over a network-wide composite re-rank. Cross-sample re-ranking
-        # at epoch start is precisely the bug mrchen caught (round
-        # 8062909): a UID 144 stored composite from a different prompt
-        # sample beat UID 123's fresh composite from the in-flight
-        # round, even though UID 144 wasn't in the round.
-        # h2h_latest is the canonical "who won the last actually-run
-        # round?" field, written by ``post_round`` after weights are set.
+        # Composite is the canonical source of truth in single-eval mode.
+        # h2h_latest is still read inside select_king_by_composite as the
+        # prior-king stability bias/margin check, but it must not be a hard
+        # lock. During live operation h2h_latest can trail composite_scores,
+        # so selecting composite first keeps weight targets aligned with the
+        # current composite table.
+        composite_king_uid, _ = select_king_by_composite(state, valid_models)
+        if composite_king_uid is not None:
+            king_kl = state.scores.get(str(composite_king_uid), float("inf"))
+            persisted_king = (state.h2h_latest or {}).get("king_uid")
+            if persisted_king is not None and persisted_king != composite_king_uid:
+                logger.info(
+                    f"single-eval: composite king UID {composite_king_uid} "
+                    f"supersedes h2h_latest UID {persisted_king}"
+                )
+            logger.info(
+                f"single-eval: king from composite_scores: "
+                f"UID {composite_king_uid} (stored KL={king_kl})"
+            )
+            return composite_king_uid, king_kl, "composite"
+        # Last-resort fallback for bootstraps where no composite row exists.
         if state.h2h_latest:
             persisted_king = state.h2h_latest.get("king_uid")
             if persisted_king is not None and persisted_king in valid_models:
                 king_kl = state.scores.get(str(persisted_king), float("inf"))
                 logger.info(
-                    f"single-eval: king from h2h_latest: UID {persisted_king} "
-                    f"(KL={king_kl})"
+                    f"single-eval: no composite king; falling back to "
+                    f"h2h_latest UID {persisted_king} (KL={king_kl})"
                 )
                 return persisted_king, king_kl, "composite"
-        # Fallback: bootstrap from composite_scores only when h2h_latest
-        # is empty (cold start, first round after upgrade).
-        composite_king_uid, _ = select_king_by_composite(state, valid_models)
-        if composite_king_uid is not None:
-            king_kl = state.scores.get(str(composite_king_uid), float("inf"))
-            logger.info(
-                f"single-eval: king from composite_scores (h2h_latest empty): "
-                f"UID {composite_king_uid} (stored KL={king_kl})"
-            )
-            return composite_king_uid, king_kl, "composite"
         # Cold start: no composite king yet. Start a challenger round without
         # selecting a KL fallback king; the first crown must come from
         # composite rows produced by evaluation.
