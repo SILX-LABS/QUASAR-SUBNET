@@ -4,7 +4,7 @@ from fastapi import APIRouter
 from fastapi.responses import JSONResponse
 
 from config import NETUID, TMC_BASE
-from external import get_metagraph as load_metagraph, get_price as load_price
+from external import get_metagraph as load_metagraph, get_price as load_price, get_weights as load_weights
 
 router = APIRouter()
 
@@ -22,6 +22,11 @@ Response includes:
          response_description="Metagraph with all 256 UIDs and their on-chain metrics")
 def get_metagraph():
     return JSONResponse(content=load_metagraph(), headers={"Cache-Control": "public, max-age=30, stale-while-revalidate=60"})
+
+
+@router.get("/api/weights", tags=["Metagraph"], summary="On-chain validator weights")
+def get_weights():
+    return JSONResponse(content=load_weights(), headers={"Cache-Control": "public, max-age=30, stale-while-revalidate=60"})
 
 
 @router.get("/api/price", tags=["Market"], summary="Token price and market data",

@@ -474,7 +474,7 @@ function render(d) {
     var histAll = d.history || [];
     var topModel = null;
     for (var ti = 0; ti < histAll.length; ti++) if (histAll[ti].accepted && histAll[ti].challenger_repo) { topModel = histAll[ti]; break; }
-    var kingRepo = topModel ? topModel.challenger_repo : (king.hf_repo || "--");
+    var kingRepo = king.hf_repo || (topModel ? topModel.challenger_repo : "--");
     var kingRev = king.king_revision || "";
     var kingLinkTop = document.getElementById("king-link-top");
     kingLinkTop.href = kingRepo !== "--" ? "https://huggingface.co/" + kingRepo : "#";

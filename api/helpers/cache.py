@@ -13,6 +13,7 @@ from helpers.sanitize import _safe_filename
 _mem = {
     "metagraph": {"data": None, "ts": 0},
     "commitments": {"data": None, "ts": 0},
+    "weights": {"data": None, "ts": 0},
     "price": {"data": None, "ts": 0},
 }
 

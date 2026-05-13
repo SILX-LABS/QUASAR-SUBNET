@@ -4,7 +4,7 @@ import sys
 
 from config import CACHE_TTL
 from helpers.cache import _bg_refresh, _get_cached, _get_stale, _set_cached
-from helpers.fetch import _fetch_commitments, _fetch_metagraph, _fetch_price
+from helpers.fetch import _fetch_commitments, _fetch_metagraph, _fetch_price, _fetch_weights
 
 
 def _cached(name, ttl, fetcher, fallback):
@@ -29,6 +29,10 @@ def get_commitments():
 
 def get_metagraph():
     return _cached("metagraph", CACHE_TTL, _fetch_metagraph, lambda exc: {"error": str(exc)})
+
+
+def get_weights():
+    return _cached("weights", CACHE_TTL, _fetch_weights, lambda exc: {"rows": [], "error": str(exc)})
 
 
 def get_price():

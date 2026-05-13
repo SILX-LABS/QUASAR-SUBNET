@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 from fastapi import APIRouter
 from fastapi.responses import JSONResponse
 
-from external import get_price
+from external import get_metagraph, get_price, get_weights
 from helpers.cache import _get_stale
 from helpers.sanitize import _sanitize_floats
 from state_store import (
@@ -184,7 +184,7 @@ def _validators():
     metagraph = _get_stale("metagraph") or {}
     rows = []
     for row in metagraph.get("neurons", []):
-        if not row.get("is_validator"):
+        if not _is_validator_neuron(row):
             continue
         rows.append({
             "uid": row.get("uid"),
@@ -197,13 +197,87 @@ def _validators():
     return sorted(rows, key=lambda item: item.get("stake") or 0, reverse=True)
 
 
+def _is_validator_neuron(row):
+    if "validator_permit" in row:
+        return bool(row.get("validator_permit"))
+    return bool(row.get("is_validator"))
+
+
+def _consensus_king(commitments):
+    metagraph = _get_stale("metagraph") or get_metagraph() or {}
+    neurons = {
+        int(row["uid"]): row
+        for row in metagraph.get("neurons", [])
+        if row.get("uid") is not None
+    }
+    weights = get_weights() or {}
+    totals = {}
+    voters = []
+    total_stake = 0.0
+
+    for row in weights.get("rows") or []:
+        try:
+            validator_uid = int(row.get("validator_uid"))
+        except (TypeError, ValueError):
+            continue
+        neuron = neurons.get(validator_uid, {})
+        if not _is_validator_neuron(neuron):
+            continue
+        target_uid = row.get("target_uid")
+        target_weight = row.get("target_weight") or 0
+        if target_uid is None or target_weight <= 0:
+            continue
+        try:
+            target_uid = int(target_uid)
+        except (TypeError, ValueError):
+            continue
+        stake = float(neuron.get("stake") or 0)
+        total_stake += stake
+        totals[target_uid] = totals.get(target_uid, 0.0) + stake
+        voters.append({
+            "validator_uid": validator_uid,
+            "target_uid": target_uid,
+            "stake": stake,
+            "validator_trust": neuron.get("validator_trust") or 0,
+            "weight": target_weight,
+        })
+
+    if not totals:
+        return None
+
+    target_uid, support_stake = max(totals.items(), key=lambda item: item[1])
+    commit = commitments.get(target_uid, {})
+    targets = [
+        {
+            "uid": uid,
+            "stake": stake,
+            "fraction": stake / total_stake if total_stake else None,
+        }
+        for uid, stake in sorted(totals.items(), key=lambda item: item[1], reverse=True)
+    ]
+    return {
+        "uid": target_uid,
+        "hf_repo": _repo(commit),
+        "revision": commit.get("revision"),
+        "support_stake": support_stake,
+        "total_voting_stake": total_stake,
+        "support_fraction": support_stake / total_stake if total_stake else None,
+        "block": weights.get("block"),
+        "source": "chain_weights",
+        "targets": targets,
+        "voters": sorted(voters, key=lambda item: item["stake"], reverse=True),
+    }
+
+
 @router.get("/api/dashboard.json", tags=["Dashboard"], summary="Compact static dashboard payload")
 def get_dashboard_json():
     commitments = _commitments_by_uid()
     latest = latest_round() or {}
     history = round_history()
     hist_rows = _history_rows(history, commitments)
-    king_uid = latest.get("king_uid")
+    consensus_king = _consensus_king(commitments)
+    state_king_uid = latest.get("king_uid")
+    king_uid = (consensus_king or {}).get("uid") if consensus_king else state_king_uid
     king_commit = commitments.get(king_uid, {})
     price = get_price() or {}
     market = {
@@ -216,15 +290,28 @@ def get_dashboard_json():
         (row for row in hist_rows if row.get("accepted") and row.get("uid") == king_uid),
         None,
     )
+    if consensus_king:
+        king_repo = consensus_king.get("hf_repo") or _repo(king_commit)
+    else:
+        king_repo = latest.get("king_model") or _repo(king_commit)
+    king_revision = (consensus_king or {}).get("revision") if consensus_king else None
+    if not king_revision:
+        king_revision = king_commit.get("revision")
     payload = {
         "market": market,
         "king": {
             "uid": king_uid,
-            "hf_repo": latest.get("king_model") or _repo(king_commit),
-            "king_revision": king_commit.get("revision"),
+            "hf_repo": king_repo or "--",
+            "king_revision": king_revision,
             "reign_number": sum(1 for rnd in history if rnd.get("king_changed")),
             "crowned_at": crowned.get("timestamp") if crowned else _iso(latest.get("timestamp")),
+            "source": "chain_weights" if consensus_king else ("validator_state" if state_king_uid is not None else None),
+            "support_stake": (consensus_king or {}).get("support_stake"),
+            "support_fraction": (consensus_king or {}).get("support_fraction"),
+            "weights_block": (consensus_king or {}).get("block"),
         },
+        "consensus_king": consensus_king,
+        "state_king_uid": state_king_uid,
         "current_eval": _current_eval(normalize_eval_progress(eval_progress() or {}), commitments),
         "queue": _queue(commitments, hist_rows),
         "validators": _validators(),

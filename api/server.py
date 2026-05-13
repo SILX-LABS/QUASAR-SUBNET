@@ -8,7 +8,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from config import ALLOWED_ORIGINS, API_DESCRIPTION
 from helpers.rate_limit import _rate_limiter
 from helpers.cache import _bg_refresh
-from helpers.fetch import _fetch_metagraph, _fetch_commitments, _fetch_price
+from helpers.fetch import _fetch_metagraph, _fetch_commitments, _fetch_price, _fetch_weights
 
 # Import routers
 from routes.health import router as health_router
@@ -85,4 +85,5 @@ def prime_caches():
     """On startup, kick off background refreshes so first request is fast."""
     _bg_refresh("metagraph", _fetch_metagraph)
     _bg_refresh("commitments", _fetch_commitments)
+    _bg_refresh("weights", _fetch_weights)
     _bg_refresh("price", _fetch_price)

@@ -1,4 +1,4 @@
-"""Data fetchers for metagraph, commitments, and price."""
+"""Data fetchers for metagraph, commitments, weights, and price."""
 
 import json
 import os
@@ -20,8 +20,8 @@ def _fetch_metagraph():
     """Fetch metagraph via subprocess to avoid loading bittensor/torch in the API process."""
     import subprocess
     script = """
-import bittensor as bt, json
-sub = bt.Subtensor(network="finney")
+import bittensor as bt, json, os
+sub = bt.Subtensor(network=os.environ.get("QUASAR_NETWORK", "finney"))
 meta = sub.metagraph(__NETUID__)
 block = sub.block
 neurons = []
@@ -37,8 +37,18 @@ def _at(names, uid, default=0.0):
             continue
     return default
 
+def _bool_at(name, uid, default=False):
+    values = getattr(meta, name, None)
+    if values is None:
+        return default
+    try:
+        return bool(values[uid])
+    except Exception:
+        return default
+
 for uid in range(meta.n):
     stake = _at(["S", "stake"], uid)
+    validator_permit = _bool_at("validator_permit", uid)
     neurons.append({
         "uid": uid,
         "hotkey": str(meta.hotkeys[uid]),
@@ -50,7 +60,8 @@ for uid in range(meta.n):
         "incentive": _at(["I", "incentive"], uid),
         "emission": _at(["E", "emission"], uid),
         "dividends": _at(["D", "dividends"], uid),
-        "is_validator": stake > 1000,
+        "validator_permit": validator_permit,
+        "is_validator": validator_permit or stake > 1000,
     })
 print(json.dumps({"netuid": __NETUID__, "block": int(block), "n": int(meta.n), "neurons": neurons}))
 """.replace("__NETUID__", str(NETUID))
@@ -69,9 +80,9 @@ def _fetch_commitments():
     """Fetch commitments via subprocess to avoid loading bittensor/torch in the API process."""
     import subprocess
     script = """
-import bittensor as bt, json, sys
+import bittensor as bt, json, os, sys
 from scalecodec.utils.ss58 import ss58_encode
-sub = bt.Subtensor(network="finney")
+sub = bt.Subtensor(network=os.environ.get("QUASAR_NETWORK", "finney"))
 commits = {}
 
 def _decode_hotkey(key):
@@ -200,6 +211,46 @@ print(json.dumps({"commitments": commits, "count": len(commits)}))
         raise RuntimeError(f"commitments fetch failed: {result.stderr[-500:]}")
     data = json.loads(result.stdout)
     return data
+
+
+def _fetch_weights():
+    """Fetch validator weights via subprocess to avoid loading bittensor in the API process."""
+    import subprocess
+    script = """
+import bittensor as bt, json, os, time
+sub = bt.Subtensor(network=os.environ.get("QUASAR_NETWORK", "finney"))
+rows = []
+for validator_uid, pairs in sub.weights(__NETUID__):
+    parsed = []
+    for uid, weight in pairs or []:
+        try:
+            parsed.append([int(uid), float(weight)])
+        except Exception:
+            continue
+    target_uid = None
+    target_weight = 0
+    if parsed:
+        target_uid, target_weight = max(parsed, key=lambda item: item[1])
+    rows.append({
+        "validator_uid": int(validator_uid),
+        "weights": parsed,
+        "target_uid": target_uid,
+        "target_weight": target_weight,
+    })
+print(json.dumps({
+    "netuid": __NETUID__,
+    "block": int(sub.block),
+    "rows": rows,
+    "timestamp": time.time(),
+}))
+""".replace("__NETUID__", str(NETUID))
+    result = subprocess.run(
+        [_subprocess_python(), "-c", script],
+        capture_output=True, text=True, timeout=60,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"weights fetch failed: {result.stderr[-500:]}")
+    return json.loads(result.stdout)
 
 
 def _fetch_tao_usd():
