@@ -186,27 +186,8 @@ def _composite_dethrone_veto(
     # lower than the triggering axis but should not be surfaced as the
     # reason.
     broken_axes = set(comp.get("broken_axes") or [])
-    from scripts.validator.composite import (
-        AXIS_WEIGHTS as _AX,
-        BENCH_AXIS_WEIGHTS as _BX,
-        ARENA_V3_AXIS_WEIGHTS as _V3X,
-        JUDGE_AXIS_IN_COMPOSITE as _JIC,
-        BENCH_AXES_IN_COMPOSITE as _BIC,
-        ARENA_V3_AXES_IN_COMPOSITE as _V3IC,
-        REASONING_DENSITY_IN_COMPOSITE as _RDIC,
-        CHAT_TURNS_AXIS_IN_COMPOSITE as _CTIC,
-    )
-    active = set(_AX.keys())
-    if _JIC:
-        active.add("judge_probe")
-    if _BIC:
-        active.update(_BX.keys())
-    if _V3IC:
-        active.update(_V3X.keys())
-    if _RDIC:
-        active.add("reasoning_density")
-    if _CTIC:
-        active.add("chat_turns_probe")
+    from scripts.validator.composite import active_composite_axes
+    active = active_composite_axes()
     active.difference_update(broken_axes)
     active_axes = {k: v for k, v in axes.items() if v is not None and k in active}
     worst_axis = min(
@@ -1091,27 +1072,8 @@ def process_results(results, models_to_eval, king_uid, state: ValidatorState, ui
                 continue
             axes = comp.get("axes") or {}
             broken_axes = set(comp.get("broken_axes") or [])
-            from scripts.validator.composite import (
-                AXIS_WEIGHTS as _AX,
-                BENCH_AXIS_WEIGHTS as _BX,
-                ARENA_V3_AXIS_WEIGHTS as _V3X,
-                JUDGE_AXIS_IN_COMPOSITE as _JIC,
-                BENCH_AXES_IN_COMPOSITE as _BIC,
-                ARENA_V3_AXES_IN_COMPOSITE as _V3IC,
-                REASONING_DENSITY_IN_COMPOSITE as _RDIC,
-                CHAT_TURNS_AXIS_IN_COMPOSITE as _CTIC,
-            )
-            _active = set(_AX.keys())
-            if _JIC:
-                _active.add("judge_probe")
-            if _BIC:
-                _active.update(_BX.keys())
-            if _V3IC:
-                _active.update(_V3X.keys())
-            if _RDIC:
-                _active.add("reasoning_density")
-            if _CTIC:
-                _active.add("chat_turns_probe")
+            from scripts.validator.composite import active_composite_axes
+            _active = active_composite_axes()
             _active.difference_update(broken_axes)
             bad = min(
                 ((k, v) for k, v in axes.items() if v is not None and k in _active),

@@ -693,6 +693,27 @@ def _is_transient_error(exc: Exception) -> bool:
     ])
 
 
+def _repo_access_failure_reason(model_repo: str, exc: Exception) -> str | None:
+    """Return a hard-DQ reason for non-transient HF repo access failures."""
+    err = str(exc)
+    err_lower = err.lower()
+    if _is_transient_error(exc):
+        return None
+    if (
+        "401" in err
+        or "404" in err
+        or "repository not found" in err_lower
+        or "not found" in err_lower
+    ):
+        return (
+            f"Model {model_repo} is not publicly accessible on HuggingFace "
+            "(missing, private, or unauthorized)"
+        )
+    if "403" in err or "restricted" in err_lower or "gated" in err_lower:
+        return f"Model {model_repo} is restricted/gated — must be publicly accessible"
+    return f"Cannot access model repo metadata: {err}"
+
+
 def verify_tokenizer_files(model_repo: str, revision: str = None) -> dict:
     """
     Byte-for-byte verification of tokenizer files against the tokenizer reference.
@@ -865,7 +886,18 @@ def check_model_architecture(
                         "params_b": 0,
                     }
         except Exception as e:
-            logger.warning(f"Could not check repo files for {model_repo}: {e}")
+            hard_reason = _repo_access_failure_reason(model_repo, e)
+            if hard_reason is None:
+                return {
+                    "pass": True,
+                    "reason": f"transient_error:{e}",
+                    "transient": True,
+                }
+            return {
+                "pass": False,
+                "reason": hard_reason,
+                "params_b": 0,
+            }
 
         # 0b. SECURITY: Comprehensive weight file analysis.
         # Catches: fake safetensors, hidden pytorch_model.bin weights, size mismatches.

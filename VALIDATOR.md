@@ -44,6 +44,15 @@ python -m pip install -r requirements-validator.txt
 
 ## Validator Runtime
 
+### Coordination
+
+Validators align evaluation by chain-coordinated rounds, so startup time should
+not decide which submissions are scored. A validator may wait for the next round
+before evaluating or setting weights.
+
+Keep local state persistent. Only reset validator state during an announced
+rollout or explicit operator recovery.
+
 ### Default Network Settings
 
 ```env

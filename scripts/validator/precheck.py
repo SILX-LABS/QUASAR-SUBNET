@@ -193,6 +193,7 @@ def check_activation_fingerprint(model_name: str, uid: int, fingerprint: dict, s
 def precheck_all_models(commitments, uid_to_hotkey, uid_to_coldkey, state: ValidatorState, max_params_b: float):
     valid_models = {}
     disqualified = set()
+    precheck_errors = {}
     single_eval_mode = is_single_eval_mode()
     for uid, commit in commitments.items():
         model_repo = commit["model"]
@@ -261,7 +262,9 @@ def precheck_all_models(commitments, uid_to_hotkey, uid_to_coldkey, state: Valid
             if not _needs_full_check:
                 integrity = verify_model_integrity(model_repo, revision, expected_hash)
                 if integrity.get("transient"):
-                    pass
+                    logger.info(f"UID {uid} integrity: TRANSIENT ERROR — {integrity['reason']}, will retry")
+                    precheck_errors[uid] = f"integrity transient: {integrity['reason']}"
+                    continue
                 elif not integrity["pass"]:
                     logger.info(f"UID {uid} ({model_repo}): INTEGRITY FAIL — {integrity['reason']}")
                     state.scores[str(uid)] = MAX_KL_THRESHOLD + 1
@@ -288,6 +291,7 @@ def precheck_all_models(commitments, uid_to_hotkey, uid_to_coldkey, state: Valid
         check = check_model_architecture(model_repo, revision, max_params_b)
         if check.get("transient"):
             logger.info(f"UID {uid} ({model_repo}): TRANSIENT ERROR — {check['reason']}, will retry next epoch")
+            precheck_errors[uid] = f"arch transient: {check['reason']}"
             continue
         if not check["pass"]:
             logger.info(f"UID {uid} ({model_repo}): FAIL — {check['reason']}")
@@ -296,6 +300,11 @@ def precheck_all_models(commitments, uid_to_hotkey, uid_to_coldkey, state: Valid
             disqualified.add(uid)
             continue
         model_hash = compute_model_hash(model_repo, revision)
+        if not model_hash:
+            reason = "weight hash unavailable after architecture check"
+            logger.info(f"UID {uid} ({model_repo}): PRECHECK ERROR — {reason}")
+            precheck_errors[uid] = reason
+            continue
         if model_hash:
             original_uid = check_duplicate_hash(model_hash, uid, state.state_dir)
             if original_uid is not None:
@@ -331,6 +340,11 @@ def precheck_all_models(commitments, uid_to_hotkey, uid_to_coldkey, state: Valid
         # Shard-invariant content hash — catches re-sharded copies that slip
         # past compute_model_hash (aizaysi's wind77/third ↔ pure-iron-6291 case).
         content_hash = compute_content_hash(model_repo, revision)
+        if not content_hash:
+            reason = "content hash unavailable after architecture check"
+            logger.info(f"UID {uid} ({model_repo}): PRECHECK ERROR — {reason}")
+            precheck_errors[uid] = reason
+            continue
         if content_hash:
             dup_uid = check_duplicate_content_hash(content_hash, uid, state.state_dir)
             if dup_uid is not None:
@@ -387,6 +401,7 @@ def precheck_all_models(commitments, uid_to_hotkey, uid_to_coldkey, state: Valid
         integrity = verify_model_integrity(model_repo, revision, expected_hash)
         if integrity.get("transient"):
             logger.info(f"UID {uid} integrity: TRANSIENT ERROR — {integrity['reason']}, will retry")
+            precheck_errors[uid] = f"integrity transient: {integrity['reason']}"
             continue
         if not integrity["pass"]:
             logger.info(f"UID {uid} DISQUALIFIED: {integrity['reason']}")
@@ -410,4 +425,4 @@ def precheck_all_models(commitments, uid_to_hotkey, uid_to_coldkey, state: Valid
             "vllm_reason": check.get("vllm_reason"),
         }
         logger.info(f"UID {uid}: {model_repo} ({check.get('params_b', 0):.2f}B) ✓")
-    return valid_models, disqualified
+    return valid_models, disqualified, precheck_errors

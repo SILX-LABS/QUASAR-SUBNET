@@ -8,6 +8,7 @@ from eval.chain import (
     SetWeightsError,
     build_winner_take_all_weights,
     fetch_metagraph,
+    get_consensus_weight_target,
     get_validator_weight_target,
     parse_commitments,
     set_weights,
@@ -40,6 +41,17 @@ from scripts.validator.config import (
     REFERENCE_MODEL,
     REFERENCE_UID,
     TEACHER_MODEL,
+)
+from scripts.validator.coordination import (
+    build_coordination_round,
+    coordination_round_from_dict,
+    coordination_enabled,
+    deferred_uids_from_latest,
+    get_block_hash,
+    log_round_manifest,
+    parse_commitments_at_cutoff,
+    wait_for_round_start,
+    wait_until_activation_block,
 )
 from scripts.validator.pod_manager import init_local_pod, init_pod
 from scripts.validator.pod_session import run_eval_on_pod
@@ -160,6 +172,65 @@ def _resolve_king(valid_models, state):
                 f"— skip threshold will be disabled this round (stale cache)"
             )
     return king_uid, king_kl, source
+
+
+def _resolve_coordinated_king(
+    subtensor, metagraph, netuid, n_uids, valid_models, state, state_dir,
+    coord_round=None,
+):
+    """Resolve the incumbent king from chain state for coordinated rounds."""
+    weight_block = getattr(coord_round, "round_start_block", None)
+    try:
+        # Use documented block-pinned Bittensor APIs for every consensus input:
+        # weights(), get_subnet_validator_permits(), and get_stake_weight().
+        # Do not fall back to current metagraph here; that would let validators
+        # starting at different moments aggregate different permit/stake state.
+        validator_permit = subtensor.get_subnet_validator_permits(
+            netuid, block=weight_block,
+        )
+        stake = subtensor.get_stake_weight(netuid, block=weight_block)
+        chain_king_uid = get_consensus_weight_target(
+            subtensor, metagraph, netuid, n_uids, block=weight_block,
+            validator_permit=validator_permit, stake=stake,
+        )
+    except Exception as exc:
+        msg = (
+            f"coordination: exact chain snapshot unavailable at block "
+            f"{weight_block}; skipping this eval instead of using a local "
+            f"fallback: {str(exc)[:160]}"
+        )
+        logger.warning(msg)
+        log_event(
+            msg,
+            level="warn",
+            state_dir=state_dir,
+        )
+        raise RuntimeError(msg) from exc
+
+    if chain_king_uid is not None and chain_king_uid in valid_models:
+        king_kl = state.scores.get(str(chain_king_uid), float("inf"))
+        logger.info(
+            "coordination: king from on-chain weight consensus at block %s: UID %s",
+            weight_block,
+            chain_king_uid,
+        )
+        log_event(
+            f"coordination: incumbent king from chain weights at block "
+            f"{weight_block} is UID {chain_king_uid}",
+            state_dir=state_dir,
+        )
+        return chain_king_uid, king_kl, "chain_consensus"
+
+    if chain_king_uid is None:
+        msg = "coordination: no chain weight consensus king; planning without incumbent"
+    else:
+        msg = (
+            f"coordination: chain weight consensus UID {chain_king_uid} is not "
+            "valid in the frozen candidate set; planning without incumbent"
+        )
+    logger.warning(msg)
+    log_event(msg, level="warn", state_dir=state_dir)
+    return None, float("inf"), "chain_consensus"
 
 
 def _safe_set_weights(subtensor, wallet, netuid, n_uids, weights, winner_uid, state_dir):
@@ -443,17 +514,38 @@ def _run_resumed_round(subtensor, wallet, netuid, state, pod, resume_round,
                              "stage": "resume_chain_unreachable"})
         return
 
-    commitments, uid_to_hotkey, uid_to_coldkey = parse_commitments(metagraph, revealed, n_uids)
-    write_api_commitments_cache(commitments, state_dir)
+    chain_commitments, uid_to_hotkey, uid_to_coldkey = parse_commitments(metagraph, revealed, n_uids)
+    commitments = chain_commitments
+    write_api_commitments_cache(chain_commitments, state_dir)
     state.uid_hotkey_map = {str(uid): hotkey for uid, hotkey in uid_to_hotkey.items()}
+    coord_round = coordination_round_from_dict(
+        cr.get("coordination") if isinstance(cr.get("coordination"), dict) else None
+    )
+    if coord_round is not None:
+        commitments, uid_to_hotkey, uid_to_coldkey = parse_commitments_at_cutoff(
+            metagraph, revealed, n_uids, coord_round.commit_cutoff_block,
+        )
+        deferred_uids = deferred_uids_from_latest(chain_commitments, coord_round)
+        log_round_manifest(
+            coord_round,
+            total_commitments=len(chain_commitments),
+            frozen_commitments=len(commitments),
+            deferred_uids=deferred_uids,
+            state_dir=state_dir,
+        )
 
     try:
-        valid_models, disqualified = run_precheck(
+        valid_models, disqualified, precheck_errors = run_precheck(
             commitments, uid_to_hotkey, uid_to_coldkey, state, max_params_b, state_dir,
         )
+        if precheck_errors:
+            logger.warning(
+                "Resume: precheck incomplete for UIDs %s; planned-result filtering will continue",
+                sorted(precheck_errors),
+            )
     except Exception as exc:
         logger.warning(f"Resume: precheck during apply failed (non-fatal): {exc}")
-        valid_models, disqualified = {}, []
+        valid_models, disqualified, precheck_errors = {}, [], {}
 
     filtered_models = {}
     for uid, info in models_to_eval.items():
@@ -467,20 +559,20 @@ def _run_resumed_round(subtensor, wallet, netuid, state, pod, resume_round,
         planned_model = info.get("model")
         planned_rev = info.get("revision") or "main"
         current_rev = current_commit.get("revision") or planned_rev
-        current_block = current_commit.get("block")
+        current_commit_block = current_commit.get("block")
         planned_block = info.get("commit_block")
         same_commit = (
             (not planned_hotkey or planned_hotkey == current_hotkey)
             and current_model == planned_model
             and (not planned_rev or current_rev == planned_rev)
-            and (planned_block in (None, float("inf")) or current_block == planned_block)
+            and (planned_block in (None, float("inf")) or current_commit_block == planned_block)
         )
         if not same_commit:
             logger.warning(
                 "Resume: dropping UID %s result because commitment changed "
                 "(planned %s@%s block=%s, current %s@%s block=%s)",
                 uid, planned_model, planned_rev, planned_block,
-                current_model, current_rev, current_block,
+                current_model, current_rev, current_commit_block,
             )
             continue
         if uid in valid_models:
@@ -527,19 +619,22 @@ def _run_resumed_round(subtensor, wallet, netuid, state, pod, resume_round,
     }
 
     try:
+        coord_meta = cr.get("coordination") if isinstance(cr.get("coordination"), dict) else {}
+        result_block_hash = current_block_hash if coord_meta else (current_block_hash or fresh_block_hash)
         winner_uid, winner_kl, h2h_results, king_h2h_kl, king_per_prompt, uid_to_model, weights_set = (
             apply_results_and_weights(
                 subtensor, wallet, netuid, n_uids,
                 results, models_to_eval, king_uid, king_kl,
                 state, uid_to_hotkey, commitments,
-                n_prompts, current_block, current_block_hash or fresh_block_hash,
+                n_prompts, current_block, result_block_hash,
                 epoch_count, is_full_eval, epoch_start, state_dir,
+                activation_block=coord_meta.get("activation_block"),
             )
         )
         post_round(
             state, pod, winner_uid, winner_kl, king_uid, king_kl, king_h2h_kl,
             king_per_prompt, models_to_eval, uid_to_model, valid_models, h2h_results,
-            current_block, current_block_hash or fresh_block_hash, n_prompts, is_full_eval,
+            current_block, result_block_hash, n_prompts, is_full_eval,
             challengers, epoch_count, disqualified, epoch_start,
             uid_to_hotkey, state_dir,
         )
@@ -625,20 +720,31 @@ def fetch_chain(subtensor, netuid):
 
 def run_precheck(commitments, uid_to_hotkey, uid_to_coldkey, state,
                  max_params_b, state_dir):
-    valid_models, disqualified = precheck_all_models(
+    valid_models, disqualified, precheck_errors = precheck_all_models(
         commitments, uid_to_hotkey, uid_to_coldkey, state, max_params_b,
     )
-    n_valid, n_dq, n_total = len(valid_models), len(disqualified), len(commitments)
+    n_valid = len(valid_models)
+    n_dq = len(disqualified)
+    n_error = len(precheck_errors)
+    n_total = len(commitments)
     log_event(
         f"Prechecked {n_total} models: {n_valid} valid, {n_dq} DQ, "
-        f"{n_total - n_valid - n_dq} error",
+        f"{n_error} error",
         state_dir=state_dir,
     )
-    return valid_models, disqualified
+    if precheck_errors:
+        logger.warning("Precheck incomplete for UIDs: %s", sorted(precheck_errors))
+        log_event(
+            f"Precheck incomplete for UIDs: {sorted(precheck_errors)}",
+            level="warn",
+            state_dir=state_dir,
+        )
+    return valid_models, disqualified, precheck_errors
 
 
 def plan_round(valid_models, state, king_uid, king_kl, epoch_count,
-               is_full_eval, state_dir, king_source="h2h_latest"):
+               is_full_eval, state_dir, king_source="h2h_latest",
+               coord_round=None):
     """Select challengers, cap, and add top-5 contenders.
 
     In production single-eval mode this returns only new commitments plus
@@ -649,21 +755,28 @@ def plan_round(valid_models, state, king_uid, king_kl, epoch_count,
     challengers = select_challengers(
         valid_models, state, king_uid, king_kl, epoch_count,
         trust_king_kl=trust_king_kl,
+        coord_round=coord_round,
     )
     challengers_before_top5 = set(challengers.keys())
     log_event(
         f"select_challengers returned {len(challengers)} (P1/P3), king={king_uid}",
         state_dir=state_dir,
     )
-    add_top5_contenders(challengers, valid_models, state, king_uid)
-    # Rotate in ~N dormant high-scorers per round
-    # so the ranking doesn't go stale when no new submissions land. No-op
-    # when king_kl is unknown or DORMANT_ROTATION_N=0 is set in env.
-    # Runs AFTER add_top5_contenders so leaderboard slots are preserved
-    # but BEFORE cap_challengers so it competes for cap slots fairly.
-    add_dormant_rotation(challengers, valid_models, state, king_uid, king_kl)
-    cap_challengers(challengers, state, king_uid)
-    assert_top_contenders_present(challengers, valid_models, state, king_uid)
+    if coord_round is None:
+        add_top5_contenders(challengers, valid_models, state, king_uid)
+        # Rotate in ~N dormant high-scorers per round
+        # so the ranking doesn't go stale when no new submissions land. No-op
+        # when king_kl is unknown or DORMANT_ROTATION_N=0 is set in env.
+        # Runs AFTER add_top5_contenders so leaderboard slots are preserved
+        # but BEFORE cap_challengers so it competes for cap slots fairly.
+        add_dormant_rotation(challengers, valid_models, state, king_uid, king_kl)
+        cap_challengers(challengers, state, king_uid)
+        assert_top_contenders_present(challengers, valid_models, state, king_uid)
+    else:
+        logger.info(
+            "coordination: using scheduled challenger set only; "
+            "skipping local-state maintenance additions"
+        )
     has_new = len(challengers_before_top5) > 0
     top5_only = not has_new and len(challengers) > 0
     if top5_only:
@@ -727,8 +840,17 @@ def apply_results_and_weights(
     n_prompts, current_block, current_block_hash,
     epoch_count, is_full_eval, epoch_start, state_dir,
     uid_to_coldkey=None,
+    activation_block=None,
 ):
     """Run process_results -> set weights -> persist H2H state."""
+    # Coordination barrier: evaluation may finish before other validators
+    # complete the same frozen round. Wait before processing results so DQs,
+    # composite_scores, h2h_latest, announcements, and weights all move at
+    # the shared activation boundary instead of leaking early through local
+    # state/dashboard sync.
+    wait_until_activation_block(
+        subtensor, activation_block, state, state_dir,
+    )
     uid_to_model = _persist_preliminary_results(
         results, models_to_eval, king_uid, state,
         current_block, current_block_hash, n_prompts, is_full_eval, king_kl,
@@ -1025,6 +1147,9 @@ def run_validator(network, netuid, wallet_name, hotkey_name, wallet_path,
                 time.sleep(tempo)
                 continue
 
+            if coordination_enabled():
+                wait_for_round_start(subtensor, state, state_dir)
+
             print("[validator] Fetching chain state...", flush=True)
             try:
                 metagraph, current_block, current_block_hash, n_uids, revealed = fetch_chain(subtensor, netuid)
@@ -1038,13 +1163,38 @@ def run_validator(network, netuid, wallet_name, hotkey_name, wallet_path,
                 continue
 
             commitments, uid_to_hotkey, uid_to_coldkey = parse_commitments(metagraph, revealed, n_uids)
+            chain_commitments = commitments
             write_api_commitments_cache(commitments, state_dir)
             logger.info(f"Found {len(commitments)} miner commitments")
+            coord_round = None
+            if coordination_enabled():
+                coord_round = build_coordination_round(current_block)
+                coord_hash = get_block_hash(subtensor, coord_round.eval_seed_block)
+                commitments, uid_to_hotkey, uid_to_coldkey = parse_commitments_at_cutoff(
+                    metagraph, revealed, n_uids, coord_round.commit_cutoff_block,
+                )
+                deferred_uids = deferred_uids_from_latest(chain_commitments, coord_round)
+                log_round_manifest(
+                    coord_round,
+                    total_commitments=len(chain_commitments),
+                    frozen_commitments=len(commitments),
+                    deferred_uids=deferred_uids,
+                    state_dir=state_dir,
+                )
+                # From here down, `current_block` means the shared round seed
+                # block, not the wall-clock block each validator happened to
+                # start on. This keeps prompts, private-pool sampling, and H2H
+                # history aligned across validators in the same round.
+                current_block = coord_round.eval_seed_block
+                current_block_hash = coord_hash
             if not commitments:
                 state.save_progress({
                     "active": False,
-                    "stage": "no_commitments",
-                    "commitments_total": 0,
+                    "stage": "no_commitments"
+                    if coord_round is None else "no_frozen_commitments",
+                    "commitments_total": len(chain_commitments),
+                    "frozen_commitments": len(commitments),
+                    "coordination": coord_round.to_dict() if coord_round else None,
                     "updated_at": time.time(),
                 })
                 if once:
@@ -1052,16 +1202,39 @@ def run_validator(network, netuid, wallet_name, hotkey_name, wallet_path,
                 time.sleep(tempo)
                 continue
 
-            migrate_dq_entries(state, commitments)
-            issues = state.validate_consistency(uid_to_hotkey, commitments, MAX_KL_THRESHOLD)
+            migrate_dq_entries(state, chain_commitments)
+            issues = state.validate_consistency(uid_to_hotkey, chain_commitments, MAX_KL_THRESHOLD)
             if issues:
                 state.save()
                 logger.info(f"State auto-repaired ({len(issues)} issues)")
             state.uid_hotkey_map = {str(uid): hotkey for uid, hotkey in uid_to_hotkey.items()}
 
-            valid_models, disqualified = run_precheck(
+            valid_models, disqualified, precheck_errors = run_precheck(
                 commitments, uid_to_hotkey, uid_to_coldkey, state, max_params_b, state_dir,
             )
+            if coord_round is not None and precheck_errors:
+                logger.warning(
+                    "coordination: precheck incomplete for UIDs %s; skipping eval so this "
+                    "validator does not plan from an incomplete candidate set",
+                    sorted(precheck_errors),
+                )
+                state.save_progress({
+                    "active": False,
+                    "stage": "coordination_precheck_incomplete",
+                    "commitments_total": len(commitments),
+                    "valid_models": len(valid_models),
+                    "disqualified": len(disqualified),
+                    "precheck_errors": {
+                        str(uid): reason for uid, reason in sorted(precheck_errors.items())
+                    },
+                    "coordination": coord_round.to_dict(),
+                    "updated_at": time.time(),
+                })
+                state.save()
+                if once:
+                    break
+                time.sleep(60)
+                continue
             if not valid_models:
                 logger.info("No valid models after pre-checks")
                 state.save_progress({
@@ -1070,6 +1243,9 @@ def run_validator(network, netuid, wallet_name, hotkey_name, wallet_path,
                     "commitments_total": len(commitments),
                     "valid_models": 0,
                     "disqualified": len(disqualified),
+                    "precheck_errors": {
+                        str(uid): reason for uid, reason in sorted(precheck_errors.items())
+                    },
                     "updated_at": time.time(),
                 })
                 state.save()
@@ -1078,21 +1254,55 @@ def run_validator(network, netuid, wallet_name, hotkey_name, wallet_path,
                 time.sleep(tempo)
                 continue
 
-            king_uid, king_kl, king_source = _resolve_king(valid_models, state)
+            if coordination_enabled():
+                try:
+                    king_uid, king_kl, king_source = _resolve_coordinated_king(
+                        subtensor, metagraph, netuid, n_uids,
+                        valid_models, state, state_dir, coord_round=coord_round,
+                    )
+                except RuntimeError:
+                    state.save_progress({
+                        "active": False,
+                        "stage": "coordination_chain_snapshot_unavailable",
+                        "coordination": coord_round.to_dict() if coord_round else None,
+                        "updated_at": time.time(),
+                    })
+                    state.save()
+                    if once:
+                        break
+                    time.sleep(60)
+                    continue
+            else:
+                king_uid, king_kl, king_source = _resolve_king(valid_models, state)
             validator_uid = next(
                 (uid for uid, hk in uid_to_hotkey.items() if hk == wallet.hotkey.ss58_address), None,
             )
-            is_full_eval = state.top4_leaderboard.get("phase") == "initial_eval"
+            # Coordinated rounds must not depend on local top4 state. A reset
+            # validator defaults to initial_eval while an older validator may
+            # still be in maintenance; letting that choose the prompt count
+            # would split the shared round inputs.
+            is_full_eval = (
+                False if coord_round is not None
+                else state.top4_leaderboard.get("phase") == "initial_eval"
+            )
 
             models_to_eval, challengers = plan_round(
                 valid_models, state, king_uid, king_kl, epoch_count,
                 is_full_eval, state_dir, king_source=king_source,
+                coord_round=coord_round,
             )
             n_challengers_in_eval = sum(
                 1 for uid in models_to_eval if uid != king_uid and uid != REFERENCE_UID
             )
             if n_challengers_in_eval == 0:
                 logger.info(f"No challengers at all — king UID {king_uid} holds")
+                wait_until_activation_block(
+                    subtensor,
+                    coord_round.activation_block if coord_round is not None else None,
+                    state,
+                    state_dir,
+                    winner_uid=king_uid,
+                )
                 if king_uid is not None:
                     _safe_set_weights(
                         subtensor, wallet, netuid, n_uids,
@@ -1104,7 +1314,13 @@ def run_validator(network, netuid, wallet_name, hotkey_name, wallet_path,
                 time.sleep(tempo)
                 continue
 
-            _sync_king_weights(subtensor, wallet, netuid, n_uids, king_uid, validator_uid, state_dir)
+            if coordination_enabled():
+                logger.info("coordination: skipping pre-eval king weight sync")
+            else:
+                _sync_king_weights(
+                    subtensor, wallet, netuid, n_uids, king_uid,
+                    validator_uid, state_dir,
+                )
 
             n_prompts = EVAL_PROMPTS_FULL if is_full_eval else EVAL_PROMPTS_H2H
             logger.info(
@@ -1143,7 +1359,14 @@ def run_validator(network, netuid, wallet_name, hotkey_name, wallet_path,
                     )
             except Exception:
                 pass
-            private_subset = sample_private_subset(n_prompts, current_block)
+            # Validator-private holdout pools are intentionally local, which
+            # means they are not suitable for coordinated consensus rounds.
+            # Keep the coordinated prompt set block-deterministic across
+            # validators; the procedural benchmark axes still rotate by block.
+            private_subset = (
+                [] if coord_round is not None
+                else sample_private_subset(n_prompts, current_block)
+            )
             n_public = max(1, n_prompts - len(private_subset))
             epoch_prompts = sample_prompts_from_dataset(
                 n_public, current_block, block_hash=current_block_hash,
@@ -1183,6 +1406,7 @@ def run_validator(network, netuid, wallet_name, hotkey_name, wallet_path,
                     "commit_root": commit_root,
                     "fraction": DEFAULT_PRIVATE_FRACTION,
                 },
+                "coordination": coord_round.to_dict() if coord_round else None,
             }
             state.save_round()
 
@@ -1223,6 +1447,10 @@ def run_validator(network, netuid, wallet_name, hotkey_name, wallet_path,
                     n_prompts, current_block, current_block_hash,
                     epoch_count, is_full_eval, epoch_start, state_dir,
                     uid_to_coldkey=uid_to_coldkey,
+                    activation_block=(
+                        state.current_round.get("coordination", {}).get("activation_block")
+                        if isinstance(state.current_round, dict) else None
+                    ),
                 )
             )
 

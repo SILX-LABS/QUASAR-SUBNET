@@ -4,6 +4,10 @@ import os
 from eval.scoring import disqualify
 from eval.state import ValidatorState
 from scripts.validator.config import MAX_KL_THRESHOLD, TOP_N_ALWAYS_INCLUDE
+from scripts.validator.coordination import (
+    reset_anchor_challenger_uids,
+    scheduled_challenger_uids,
+)
 from scripts.validator import single_eval as single_eval_mod
 from scripts.validator.composite import COMPOSITE_SHADOW_VERSION
 from scripts.validator.single_eval import (
@@ -42,8 +46,22 @@ PROTECTED_H2H_CONTENDERS = int(
 LB_PRECHECK_EVICTION_STREAK = int(os.environ.get("LB_PRECHECK_EVICTION_STREAK", "3"))
 
 
+def _looks_like_reset_state(state: ValidatorState) -> bool:
+    """True when local ranking state was intentionally cleared."""
+    # Deliberately ignore state.scores here. Precheck runs before challenger
+    # planning and may write DQ/failure telemetry into scores during the first
+    # post-reset epoch. That telemetry must not cancel the reset anchor before
+    # it has a chance to seat the frozen backlog once.
+    return not any([
+        getattr(state, "composite_scores", None),
+        getattr(state, "evaluated_uids", None),
+        getattr(state, "h2h_latest", None),
+    ])
+
+
 def select_challengers(valid_models, state: ValidatorState, king_uid, king_kl,
-                       epoch_count: int, trust_king_kl: bool = True):
+                       epoch_count: int, trust_king_kl: bool = True,
+                       coord_round=None):
     """Pick challengers for the round.
 
     ``trust_king_kl`` = False disables the ``best_ever > king_kl*2`` prune.
@@ -60,12 +78,9 @@ def select_challengers(valid_models, state: ValidatorState, king_uid, king_kl,
     non-king participants and skips GPU evaluation.
     """
     if is_single_eval_mode():
-        evict_stale_evaluated_uids(state, valid_models)
         challengers = {}
-        force_eligible: set[str] = set()
         if king_uid is not None:
             king_record = (state.composite_scores or {}).get(str(king_uid))
-            force_eligible.add(str(king_uid))
             if isinstance(king_record, dict):
                 try:
                     king_version = int(king_record.get("version") or 0)
@@ -83,59 +98,82 @@ def select_challengers(valid_models, state: ValidatorState, king_uid, king_kl,
                         f"single-eval: king UID {king_uid} included in "
                         f"challenger rounds for paired comparison."
                     )
-        for uid, info in valid_models.items():
-            uid_str = str(uid)
-            model_name = info["model"]
-            if info.get("is_reference"):
-                continue
-            if model_name in state.permanently_bad_models:
-                state.evaluated_uids.add(uid_str)
-                continue
-            if uid_str in state.composite_scores and uid_str not in force_eligible:
-                continue
-            # Strict no-re-eval: a UID in evaluated_uids has been through a
-            # full round once already. Even if its score row got dropped
-            # later (DQ revert, partial-state reset, etc.), per single-eval
-            # policy it should not run again unless its commitment changed
-            # — and ``evict_stale_evaluated_uids`` already pulled out the
-            # commitment-changed entries above. The previous filter required
-            # both ``evaluated_uids`` AND ``scores`` to be set, which let
-            # historical UIDs sneak back into the queue when state was
-            # partially rebuilt.
-            if uid_str in state.evaluated_uids and uid_str not in force_eligible:
-                continue
-            challengers[uid] = info
-        # FIFO cap: oldest commitment first. Without this the planner
-        # queues every pending new commit at once and rounds bloat to 8h
-        # of pod compute. The cap forces rotation across rounds so each
-        # individual round stays in the 60–75 min target. We read the
-        # live cap from the single_eval module each call so unit tests
-        # (and operators editing the env at runtime) can override it
-        # without restarting the planner.
         cap = int(single_eval_mod.SINGLE_EVAL_MAX_PER_ROUND)
-        if challengers and cap > 0 and len(challengers) > cap:
-            ordered = sorted(
-                challengers.items(),
-                key=lambda kv: (
-                    int((kv[1] or {}).get("commit_block") or 0),
-                    kv[0],
-                ),
-            )
-            kept = dict(ordered[:cap])
-            deferred = [uid for uid, _ in ordered[cap:]]
-            logger.info(
-                f"single-eval: capping round at {cap} of {len(challengers)} "
-                f"pending new commitments (FIFO by commit_block); deferred "
-                f"to next round: {deferred}"
-            )
-            challengers = kept
+        if coord_round is not None:
+            if _looks_like_reset_state(state):
+                scheduled = reset_anchor_challenger_uids(
+                    valid_models, cap, king_uid=king_uid,
+                )
+                logger.info(
+                    f"single-eval: coordination reset anchor scheduled "
+                    f"{len(scheduled)} challenger(s): {scheduled}"
+                )
+            else:
+                scheduled = scheduled_challenger_uids(
+                    valid_models, coord_round, cap, king_uid=king_uid,
+                )
+                logger.info(
+                    f"single-eval: coordination scheduled {len(scheduled)} "
+                    f"challenger(s) for round {coord_round.round_id}: {scheduled}"
+                )
+            challengers = {uid: valid_models[uid] for uid in scheduled}
+        else:
+            evict_stale_evaluated_uids(state, valid_models)
+            for uid, info in valid_models.items():
+                uid_str = str(uid)
+                model_name = info["model"]
+                if info.get("is_reference"):
+                    continue
+                # The incumbent is always seated separately by service.plan_round
+                # for paired evaluation against the challengers. It must not live
+                # in the challenger pool here, otherwise the single-eval cap counts
+                # the king as one of the pending-new slots and can defer a real
+                # valid challenger.
+                if uid == king_uid:
+                    continue
+                if model_name in state.permanently_bad_models:
+                    state.evaluated_uids.add(uid_str)
+                    continue
+                if uid_str in state.composite_scores:
+                    continue
+                # Strict no-re-eval: a UID in evaluated_uids has been through a
+                # full round once already. Even if its score row got dropped
+                # later (DQ revert, partial-state reset, etc.), per single-eval
+                # policy it should not run again unless its commitment changed
+                # — and ``evict_stale_evaluated_uids`` already pulled out the
+                # commitment-changed entries above. The previous filter required
+                # both ``evaluated_uids`` AND ``scores`` to be set, which let
+                # historical UIDs sneak back into the queue when state was
+                # partially rebuilt.
+                if uid_str in state.evaluated_uids:
+                    continue
+                challengers[uid] = info
+            # FIFO cap: oldest commitment first. Without this the planner
+            # queues every pending new commit at once and rounds bloat to 8h
+            # of pod compute. The cap forces rotation across rounds so each
+            # individual round stays in the 60–75 min target. We read the
+            # cap from the single_eval module each call so unit tests can patch
+            # it without changing the production constant.
+            if challengers and cap > 0 and len(challengers) > cap:
+                ordered = sorted(
+                    challengers.items(),
+                    key=lambda kv: (
+                        int((kv[1] or {}).get("commit_block") or 0),
+                        kv[0],
+                    ),
+                )
+                kept = dict(ordered[:cap])
+                deferred = [uid for uid, _ in ordered[cap:]]
+                logger.info(
+                    f"single-eval: capping round at {cap} of {len(challengers)} "
+                    f"pending new commitments (FIFO by commit_block); deferred "
+                    f"to next round: {deferred}"
+                )
+                challengers = kept
         if challengers:
-            n_king = 1 if (king_uid is not None and str(king_uid) in {str(u) for u in challengers}) else 0
-            n_others = len(challengers) - n_king
             logger.info(
-                f"single-eval: {n_others} new commitment(s) to evaluate"
-                + (" + king (paired re-eval)" if n_king else "")
-                + " (no top-N rotation, no dormant rotation)"
+                f"single-eval: {len(challengers)} new commitment(s) to evaluate "
+                "+ king (paired re-eval; no top-N rotation, no dormant rotation)"
             )
         else:
             logger.info(
@@ -313,11 +351,9 @@ def add_dormant_rotation(challengers, valid_models, state: ValidatorState,
 
 
 def cap_challengers(challengers, state: ValidatorState, king_uid):
-    # Single-eval mode: every commitment in the round is a never-evaluated
-    # new submission, so the cap doesn't apply (there's nothing to truncate
-    # — the natural ceiling is "however many new commits arrived"). The
-    # registration burn cost is the spam control instead of an artificial
-    # per-round limit.
+    # Single-eval mode applies its consensus cap inside select_challengers,
+    # before the incumbent king is seated separately for paired evaluation.
+    # This legacy maintenance cap is only for the non-single-eval branch.
     if is_single_eval_mode():
         return
     phase = state.top4_leaderboard.get("phase", "maintenance")

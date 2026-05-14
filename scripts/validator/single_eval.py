@@ -45,7 +45,9 @@ SINGLE_EVAL_DETHRONE_MARGIN = float(
 )
 
 
-# Hard ceiling on how many never-evaluated commitments enter a single round.
+# Consensus-critical hard ceiling on how many never-evaluated challenger
+# commitments enter a single round. Keep this as code, not a validator-local
+# env knob: validators with different caps evaluate different candidate sets.
 # When a backlog of new commits accumulates faster than rounds can consume
 # them (e.g. after a 12 h restart loop), the planner would otherwise queue
 # 20+ models per round and each round bloats to 8+ hours of pod compute.
@@ -55,11 +57,8 @@ SINGLE_EVAL_DETHRONE_MARGIN = float(
 # (oldest commitment first), so every miner is evaluated within a few
 # rounds without a single round being a multi-hour wallclock fire.
 #
-# Default 10 keeps round target around 60–75 min on H200 with shadow axes
-# off. Override per-deployment with ``SINGLE_EVAL_MAX_PER_ROUND`` env.
-SINGLE_EVAL_MAX_PER_ROUND = int(
-    os.environ.get("SINGLE_EVAL_MAX_PER_ROUND", "10")
-)
+# 10 keeps the round target around 60–75 min on H200 with shadow axes off.
+SINGLE_EVAL_MAX_PER_ROUND = 10
 
 
 # When `worst` (min over axes) is at-or-below this epsilon, treat the UID as

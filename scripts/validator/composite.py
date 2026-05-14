@@ -317,6 +317,37 @@ BENCH_MIN_VALID = {
 
 COMPOSITE_SHADOW_VERSION = 28  # Session 3.21 — quality > quantity rebalance. Six axes muted to weight 0 (knowledge_bench, arc_bench, truthful_bench, procedural_bench, self_consistency_bench, noise_resistance_bench) because they were either eval-setup-fragile (random-pick floors near the king's signal), redundant with the post-v27 procedural rewrite (procedural_bench duplicates capability + math_bench), or the same item pool re-graded under a different aggregator (self_consistency reuses math_bench). Cut weight 0.20 redirected to harder axes the user explicitly asked us to make more binding (aime_bench +0.04, mbpp_bench +0.02, tool_use_bench +0.02, long_context_bench +0.01, robustness_bench +0.03) and to the relative-axis cluster (math_bench +0.02, code_bench +0.02, reasoning_bench +0.02, ifeval_bench +0.02). Per-round item budgets shrunk on the muted axes (knowledge: 10→0, arc: 8→0, truthful: 6→0, procedural: 6→0, self_consistency: 6→0, noise_resistance: 4→0) and bumped on the high-value ones (math: 10→12, aime: 6→8, code: 6→8, mbpp: 6→8). Net effect: ~24 fewer items per round (~9 min wall-time saved) with sharper composite ranking. Mixing v27 and v28 records is unsafe because v27 records carry six axes the v28 ranker now ignores — the king filter (``_KING_SELECTION_MIN_VERSION = 28``) quarantines old records until regraded under v28 so the dethrone gate never compares v27-axes-passed-on-luck to v28-honest-ranking. Session 3.20 — full procedural switch for math_bench / code_bench / reasoning_bench / knowledge_bench / ifeval_bench / aime_bench / mbpp_bench / tool_use_bench / self_consistency_bench / arc_bench / truthful_bench / robustness_bench / noise_resistance_bench. Pre-v27 every benchmark axis sampled from public datasets (GSM8K + MATH-500 + HumanEval + MBPP + BBH + MMLU-Pro + IFEval + AIME + ARC + TruthfulQA). v18-v26 paraphrase / option-shuffle / prompt-rotation hardening rotated the surface form of public items but the (problem, gold) pair on disk was unchanged, so a miner with a {paraphrased_question → answer} lookup over the public corpus could still saturate the axis. v27 generates the bench items per round directly from ``block_seed`` via 6 new procedural generators in ``pod_eval_vllm.py`` (_generate_math_items / _generate_aime_items / _generate_code_items / _generate_reasoning_items / _generate_mc_items / _generate_ifeval_items). The (parameters, gold) pair is fresh every round and exists nowhere on disk — there is no dataset to memorise. The public datasets remain available for ``scripts/eval_pod/auto_benchmark.sh`` post-hoc evalscope verification against the king on a separate Lium pod, but the validator never trains-or-evals against the public items. Round duration unchanged because per-item generation is microseconds. Mixing v26 and v27 records would let a v26 memoriser keep their inflated public-pool floor under the old grading while honest miners regrade against fresh procedural items every round — the king filter (``_KING_SELECTION_MIN_VERSION = 27``) quarantines old records until regraded under v27. Session 3.19 — on_policy_rkl per-round chat-domain prompt paraphrase. After v25 closed the judge_probe / chat_turns_probe surfaces, ``on_policy_rkl`` (composite weight 0.35 — the SINGLE-LARGEST axis weight in the entire composite, larger than the next two combined) was the largest remaining un-rotated public-prompt-pool axis. The 80-prompt ``ON_POLICY_RKL_POOL`` is fully baked into the open-source ``pod_eval_vllm.py``; pre-v17 the per-round 16-of-80 sample was deterministic on ``block_seed`` but the rollout-sampling seed was a constant ``42``, so a miner could pre-compute their student's exact deterministic rollout per pool entry and surgically train weights to align with the teacher's high-prob tokens at every position of that exact trajectory. v17 (Session 3.10) defeated *that specific* attack by rotating the rollout-sampling seed per ``block_seed`` (XOR with ``ON_POLICY_RKL_SEED``) — but it did NOT defeat the more fundamental Goodhart vector that prompt rotation alone defeats: a miner who pre-distils their student onto ``teacher_logprobs(prompt)`` for the canonical wording of all 80 pool entries can saturate ``on_policy_rkl`` regardless of sampling-seed rotation, because the student has been trained to place teacher-likely tokens at every position the teacher would. Rotating the *surface form* of the prompt every round forces a student that wants to keep its low-KL floor to actually generalise across phrasings — which is the entire point of distillation. v26 wires the v25 ``_paraphrase_chat_prompt`` helper into ``_pick_on_policy_rkl_prompts`` so each of the 16 sampled prompts gets a chat-domain synonym swap (``_CHAT_INSTRUCTION_SYNONYMS``: explain/describe/outline, give/provide/offer, list/enumerate, briefly/concisely, etc.) keyed on ``(block_seed, sha(prompt))``. The helper is region-aware so translation answer keys ("Translate to French: The cat sat on the mat.") are PROTECTED — only conversational PROSE rotates, the quoted source text and the language tag survive byte-identical so the gold output of a translation prompt is unchanged. JSON-output specs ("Output a JSON object with keys 'name' and 'age'..."), function-signature requests, and bash one-liner prompts likewise survive because their format constraints sit inside protected single-quoted regions. The math-domain default synonym table is *not* layered in (the helper uses ``_apply_chat_synonyms``) so verbs like ``find``/``calculate``/``determine`` in the on_policy_rkl reasoning sub-pool ("Is 97 prime? Answer with reasoning.") read naturally because they are NOT rewritten — only chat-domain prose rotates. Mixing v25 and v26 records would let an on_policy_rkl wording-memoriser keep their inflated low-KL floor under the old grading while honest miners regrade against rotated phrasings — the king filter quarantines old records until regraded under v26. Session 3.18 — judge_probe / chat_turns_probe canonical-response paraphrase. After v18-v24 closed every benchmark-axis canonical-wording attack vector, the two largest remaining un-rotated public-prompt-pool axes were ``judge_probe`` (composite weight 0.15, drawn from a 65-prompt static pool baked into ``pod_eval_vllm.py``) and ``chat_turns_probe`` (composite weight 0.08, drawn from a ~25-conversation static pool of 3-turn dialogues). Combined attack surface = 0.23 weight, larger than ``code_bench`` + ``reasoning_bench`` combined (0.20). Both axes are graded by the teacher rubric on a 1-5 scale of "correct + clear + addresses the question + appropriate length" — a miner who pre-trains on canonical 5/5-quality responses to all ~90 prompts can saturate both axes from a ``{prompt_text → canonical_response}`` lookup without doing any genuine chat work, the same canonical-wording memorisation Goodhart vector closed for math / code / BBH in v18-v24, just on a smaller surface. v25 introduces ``_paraphrase_chat_prompt`` which is region-aware: it splits each prompt into alternating PROSE / PROTECTED chunks (anything inside triple-backtick fences, single-backtick code, single or double quoted strings, or inline ``{...}`` JSON-like blocks is PROTECTED) and applies a chat-domain synonym swap (``_CHAT_INSTRUCTION_SYNONYMS``: explain/describe/outline, give/provide/offer, show/demonstrate/illustrate, list/enumerate, briefly/concisely, suggest/recommend, etc.) ONLY to PROSE chunks. Code identifiers (``range(5)`` / ``list(...)``), function names (``is_palindrome``), format specifiers (``'PROS: <a, b>; CONS: <c, d>'``), regex literals (``\\d{5}``), inline JSON (``{"name": "Ada", "langs": ["py", "go"]}``), and tight format constraints ("no other text" / "only the JSON" / "exactly N words") are all preserved verbatim — so the rubric-graded format adherence is unchanged and the answer key implicit in code-output prompts (``print(list(range(3, 10, 2)))``) still matches. The math-domain default synonym table is *not* layered in for chat (the helper uses ``_apply_chat_synonyms`` which bypasses the math defaults) because English homonyms (``"find a movie"`` / ``"calculate the cost"``) make indiscriminate ``find/calculate/determine`` rewrites read awkward in conversational prose. Per-prompt seed is mixed via ``_stable_seed_from_text`` so cross-validator agreement is preserved while the swap rotates per ``block_seed``. Each turn of a chat_turns_probe conversation is paraphrased independently so a memoriser keyed on "Give me a simple recipe for chocolate chip cookies." → "Provide a simple recipe..." on round N → "Offer a simple recipe..." on round N+1 sees a different surface every round across all three turns. Mixing v24 and v25 records would let a chat-prompt memoriser keep their inflated ``judge_probe=0.95`` / ``chat_turns_probe=0.95`` floor while honest miners regrade against rotated phrasings — the king filter quarantines old records until regraded under v25. Session 3.17 — reasoning_bench (BBH) inline-MC option shuffle per round. After v23 closed the code surface, ``reasoning_bench`` (0.08 weight, 21 BBH subtasks) was the largest remaining un-rotated MC public-pool axis. ~12 of the 21 BBH subtasks (logical_deduction_*, tracking_shuffled_objects_*, disambiguation_qa, geometric_shapes, hyperbaton, movie_recommendation, penguins_in_a_table, ruin_names, snarks, temporal_sequences) ship with a fixed correct-letter per item, encoded INLINE in the question text as ``Options:\\n(A) ...\\n(B) ...``. The round-20 ``_shuffle_mc_options_for_round`` helper couldn't be reused because BBH stores options inline rather than as a separate ``options`` field. Schema-version-0 records (pre any Goodhart hardening) reached ``reasoning_bench=0.88`` paired with ``capability=0.99`` / ``arc_bench=0`` / ``code_bench=0`` — the textbook saturated-on-memorisable-axis Goodhart signature. v24 introduces ``_shuffle_bbh_mc_options`` which parses the inline ``Options:\\n(A) ...`` block via a dedicated regex, shuffles option contents per ``(block_seed XOR sha256(question))`` to match v20's keying convention, and remaps the gold letter to point at where the original correct content lands. Boolean / numeric subtasks (boolean_expressions, object_counting, web_of_lies, navigate) have no inline options block and pass through unchanged so the helper degrades gracefully on the entire BBH pool. The rebuilt question keeps the canonical ``Options:\\n(A) ...\\n(B) ...`` shape so the model sees a familiar BBH format and the existing answer-extraction regex (``\\(?[A-Z]\\)?``) keeps working. Mixing v23 and v24 records would let a BBH letter-memoriser keep their inflated ``reasoning_bench=0.88`` floor while honest miners regrade against rotated letters; the king filter quarantines old records until regraded. Session 3.16 — code_bench (HumanEval) and mbpp_bench prompt paraphrase per round. After v18-v22 closed the math / multiple-choice / tool-use / self-consistency surfaces, ``code_bench`` (164 fully-public HumanEval items) and ``mbpp_bench`` (378 MBPP+ items) became the largest remaining un-rotated axis pair on the validator. ``code_bench`` carries weight 0.12 (tied with ``math_bench`` for the largest single axis weight) and the entire pool plus answer key is open-source, so a miner can build a ``{prompt → solution}`` lookup keyed on canonical docstring wording and saturate the axis without ever passing the prompt through a Python compiler. Round-18 prose-stripping closed the conversational-wrapper bypass; round 23 closes the prompt-memorisation bypass that prose-stripping could not. v23 introduces ``_paraphrase_code_problem`` which is structurally aware: it tokenises the prompt line-by-line, classifies each line as PROSE or CODE (function signatures, ``import``/``from``/``class``/``@``/``return``/``assert`` lines, ``>>>`` doctest inputs, doctest outputs, and bare triple-quote markers all classified as CODE), and applies the math-domain synonym swap PLUS a code-domain extension (``_CODE_INSTRUCTION_SYNONYMS``: "write a function" / "check if" / "given a" rotations) ONLY to PROSE lines. Function signatures, type hints, parameter names, doctest examples, and the test harness in MBPP ``assert`` blocks are preserved verbatim — a genuine solver still passes the gold tests. Cross-validator agreement: same ``(prompt, block_seed)`` → identical paraphrased prompt because the per-prompt seed is mixed via ``_stable_seed_from_text``. Mixing v22 and v23 records would let a HumanEval/MBPP wording-memoriser keep their stale code_bench=1.0 floor while honest miners regrade against rotated phrasings — the king filter requires v23+ to claim the crown so the gamed records are quarantined until regraded. Session 3.15 — math_bench / tool_use_bench / self_consistency_bench problem paraphrase per round. The round-21 paraphrase defence covered ``aime_bench`` (~90 public items) but left the much larger math-bench surface (1 319 GSM8K + 500 MATH-500 = 1 819 public items) wide open. ``math_bench`` is also the heaviest single bench weight at 0.12 (vs ``robustness_bench`` at 0.04), so a miner who memorised canonical wording could saturate it for a +0.12 weight payoff and only lose 0.04 on robustness — net +0.08 weight gain even after the round-21 audit. v22 applies the same math-domain-safe paraphrase helpers (``_apply_instruction_synonyms`` + ``_imperative_to_question``) to math_bench, tool_use_bench, and self_consistency_bench items at round-start, keyed on ``(block_seed, sha(question))``. All three axes pull from the GSM8K / MATH-500 pool, so they share the same canonical-wording attack surface — closing all three together stops the +0.20 cumulative weight payoff the previous gap allowed. Numeric constants, LaTeX (``$...$``, ``\\boxed{...}``), GSM8K ``####`` answer markers, and the ``\\n\\n`` format suffix are preserved verbatim by the helpers, so a model that genuinely understands the problem still scores; only ``{problem_text → answer}`` lookups break. Mixing v21 and v22 records would let a wording memoriser keep their math_bench=0.9 floor under the old grading while honest miners regrade against rotated phrasings — re-grounding via the king filter is required. Session 3.14 — AIME problem paraphrase per round. Pre-v21 ``aime_bench`` used the canonical AIME problem wording verbatim. The pool is ~90 public items from ``HuggingFaceH4/aime_2025`` + ``Maxwell-Jia/AIME_2024`` + ``AI-MO/aimo-validation-aime`` with integer answers 0–999. A miner who pre-trains on the public datasets can build a ``{problem_text → answer}`` lookup keyed on canonical wording. AIME isn't currently the dominant Goodhart vector (round-18 logs show top score 0.25 = 2/6, suggesting partial memorization but not full saturation) but the attack scales linearly with how much of the public pool a miner caches. v21+ wraps each AIME problem with the same math-domain-safe paraphrase helpers used by robustness_bench (``_apply_instruction_synonyms`` + ``_imperative_to_question``) keyed on ``(block_seed, sha(question))``. The synonym table only touches instruction verbs (``find``/``calculate``/``determine``) and the imperative→question rewrite only edits the closing sentence — digits, LaTeX, and boxed format are preserved so the math is unchanged. A genuine reasoner solves it; a memoriser keyed on canonical wording fails. Session 3.13 — per-round MC option shuffle for arc_bench / knowledge_bench / truthful_bench. Pre-v20 the ARC and MMLU-Pro pools shipped with a fixed correct-letter per question (the original dataset order), and ``truthful_bench`` shuffled per-question only at load time. A miner who pre-trained on the public ``allenai/ai2_arc`` and ``TIGER-Lab/MMLU-Pro`` datasets could build a ``{question_text → correct_letter}`` lookup and saturate ``arc_bench`` without parsing the options. Round 18 logs caught this in the wild: 8 distinct miners scored ``arc_bench=1.000`` while their ``knowledge_bench`` was 0.0–0.25 (uids 11/22/40/42/61/64/69/79). Rotating the option order per ``(block_seed, sha256(question))`` forces the correct letter to change every round so a memorised lookup is wrong on every refresh; the model has to actually parse the option text. Cross-validator agreement preserved (every validator with the same block_seed produces the same shuffle). Session 3.12 — capability_probe procedural rebalance. Pre-v19 the capability axis (composite weight 0.25, the second-highest after on_policy_rkl) drew 24 of its 36 items per round from a static trivia pool baked into the open-source pod_eval_vllm.py. The pool rotates 24/200 items per round but the pool is public, so a miner can pre-train answers to every entry and saturate this axis. Round 18 evidence (composite_scores.json) confirmed the attack: ``ty4321/cc`` scored capability=1.000 perfect while bombing math_bench=0.500, code_bench=0.500, aime_bench=0.000, knowledge_bench=0.500 — a textbook overfit-one-axis Goodhart signature. Several other ty4321 commitments showed the same pattern: capability ≥ 0.95 with reasoning_bench / knowledge_bench < 0.30. v19+ flips the static/procedural ratio (CAPABILITY_PROBE_N=12 down from 24, CAPABILITY_PROBE_N_PROC_MATH=24 up from 12) and broadens the procedural generator (``_procedural_capability_prompts``) beyond arithmetic to number theory, string ops (count chars / vowels), list ops (min/max/count), and comparison. All procedural items are block_seed-derived so the (operands, items) tuple is fresh every round and cannot be memorized; total per-round count stays at 36 so wall-clock cost is unchanged. Mixing v18 and v19 records would let an old static-pool memorizer keep their capability=1.0 floor while honest miners regrade against the harder mix — ranking re-grounded by the king filter. Session 3.11 — MBPP+HumanEval prose-stripping. Pre-v18 the sandbox accepted the model generation almost-verbatim: ``_strip_code_fences`` peeled markdown fences and an auto-indent path repaired bare unindented bodies, but a chatty model that wrapped a CORRECT solution in conversational prose ("Sure, here's the function:" / "Hope this helps!") tripped a SyntaxError instead of being graded on its code. Confirmed via synthetic repro on ``def is_sorted(...)`` and seen in real eval logs as IndentationError on Qwen-class HumanEval/13 outputs. That penalises coding ability on the basis of pedantic instruction-following — already measured separately in ``ifeval_bench`` — so it is a textbook Goodhart vector. v18+ adds ``_find_parseable_gen_window`` which uses ``ast.parse`` to find the largest contiguous gen line range that, concatenated to the prompt, parses cleanly. Conservative: never invents code, never re-orders lines, and the empty-prompt MBPP variant additionally requires the entry-point ``def`` to survive the trim. Mixing v17 and v18 records would let a model whose chatty wrapping was previously masked recover the earned-but-blocked passes — composite scores need to be re-grounded on a uniform sandbox. The ``_strip_code_fences`` helper was also hardened to handle paired fences with both leading and trailing prose (regex over the whole string) and to disambiguate the single-marker fallback by preferring the side that precedes the bare ``\`\`\``` marker. Session 3.10 — on_policy_rkl per-round seed rotation. Pre-v17 the student rollout-sampling seed was the constant ``ON_POLICY_RKL_SEED=42`` for every round. Combined with the prompt-pool rotation, that meant ``torch.manual_seed(42 + p_idx)`` was the SAME across rounds for every prompt position — a miner who knew the public 80-prompt pool could pre-compute their model's exact rollout (deterministic given weights + sampling seed + prompt) and surgically train weights to place teacher-high-prob tokens onto that exact sampled trajectory. That's a direct attack on the highest-weight axis (on_policy_rkl is composite-weighted higher than every benchmark axis). v17+ derives the sampling seed from ``XOR(ON_POLICY_RKL_SEED, block_seed) & 0xFFFFFFFF`` so the trajectory rotates per round (every validator agrees but per-round-rollout overfitting is impractical, requiring intra-round retraining). Mixing v16 and v17 records would let a per-round-overfitter inherit the crown via inflated on_policy_rkl. v16 robustness paraphrase, v15 prompt-injection defense, and v14 code_bench auto-indent fix carry forward unchanged.
 
+
+def active_composite_axis_weights() -> dict[str, float]:
+    """Return the axes that currently participate in worst/weighted scoring."""
+    weights = dict(AXIS_WEIGHTS)
+    if JUDGE_AXIS_IN_COMPOSITE and JUDGE_AXIS_WEIGHT > 0:
+        weights["judge_probe"] = JUDGE_AXIS_WEIGHT
+    if BENCH_AXES_IN_COMPOSITE:
+        weights.update({k: w for k, w in BENCH_AXIS_WEIGHTS.items() if w > 0})
+    if ARENA_V3_AXES_IN_COMPOSITE:
+        weights.update({k: w for k, w in ARENA_V3_AXIS_WEIGHTS.items() if w > 0})
+    if REASONING_DENSITY_IN_COMPOSITE and REASONING_DENSITY_WEIGHT > 0:
+        weights["reasoning_density"] = REASONING_DENSITY_WEIGHT
+    if CHAT_TURNS_AXIS_IN_COMPOSITE and CHAT_TURNS_AXIS_WEIGHT > 0:
+        weights["chat_turns_probe"] = CHAT_TURNS_AXIS_WEIGHT
+    return weights
+
+
+def active_composite_axes() -> set[str]:
+    """Return active nonzero weighted axes for telemetry and veto labels."""
+    return set(active_composite_axis_weights())
+
+
+def active_reasoning_density_bench_axes() -> set[str]:
+    """Return bench axes that may feed the reasoning-density aggregate."""
+    axes: set[str] = set()
+    if BENCH_AXES_IN_COMPOSITE:
+        axes.update(k for k, w in BENCH_AXIS_WEIGHTS.items() if w > 0)
+    if ARENA_V3_AXES_IN_COMPOSITE:
+        axes.update(k for k, w in ARENA_V3_AXIS_WEIGHTS.items() if w > 0)
+    return axes
+
 # ── Pareto majority dominance (Session 3 shadow) ──────────────────────
 # An extra dethrone consideration: a challenger must beat the king on a
 # majority of scorable axes, not just the single worst axis. Inspired
@@ -648,7 +679,10 @@ def _axis_reasoning_density(student: dict) -> float | None:
     changes. See composite.py REASONING_DENSITY_TARGET_TOKENS.
     """
     per_bench_scores: list[float] = []
+    active_benches = active_reasoning_density_bench_axes()
     for axis_name, target in REASONING_DENSITY_TARGET_TOKENS.items():
+        if axis_name not in active_benches:
+            continue
         payload = student.get(axis_name) or {}
         if not isinstance(payload, dict):
             continue
@@ -824,22 +858,10 @@ def resolve_teacher_broken_axes(teacher_student_row: dict | None,
     if not teacher_student_row:
         return broken
     teacher_axes = compute_axes(teacher_student_row, king_kl, king_rkl)
-    # Build the set of axes the teacher is actually being scored on this
-    # round: AXIS_WEIGHTS + (judge if promoted) + (Session 2 bench if
-    # promoted) + (Session 3 Arena v3 bench if promoted).
-    applicable = set(AXIS_WEIGHTS.keys())
-    if JUDGE_AXIS_IN_COMPOSITE:
-        applicable.add("judge_probe")
-    if BENCH_AXES_IN_COMPOSITE:
-        for k in BENCH_AXIS_WEIGHTS:
-            applicable.add(k)
-    if ARENA_V3_AXES_IN_COMPOSITE:
-        for k in ARENA_V3_AXIS_WEIGHTS:
-            applicable.add(k)
-    if REASONING_DENSITY_IN_COMPOSITE:
-        applicable.add("reasoning_density")
-    if CHAT_TURNS_AXIS_IN_COMPOSITE:
-        applicable.add("chat_turns_probe")
+    # Only active nonzero-weight axes can be broken for ranking purposes.
+    # Muted v28 telemetry axes can still appear in ``axes`` but must not
+    # affect worst/weighted decisions or teacher-broken labels.
+    applicable = active_composite_axes()
     for axis, val in teacher_axes.items():
         if axis not in applicable:
             continue
@@ -889,26 +911,9 @@ def compute_composite(student: dict, king_kl: float | None = None,
     reference-broken sets via ``broken_axes``.
     """
     axes = compute_axes(student, king_kl, king_rkl)
-    # Build effective weights. Shadow-only axes flip in when their
-    # respective gates are set (``JUDGE_AXIS_IN_COMPOSITE`` /
-    # ``BENCH_AXES_IN_COMPOSITE`` / ``ARENA_V3_AXES_IN_COMPOSITE``).
-    # Keeping this local to compute_composite so a single env flip
-    # flows to every caller without touching the weight dicts.
-    effective_weights = dict(AXIS_WEIGHTS)
-    if JUDGE_AXIS_IN_COMPOSITE:
-        effective_weights["judge_probe"] = JUDGE_AXIS_WEIGHT
-    if BENCH_AXES_IN_COMPOSITE:
-        for k, w in BENCH_AXIS_WEIGHTS.items():
-            if w > 0:
-                effective_weights[k] = w
-    if ARENA_V3_AXES_IN_COMPOSITE:
-        for k, w in ARENA_V3_AXIS_WEIGHTS.items():
-            if w > 0:
-                effective_weights[k] = w
-    if REASONING_DENSITY_IN_COMPOSITE and REASONING_DENSITY_WEIGHT > 0:
-        effective_weights["reasoning_density"] = REASONING_DENSITY_WEIGHT
-    if CHAT_TURNS_AXIS_IN_COMPOSITE and CHAT_TURNS_AXIS_WEIGHT > 0:
-        effective_weights["chat_turns_probe"] = CHAT_TURNS_AXIS_WEIGHT
+    # Build effective weights from one shared helper so ranking, teacher
+    # sanity, and telemetry labels agree on which axes are truly active.
+    effective_weights = active_composite_axis_weights()
     # ``ranked`` = axes used by ``worst()``: drops broken axes so the
     # min is not artificially floored by an axis the eval setup itself
     # can't pass (the dethrone gate degenerates to 0=0=0 otherwise).
@@ -1137,10 +1142,15 @@ def compute_king_health(
     """
     if not king_composite or king_composite.get("worst") is None:
         return None
+    active = active_composite_axes()
     king_worst = float(king_composite["worst"])
+    king_broken = set(king_composite.get("broken_axes") or [])
     king_axes = king_composite.get("axes") or {}
     king_worst_axis = min(
-        ((k, v) for k, v in king_axes.items() if v is not None),
+        (
+            (k, v) for k, v in king_axes.items()
+            if v is not None and k in active and k not in king_broken
+        ),
         key=lambda kv: kv[1],
         default=(None, None),
     )[0]
@@ -1148,9 +1158,13 @@ def compute_king_health(
     base_worst_axis: str | None = None
     if base_composite and base_composite.get("worst") is not None:
         base_worst = float(base_composite["worst"])
+        base_broken = set(base_composite.get("broken_axes") or [])
         base_axes = base_composite.get("axes") or {}
         base_worst_axis = min(
-            ((k, v) for k, v in base_axes.items() if v is not None),
+            (
+                (k, v) for k, v in base_axes.items()
+                if v is not None and k in active and k not in base_broken
+            ),
             key=lambda kv: kv[1],
             default=(None, None),
         )[0]

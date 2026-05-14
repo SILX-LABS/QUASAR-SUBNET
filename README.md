@@ -58,6 +58,15 @@ ranking:
 - Weight setting happens after evaluation by assigning the current king the full
   validator weight.
 
+## Validator Timing
+
+Validators evaluate submissions in shared chain-coordinated rounds so the
+network converges on the same winner. A valid public pinned Quasar repo may wait
+until the next round before it is scored, and dashboard or chain weights can
+briefly lag evaluation results while updates settle.
+
+Keep submitted repos public, pinned, valid, and unchanged after commit.
+
 ## Model Requirements
 
 Submissions must match the official Quasar base interface. The canonical config
