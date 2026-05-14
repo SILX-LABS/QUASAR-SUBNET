@@ -697,20 +697,28 @@ def _repo_access_failure_reason(model_repo: str, exc: Exception) -> str | None:
     """Return a hard-DQ reason for non-transient HF repo access failures."""
     err = str(exc)
     err_lower = err.lower()
-    if _is_transient_error(exc):
-        return None
+    # Access failures must be classified before the broad transient matcher.
+    # Hugging Face "Repository Not Found" exceptions can carry client/http
+    # wording that looks network-ish, but a 401/403/404/private/gated repo is
+    # consensus-stable and should not block coordinated rounds forever.
     if (
         "401" in err
+        or "403" in err
         or "404" in err
         or "repository not found" in err_lower
         or "not found" in err_lower
+        or "unauthorized" in err_lower
+        or "authentication" in err_lower
+        or "private" in err_lower
+        or "gated" in err_lower
+        or "restricted" in err_lower
     ):
         return (
             f"Model {model_repo} is not publicly accessible on HuggingFace "
             "(missing, private, or unauthorized)"
         )
-    if "403" in err or "restricted" in err_lower or "gated" in err_lower:
-        return f"Model {model_repo} is restricted/gated — must be publicly accessible"
+    if _is_transient_error(exc):
+        return None
     return f"Cannot access model repo metadata: {err}"
 
 
