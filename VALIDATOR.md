@@ -53,6 +53,10 @@ before evaluating or setting weights.
 Keep local state persistent. Only reset validator state during an announced
 rollout or explicit operator recovery.
 
+For an announced coordination reset, stop the validator, back up and clear the
+local `QUASAR_STATE_DIR`, then pull/start the updated code with the other
+validators. Do not wipe wallet keys or validator config.
+
 ### Default Network Settings
 
 ```env
