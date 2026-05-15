@@ -157,6 +157,11 @@ def latest_round():
     return read_state(H2H_LATEST_FILE, {})
 
 
+def validator_log():
+    data = read_state("validator_log.json", [])
+    return data if isinstance(data, list) else []
+
+
 def round_history():
     data = read_state(H2H_HISTORY_FILE, [])
     return data if isinstance(data, list) else []
@@ -280,6 +285,33 @@ def normalize_eval_progress(progress):
     if normalized.get("students_done") is None:
         completed = normalized.get("completed")
         normalized["students_done"] = len(completed) if isinstance(completed, list) else 0
+    phase = normalized.get("phase") or normalized.get("stage")
+    active_eval = bool(
+        normalized.get("active")
+        and phase not in {
+            "waiting_for_coordination_round_start",
+            "waiting_for_coordination_activation",
+            "coordination_no_challengers_complete",
+            "no_challengers_complete",
+        }
+    )
+    normalized.setdefault("active_eval", active_eval)
+    if "status_mode" not in normalized:
+        if active_eval:
+            normalized["status_mode"] = "evaluating"
+            normalized["status_label"] = "Evaluation running"
+        elif normalized.get("active") and phase == "waiting_for_coordination_activation":
+            normalized["status_mode"] = "activation_wait"
+            normalized["status_label"] = "Winner selected; waiting for activation"
+        elif phase == "waiting_for_coordination_round_start":
+            normalized["status_mode"] = "round_wait"
+            normalized["status_label"] = "Waiting for next coordination round"
+        elif normalized.get("active"):
+            normalized["status_mode"] = "active"
+            normalized["status_label"] = "Validator round active"
+        else:
+            normalized["status_mode"] = "idle"
+            normalized["status_label"] = "Idle between rounds"
     return normalized
 
 

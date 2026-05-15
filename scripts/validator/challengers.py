@@ -1,5 +1,8 @@
 import logging
+import json
 import os
+import time
+from pathlib import Path
 
 from eval.scoring import disqualify
 from eval.state import ValidatorState
@@ -17,6 +20,8 @@ from scripts.validator.single_eval import (
 )
 
 logger = logging.getLogger("quasar.validator")
+
+RESET_ANCHOR_FILE = "coordination_reset_anchor.json"
 
 
 # Historical maintenance-round tunables. Production Quasar single-eval
@@ -61,6 +66,64 @@ def _looks_like_reset_state(state: ValidatorState) -> bool:
     ])
 
 
+def _state_dir(state: ValidatorState) -> Path:
+    return Path(getattr(state, "state_dir", None) or "state")
+
+
+def _reset_anchor_path(state: ValidatorState) -> Path:
+    return _state_dir(state) / RESET_ANCHOR_FILE
+
+
+def _read_reset_anchor(state: ValidatorState) -> dict:
+    path = _reset_anchor_path(state)
+    try:
+        with path.open() as handle:
+            data = json.load(handle)
+        return data if isinstance(data, dict) else {}
+    except FileNotFoundError:
+        return {}
+    except Exception as exc:
+        logger.warning("coordination reset anchor: could not read %s: %s", path, exc)
+        return {}
+
+
+def _write_reset_anchor(state: ValidatorState, data: dict) -> None:
+    path = _reset_anchor_path(state)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        with tmp.open("w") as handle:
+            json.dump(data, handle, indent=2, sort_keys=True)
+        tmp.replace(path)
+    except Exception as exc:
+        logger.warning("coordination reset anchor: could not write %s: %s", path, exc)
+
+
+def _manual_reset_anchor_requested(state: ValidatorState, coord_round) -> bool:
+    data = _read_reset_anchor(state)
+    if not data.get("pending"):
+        return False
+    try:
+        consumed_round = int(data.get("consumed_round_id"))
+    except (TypeError, ValueError):
+        consumed_round = None
+    return consumed_round != getattr(coord_round, "round_id", None)
+
+
+def _consume_manual_reset_anchor(state: ValidatorState, coord_round, scheduled) -> None:
+    data = _read_reset_anchor(state)
+    if not data.get("pending"):
+        return
+    data.update({
+        "pending": False,
+        "consumed_at": time.time(),
+        "consumed_round_id": getattr(coord_round, "round_id", None),
+        "consumed_round_start_block": getattr(coord_round, "round_start_block", None),
+        "scheduled_uids": list(scheduled or []),
+    })
+    _write_reset_anchor(state, data)
+
+
 def select_challengers(valid_models, state: ValidatorState, king_uid, king_kl,
                        epoch_count: int, trust_king_kl: bool = True,
                        coord_round=None):
@@ -102,10 +165,13 @@ def select_challengers(valid_models, state: ValidatorState, king_uid, king_kl,
                     )
         cap = int(single_eval_mod.SINGLE_EVAL_MAX_PER_ROUND)
         if coord_round is not None:
-            if _looks_like_reset_state(state):
+            manual_reset_anchor = _manual_reset_anchor_requested(state, coord_round)
+            if _looks_like_reset_state(state) or manual_reset_anchor:
                 scheduled = reset_anchor_challenger_uids(
                     valid_models, cap, king_uid=king_uid,
                 )
+                if manual_reset_anchor:
+                    _consume_manual_reset_anchor(state, coord_round, scheduled)
                 logger.info(
                     f"single-eval: coordination reset anchor scheduled "
                     f"{len(scheduled)} challenger(s): {scheduled}"

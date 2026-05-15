@@ -35,6 +35,7 @@ app = FastAPI(
         {"name": "Market", "description": "Token pricing, emission, and market data"},
         {"name": "Chat", "description": "Chat with the current king model (when GPU is available)"},
         {"name": "Telemetry", "description": "Dashboard telemetry — composite axes, DQs, validator events, pod health"},
+        {"name": "Dashboard", "description": "Compact UI payloads with chain-weight consensus, eval state, submissions, and validators"},
     ],
 )
 

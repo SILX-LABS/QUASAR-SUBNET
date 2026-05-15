@@ -107,6 +107,7 @@ body {
 .scroll-box::-webkit-scrollbar { width: 4px; }
 .scroll-box::-webkit-scrollbar-thumb { background: var(--ink); }
 .scroll-queue { max-height: 200px; }
+.scroll-events { max-height: 160px; }
 
 .scroll-hist { max-height: 60vh; }
 
@@ -143,6 +144,10 @@ tr:hover td {
 }
 tr:hover td a { color: var(--ink-inv) !important; }
 th:last-child, td:last-child { text-align: right; }
+.scroll-events th:last-child, .scroll-events td:last-child {
+    text-align: left;
+    white-space: normal;
+}
 
 [data-theme="dark"] .logo-img { filter: invert(1); }
 
@@ -212,6 +217,7 @@ th:last-child, td:last-child { text-align: right; }
     .scroll-hist table,
 
     .scroll-queue table { table-layout: auto; min-width: 500px; }
+    .scroll-events table { table-layout: auto; min-width: 520px; }
     .scroll-hist table { min-width: 700px; }
     .scroll-hist th:nth-child(6),
     .scroll-hist td:nth-child(6),
@@ -256,7 +262,7 @@ th:last-child, td:last-child { text-align: right; }
     </div>
 
     <div id="duel-section" class="duel-idle">
-        <div class="section-label" id="duel-label">Idle</div>
+        <div class="section-label" id="duel-label">Status</div>
         <div class="duel-bar-wrap"><div class="duel-bar" id="duel-bar" style="width:0%"></div></div>
         <div class="duel-info"><span id="duel-progress">--</span><span id="duel-wr">--</span></div>
     </div>
@@ -266,10 +272,18 @@ th:last-child, td:last-child { text-align: right; }
         <div id="last-winner" style="font-size:12px;line-height:1.8;min-height:48px;display:flex;flex-wrap:wrap;gap:0 16px;">--</div>
     </div>
 
-
+    <div>
+        <div class="section-label">Validator Events</div>
+        <div class="scroll-box scroll-events">
+            <table>
+                <thead><tr><th>When</th><th>Level</th><th>Event</th></tr></thead>
+                <tbody id="events"></tbody>
+            </table>
+        </div>
+    </div>
 
     <div>
-        <div class="section-label">Queue</div>
+        <div class="section-label">Submissions</div>
         <div class="scroll-box scroll-queue">
             <table>
                 <thead><tr><th>UID</th><th>Repo</th><th>Hotkey</th><th>Block</th><th>Status</th></tr></thead>
@@ -308,7 +322,8 @@ function short(s, n) { return s ? s.slice(0, n || 12) + "\u2026" : "--"; }
 
 function timeAgo(iso) {
     if (!iso) return "--";
-    var sec = Math.floor((Date.now() - new Date(iso).getTime()) / 1000);
+    var t = typeof iso === "number" ? iso * 1000 : new Date(iso).getTime();
+    var sec = Math.floor((Date.now() - t) / 1000);
     if (sec < 0) sec = 0;
     if (sec < 60) return sec + "s ago";
     var min = Math.floor(sec / 60);
@@ -488,6 +503,7 @@ function render(d) {
     renderChart(d);
 
     var ev = d.current_eval;
+    var status = d.status || {};
     var duelSec = document.getElementById("duel-section");
     var duelLabel = document.getElementById("duel-label");
     var duelBar = document.getElementById("duel-bar");
@@ -502,20 +518,15 @@ function render(d) {
         duelProgress.textContent = ev.loading ? "Loading model \u2026" : ev.progress + " / " + ev.total + "  (" + pct + "%)";
         duelWr.textContent = ev.loading ? "--" : "MU: " + Number(ev.mu_hat || 0).toFixed(6);
     } else {
-        var q = d.queue || [];
-        if (q.length > 0) {
-            duelSec.classList.remove("duel-idle");
-            duelLabel.innerHTML = repoLink(q[0].hf_repo);
-            duelBar.style.width = "0%";
-            duelProgress.textContent = "Loading model \u2026";
-            duelWr.textContent = "--";
-        } else {
-            duelSec.classList.add("duel-idle");
-            duelLabel.textContent = "Idle";
-            duelBar.style.width = "0%";
-            duelProgress.textContent = "--";
-            duelWr.textContent = "--";
-        }
+        duelSec.classList.add("duel-idle");
+        duelLabel.textContent = status.label || "Idle";
+        duelBar.style.width = "0%";
+        var detail = status.detail || "No model eval is running.";
+        if (status.activation_block) detail += " Activation #" + status.activation_block + ".";
+        else if (status.next_round_start_block) detail += " Next round #" + status.next_round_start_block + ".";
+        if (status.blocks_remaining != null) detail += " " + status.blocks_remaining + " blocks remaining.";
+        duelProgress.textContent = detail;
+        duelWr.textContent = status.winner_uid != null ? "WINNER UID: " + status.winner_uid : (status.mode || "--");
     }
 
     var lwEl = document.getElementById("last-winner");
@@ -538,9 +549,17 @@ function render(d) {
     var qEl = document.getElementById("queue");
     var q = d.queue || [];
     qEl.innerHTML = q.length === 0
-        ? '<tr><td colspan="5" style="text-align:center;padding:16px">Queue empty</td></tr>'
+        ? '<tr><td colspan="5" style="text-align:center;padding:16px">No submissions visible</td></tr>'
         : q.map(function(e) {
-            return '<tr><td>' + (e.uid != null ? e.uid : "--") + '</td><td>' + repoLink(e.hf_repo) + '</td><td>' + hotkeyLink(e.hotkey) + '</td><td>' + (e.block ? '#' + e.block : '--') + '</td><td>' + (e.reeval ? 'SEEN' : 'UNSEEN') + '</td></tr>';
+            return '<tr title="' + esc(e.status_detail || "") + '"><td>' + (e.uid != null ? e.uid : "--") + '</td><td>' + repoLink(e.hf_repo) + '</td><td>' + hotkeyLink(e.hotkey) + '</td><td>' + (e.block ? '#' + e.block : '--') + '</td><td>' + esc(e.status_label || (e.reeval ? 'SEEN' : 'PENDING')) + '</td></tr>';
+        }).join("");
+
+    var evEl = document.getElementById("events");
+    var events = d.events || [];
+    evEl.innerHTML = events.length === 0
+        ? '<tr><td colspan="3" style="text-align:center;padding:12px">No validator events yet</td></tr>'
+        : events.slice(0, 40).map(function(e) {
+            return '<tr><td title="' + esc(e.ts || "") + '">' + timeAgo(e.ts) + '</td><td>' + esc((e.level || "info").toUpperCase()) + '</td><td>' + esc(e.msg || e.message || "") + '</td></tr>';
         }).join("");
 
     var hb = document.getElementById("hist");

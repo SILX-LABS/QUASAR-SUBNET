@@ -707,6 +707,28 @@ def get_dashboard():
         eval_age_min = None
         if latest.get("timestamp"):
             eval_age_min = round((time.time() - latest["timestamp"]) / 60, 1)
+        phase = prog.get("phase") or prog.get("stage")
+        active_eval = bool(
+            prog.get("active")
+            and phase not in (
+                "waiting_for_coordination_round_start",
+                "waiting_for_coordination_activation",
+                "coordination_no_challengers_complete",
+                "no_challengers_complete",
+            )
+        )
+        if active_eval:
+            status_label = "Evaluation running"
+            status_mode = "evaluating"
+        elif prog.get("active") and phase == "waiting_for_coordination_activation":
+            status_label = "Winner selected; waiting for activation"
+            status_mode = "activation_wait"
+        elif phase == "waiting_for_coordination_round_start":
+            status_label = "Waiting for next coordination round"
+            status_mode = "round_wait"
+        else:
+            status_label = "Idle between rounds"
+            status_mode = "idle"
 
         snapshot = {
             "king": {
@@ -719,6 +741,15 @@ def get_dashboard():
             "eval": {
                 "active": prog.get("active", False),
                 "phase": prog.get("phase"),
+                "stage": prog.get("stage"),
+                "active_eval": active_eval,
+                "status_mode": status_mode,
+                "status_label": status_label,
+                "winner_uid": prog.get("winner_uid"),
+                "activation_block": prog.get("activation_block"),
+                "next_round_start_block": prog.get("next_round_start_block"),
+                "current_block": prog.get("current_block"),
+                "blocks_remaining": prog.get("blocks_remaining"),
                 "students_done": prog.get("students_done"),
                 "students_total": prog.get("students_total"),
                 "prompts_total": prog.get("prompts_total"),
@@ -741,6 +772,7 @@ def get_dashboard():
                 "n_scored": len(scores_data),
                 "n_disqualified": len(dq),
                 "active_round": bool(prog.get("active")),
+                "active_eval": active_eval,
             },
         }
         return JSONResponse(
