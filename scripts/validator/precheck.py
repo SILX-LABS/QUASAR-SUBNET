@@ -4,11 +4,11 @@ import math
 import time
 
 from eval.model_checker import (
-    check_duplicate_content_hash,
-    check_duplicate_hash,
     check_model_architecture,
     compute_content_hash,
     compute_model_hash,
+    duplicate_content_hash_uids,
+    duplicate_hash_uids,
     register_content_hash,
     register_model_hash,
     verify_model_integrity,
@@ -27,6 +27,54 @@ from scripts.validator.config import ACTIVATION_COPY_THRESHOLD, MAX_KL_THRESHOLD
 from scripts.validator.single_eval import is_single_eval_mode
 
 logger = logging.getLogger("quasar.validator")
+
+
+def _commit_sort_key(uid: int, commitments: dict) -> tuple[float, int]:
+    block = commitments.get(uid, {}).get("block")
+    if block is None:
+        block = float("inf")
+    return (block, uid)
+
+
+def _canonical_duplicate_uid(uid: int, duplicate_uids: list[int], commitments: dict) -> int:
+    candidates = {uid}
+    candidates.update(other_uid for other_uid in duplicate_uids if other_uid in commitments)
+    return min(candidates, key=lambda candidate_uid: _commit_sort_key(candidate_uid, commitments))
+
+
+def _dq_later_duplicate(
+    duplicate_uid: int,
+    canonical_uid: int,
+    relation: str,
+    model_repo: str,
+    commitments: dict,
+    uid_to_hotkey: dict,
+    state: ValidatorState,
+    valid_models: dict,
+    disqualified: set,
+):
+    duplicate_commit = commitments.get(duplicate_uid, {})
+    canonical_commit = commitments.get(canonical_uid, {})
+    duplicate_hotkey = uid_to_hotkey.get(duplicate_uid, str(duplicate_uid))
+    duplicate_block = duplicate_commit.get("block")
+    canonical_block = canonical_commit.get("block")
+    canonical_model = canonical_commit.get("model", model_repo)
+    logger.info(
+        f"UID {duplicate_uid} ({duplicate_commit.get('model', '?')}): "
+        f"{relation.upper()} of UID {canonical_uid}"
+    )
+    state.scores[str(duplicate_uid)] = MAX_KL_THRESHOLD + 1
+    disqualify(
+        duplicate_hotkey,
+        (
+            f"copy: {relation} as UID {canonical_uid} ({canonical_model}), "
+            f"committed later at block {duplicate_block} vs {canonical_block}"
+        ),
+        state.dq_reasons,
+        commit_block=duplicate_block,
+    )
+    valid_models.pop(duplicate_uid, None)
+    disqualified.add(duplicate_uid)
 
 
 def _cosine_sim(a: list, b: list) -> float:
@@ -306,37 +354,21 @@ def precheck_all_models(commitments, uid_to_hotkey, uid_to_coldkey, state: Valid
             precheck_errors[uid] = reason
             continue
         if model_hash:
-            original_uid = check_duplicate_hash(model_hash, uid, state.state_dir)
-            if original_uid is not None:
-                orig_block = commitments.get(original_uid, {}).get("block", float("inf"))
-                this_block = commit.get("block", float("inf"))
-                if this_block >= orig_block:
-                    orig_model = commitments.get(original_uid, {}).get("model", "?")
-                    logger.info(f"UID {uid} ({model_repo}): DUPLICATE of UID {original_uid}")
-                    state.scores[str(uid)] = MAX_KL_THRESHOLD + 1
-                    disqualify(
-                        hotkey,
-                        f"copy: identical weights to UID {original_uid} ({orig_model}), committed later at block {this_block} vs {orig_block}",
-                        state.dq_reasons,
-                        commit_block=this_commit_block,
-                    )
-                    disqualified.add(uid)
-                    continue
-                logger.info(f"UID {original_uid} is duplicate of UID {uid} (committed earlier)")
-                state.scores[str(original_uid)] = MAX_KL_THRESHOLD + 1
-                orig_hotkey = uid_to_hotkey.get(original_uid, str(original_uid))
-                orig_commit_block = commitments.get(original_uid, {}).get("block")
-                disqualify(
-                    orig_hotkey,
-                    f"copy: identical weights to UID {uid} ({model_repo}), committed later",
-                    state.dq_reasons,
-                    commit_block=orig_commit_block,
+            duplicate_uids = duplicate_hash_uids(model_hash, uid, state.state_dir)
+            canonical_uid = _canonical_duplicate_uid(uid, duplicate_uids, commitments)
+            if canonical_uid != uid:
+                _dq_later_duplicate(
+                    uid, canonical_uid, "identical weights", model_repo,
+                    commitments, uid_to_hotkey, state, valid_models, disqualified,
                 )
-                valid_models.pop(original_uid, None)
-                disqualified.add(original_uid)
-                register_model_hash(model_hash, uid, state.state_dir)
-            else:
-                register_model_hash(model_hash, uid, state.state_dir)
+                continue
+            for duplicate_uid in duplicate_uids:
+                if duplicate_uid in commitments and duplicate_uid != uid:
+                    _dq_later_duplicate(
+                        duplicate_uid, uid, "identical weights", model_repo,
+                        commitments, uid_to_hotkey, state, valid_models, disqualified,
+                    )
+            register_model_hash(model_hash, uid, state.state_dir)
         # Shard-invariant content hash — catches re-sharded copies that slip
         # past compute_model_hash (aizaysi's wind77/third ↔ pure-iron-6291 case).
         content_hash = compute_content_hash(model_repo, revision)
@@ -346,37 +378,21 @@ def precheck_all_models(commitments, uid_to_hotkey, uid_to_coldkey, state: Valid
             precheck_errors[uid] = reason
             continue
         if content_hash:
-            dup_uid = check_duplicate_content_hash(content_hash, uid, state.state_dir)
-            if dup_uid is not None:
-                orig_block = commitments.get(dup_uid, {}).get("block", float("inf"))
-                this_block = commit.get("block", float("inf"))
-                if this_block >= orig_block:
-                    orig_model = commitments.get(dup_uid, {}).get("model", "?")
-                    logger.info(f"UID {uid} ({model_repo}): CONTENT-DUPLICATE of UID {dup_uid}")
-                    state.scores[str(uid)] = MAX_KL_THRESHOLD + 1
-                    disqualify(
-                        hotkey,
-                        f"copy: identical tensor content as UID {dup_uid} ({orig_model}) (re-sharded), committed later at block {this_block} vs {orig_block}",
-                        state.dq_reasons,
-                        commit_block=this_commit_block,
-                    )
-                    disqualified.add(uid)
-                    continue
-                orig_hotkey = uid_to_hotkey.get(dup_uid, str(dup_uid))
-                orig_commit_block = commitments.get(dup_uid, {}).get("block")
-                logger.info(f"UID {dup_uid} is content-duplicate of UID {uid} (committed earlier)")
-                state.scores[str(dup_uid)] = MAX_KL_THRESHOLD + 1
-                disqualify(
-                    orig_hotkey,
-                    f"copy: identical tensor content as UID {uid} ({model_repo}) (re-sharded), committed later",
-                    state.dq_reasons,
-                    commit_block=orig_commit_block,
+            duplicate_uids = duplicate_content_hash_uids(content_hash, uid, state.state_dir)
+            canonical_uid = _canonical_duplicate_uid(uid, duplicate_uids, commitments)
+            if canonical_uid != uid:
+                _dq_later_duplicate(
+                    uid, canonical_uid, "identical tensor content", model_repo,
+                    commitments, uid_to_hotkey, state, valid_models, disqualified,
                 )
-                valid_models.pop(dup_uid, None)
-                disqualified.add(dup_uid)
-                register_content_hash(content_hash, uid, state.state_dir)
-            else:
-                register_content_hash(content_hash, uid, state.state_dir)
+                continue
+            for duplicate_uid in duplicate_uids:
+                if duplicate_uid in commitments and duplicate_uid != uid:
+                    _dq_later_duplicate(
+                        duplicate_uid, uid, "identical tensor content", model_repo,
+                        commitments, uid_to_hotkey, state, valid_models, disqualified,
+                    )
+            register_content_hash(content_hash, uid, state.state_dir)
         expected_hash = state.model_hashes.get(str(uid))
         stored_commit_block = state.model_hashes.get(f"{uid}_block")
         stored_hotkey = state.model_hashes.get(f"{uid}_hotkey")

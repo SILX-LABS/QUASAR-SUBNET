@@ -279,19 +279,34 @@ def check_duplicate_hash(
     can't overwrite the weight hash with an integrity hash and silently
     break dedup (aizaysi root-caused this via wind77/third ↔ curli12/third).
     """
+    matches = duplicate_hash_uids(model_hash, miner_uid, state_dir)
+    return matches[0] if matches else None
+
+
+def duplicate_hash_uids(
+    model_hash: str, miner_uid: int, state_dir: Path = STATE_DIR,
+) -> list[int]:
+    """Return all other UIDs with the same shard-level weight hash."""
     hash_file = state_dir / "weight_hashes.json"
     legacy_file = state_dir / "model_hashes.json"
+    matches: list[int] = []
+    seen: set[int] = set()
     for f in (hash_file, legacy_file):
         if not f.exists():
             continue
         try:
             hashes = json.loads(f.read_text())
             for uid_str, stored_hash in hashes.items():
-                if stored_hash == model_hash and int(uid_str) != miner_uid:
-                    return int(uid_str)
+                try:
+                    uid = int(uid_str)
+                except (TypeError, ValueError):
+                    continue
+                if stored_hash == model_hash and uid != miner_uid and uid not in seen:
+                    matches.append(uid)
+                    seen.add(uid)
         except Exception:
             continue
-    return None
+    return matches
 
 
 def register_model_hash(
@@ -314,17 +329,31 @@ def check_duplicate_content_hash(
     content_hash: str, miner_uid: int, state_dir: Path = STATE_DIR,
 ) -> Optional[int]:
     """Find another UID with the same content (re-shard-invariant) hash."""
+    matches = duplicate_content_hash_uids(content_hash, miner_uid, state_dir)
+    return matches[0] if matches else None
+
+
+def duplicate_content_hash_uids(
+    content_hash: str, miner_uid: int, state_dir: Path = STATE_DIR,
+) -> list[int]:
+    """Return all other UIDs with the same content (re-shard-invariant) hash."""
     f = state_dir / "model_content_hashes.json"
     if not f.exists():
-        return None
+        return []
     try:
         hashes = json.loads(f.read_text())
+        matches = []
         for uid_str, stored_hash in hashes.items():
-            if stored_hash == content_hash and int(uid_str) != miner_uid:
-                return int(uid_str)
+            try:
+                uid = int(uid_str)
+            except (TypeError, ValueError):
+                continue
+            if stored_hash == content_hash and uid != miner_uid:
+                matches.append(uid)
+        return matches
     except Exception:
         pass
-    return None
+    return []
 
 
 def register_content_hash(
