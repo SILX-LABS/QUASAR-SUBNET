@@ -70,6 +70,12 @@ from scripts.validator.state_manager import (
     update_model_tracking,
     update_top4_leaderboard,
 )
+from scripts.validator.telemetry import (
+    finish_wandb_telemetry,
+    init_wandb_telemetry,
+    telemetry_event,
+    telemetry_log,
+)
 
 logger = logging.getLogger("quasar.validator")
 
@@ -236,11 +242,28 @@ def _resolve_coordinated_king(
 def _safe_set_weights(subtensor, wallet, netuid, n_uids, weights, winner_uid, state_dir):
     """Call set_weights and surface SetWeightsError as a log_event so the epoch
     loop can sleep + retry instead of silently leaving stale weights."""
+    telemetry_log({
+        "stage": "set_weights_start",
+        "winner_uid": winner_uid,
+    })
     try:
-        return bool(set_weights(subtensor, wallet, netuid, n_uids, weights, winner_uid))
+        ok = bool(set_weights(subtensor, wallet, netuid, n_uids, weights, winner_uid))
+        telemetry_log({
+            "stage": "set_weights_complete",
+            "winner_uid": winner_uid,
+            "weights_set": ok,
+        })
+        return ok
     except SetWeightsError as exc:
         logger.error(f"set_weights failed: {exc}")
         log_event(f"set_weights failed: {str(exc)[:200]}", level="error", state_dir=state_dir)
+        telemetry_event(
+            str(exc)[:200],
+            level="error",
+            stage="set_weights_failed",
+            winner_uid=winner_uid,
+            weights_set=False,
+        )
         return False
 
 
@@ -683,7 +706,10 @@ def ensure_clean_state(state, state_dir):
     )
     if state.eval_progress.get("active"):
         age_min = (time.time() - state.eval_progress.get("started_at", 0)) / 60
-        stale_limit = 180 if has_pod_eval else 30
+        waiting_for_activation = (
+            state.eval_progress.get("phase") == "waiting_for_coordination_activation"
+        )
+        stale_limit = 180 if (has_pod_eval or waiting_for_activation) else 30
         if age_min > stale_limit:
             logger.warning(
                 f"STALE ROUND: active for {age_min:.0f}m (limit={stale_limit}m, "
@@ -732,6 +758,14 @@ def run_precheck(commitments, uid_to_hotkey, uid_to_coldkey, state,
         f"{n_error} error",
         state_dir=state_dir,
     )
+    telemetry_log({
+        "stage": "precheck_complete",
+        "precheck/total": n_total,
+        "precheck/valid": n_valid,
+        "precheck/dq": n_dq,
+        "precheck/errors": n_error,
+        "precheck/error_uids": sorted(precheck_errors),
+    })
     if precheck_errors:
         logger.warning("Precheck incomplete for UIDs: %s", sorted(precheck_errors))
         log_event(
@@ -762,6 +796,12 @@ def plan_round(valid_models, state, king_uid, king_kl, epoch_count,
         f"select_challengers returned {len(challengers)} (P1/P3), king={king_uid}",
         state_dir=state_dir,
     )
+    telemetry_log({
+        "stage": "challengers_selected",
+        "king_uid": king_uid,
+        "challengers/count": len(challengers),
+        "challengers/uids": sorted(challengers),
+    })
     if coord_round is None:
         add_top5_contenders(challengers, valid_models, state, king_uid)
         # Rotate in ~N dormant high-scorers per round
@@ -1021,6 +1061,15 @@ def post_round(
     )
     state.clear_round()
     state.save_progress({"active": False})
+    telemetry_log({
+        "stage": "round_complete",
+        "winner_uid": winner_uid,
+        "prior_king_uid": king_uid,
+        "king_changed": bool(winner_uid is not None and winner_uid != king_uid),
+        "round/block": current_block,
+        "round/prompts": n_prompts,
+        "round/results": len(h2h_results or []),
+    })
     try:
         pod.post_eval_cleanup(TEACHER_MODEL)
         pod.resume_background_tasks()
@@ -1080,6 +1129,15 @@ def run_validator(network, netuid, wallet_name, hotkey_name, wallet_path,
     state = ValidatorState(state_dir)
     state.load()
     wallet = bt.Wallet(name=wallet_name, hotkey=hotkey_name, path=wallet_path)
+    init_wandb_telemetry(
+        network=network,
+        netuid=netuid,
+        wallet_name=wallet_name,
+        hotkey_name=hotkey_name,
+        hotkey_ss58=getattr(wallet.hotkey, "ss58_address", None),
+        eval_backend=eval_backend,
+        state_dir=state_dir,
+    )
     subtensor = bt.Subtensor(network=network)
     eval_script = "scripts/pod_eval_vllm.py"
     if eval_backend == "lium":
@@ -1112,6 +1170,10 @@ def run_validator(network, netuid, wallet_name, hotkey_name, wallet_path,
             print(f"\n[validator] === EPOCH {epoch_count} ===", flush=True)
             logger.info(f"=== EPOCH {epoch_count} ===")
             log_event(f"Starting epoch {epoch_count}", state_dir=state_dir)
+            telemetry_log({
+                "stage": "epoch_start",
+                "epoch": epoch_count,
+            })
 
             ensure_clean_state(state, state_dir)
 
@@ -1153,11 +1215,24 @@ def run_validator(network, netuid, wallet_name, hotkey_name, wallet_path,
             print("[validator] Fetching chain state...", flush=True)
             try:
                 metagraph, current_block, current_block_hash, n_uids, revealed = fetch_chain(subtensor, netuid)
+                telemetry_log({
+                    "stage": "chain_state",
+                    "epoch": epoch_count,
+                    "chain/block": current_block,
+                    "chain/n_uids": n_uids,
+                    "chain/revealed": len(revealed),
+                })
             except Exception as exc:
                 logger.error(f"Chain unreachable: {exc}, sleeping 5min")
                 log_event(
                     f"Chain unreachable: {str(exc)[:150]}, retrying in 5min",
                     level="error", state_dir=state_dir,
+                )
+                telemetry_event(
+                    str(exc)[:150],
+                    level="error",
+                    stage="chain_unreachable",
+                    epoch=epoch_count,
                 )
                 time.sleep(300)
                 continue
@@ -1274,6 +1349,13 @@ def run_validator(network, netuid, wallet_name, hotkey_name, wallet_path,
                     continue
             else:
                 king_uid, king_kl, king_source = _resolve_king(valid_models, state)
+            telemetry_log({
+                "stage": "king_resolved",
+                "epoch": epoch_count,
+                "king_uid": king_uid,
+                "king_source": king_source,
+                "king_kl": king_kl if king_kl != float("inf") else None,
+            })
             validator_uid = next(
                 (uid for uid, hk in uid_to_hotkey.items() if hk == wallet.hotkey.ss58_address), None,
             )
@@ -1296,18 +1378,45 @@ def run_validator(network, netuid, wallet_name, hotkey_name, wallet_path,
             )
             if n_challengers_in_eval == 0:
                 logger.info(f"No challengers at all — king UID {king_uid} holds")
-                wait_until_activation_block(
+                telemetry_log({
+                    "stage": "no_challengers",
+                    "epoch": epoch_count,
+                    "king_uid": king_uid,
+                    "coordination/activation_block": (
+                        coord_round.activation_block if coord_round is not None else None
+                    ),
+                })
+                activation_seen = wait_until_activation_block(
                     subtensor,
                     coord_round.activation_block if coord_round is not None else None,
                     state,
                     state_dir,
                     winner_uid=king_uid,
                 )
+                weights_set = False
                 if king_uid is not None:
-                    _safe_set_weights(
+                    weights_set = _safe_set_weights(
                         subtensor, wallet, netuid, n_uids,
                         build_winner_take_all_weights(n_uids, king_uid), king_uid, state_dir,
                     )
+                state.save_progress({
+                    "active": False,
+                    "stage": "coordination_no_challengers_complete"
+                    if coord_round is not None else "no_challengers_complete",
+                    "winner_uid": king_uid,
+                    "weights_set": weights_set,
+                    "activation_block": (
+                        coord_round.activation_block if coord_round is not None else None
+                    ),
+                    "activation_seen_block": activation_seen,
+                    "updated_at": time.time(),
+                })
+                telemetry_log({
+                    "stage": "no_challengers_complete",
+                    "winner_uid": king_uid,
+                    "weights_set": weights_set,
+                    "coordination/activation_seen_block": activation_seen,
+                })
                 state.save()
                 if once:
                     break
@@ -1427,6 +1536,12 @@ def run_validator(network, netuid, wallet_name, hotkey_name, wallet_path,
                     "Eval failed to produce usable results; cleared round state and will retry next epoch",
                     level="warning", state_dir=state_dir,
                 )
+                telemetry_event(
+                    "Eval did not produce usable results",
+                    level="warning",
+                    stage="eval_failed",
+                    epoch=epoch_count,
+                )
                 state.clear_round()
                 state.save_progress({"active": False, "failed": True, "failed_at": time.time()})
                 try:
@@ -1453,6 +1568,15 @@ def run_validator(network, netuid, wallet_name, hotkey_name, wallet_path,
                     ),
                 )
             )
+            telemetry_log({
+                "stage": "eval_results_applied",
+                "epoch": epoch_count,
+                "winner_uid": winner_uid,
+                "winner_kl": winner_kl,
+                "prior_king_uid": king_uid,
+                "weights_set": weights_set,
+                "round/results": len(h2h_results or []),
+            })
 
             post_round(
                 state, pod, winner_uid, winner_kl, king_uid, king_kl, king_h2h_kl,
@@ -1487,10 +1611,17 @@ def run_validator(network, netuid, wallet_name, hotkey_name, wallet_path,
         except KeyboardInterrupt:
             logger.info("Shutting down")
             state.save()
+            finish_wandb_telemetry()
             break
         except Exception as exc:
             logger.error(f"EPOCH ERROR: {exc}")
             log_event(f"Epoch error: {str(exc)[:200]}", level="error", state_dir=state_dir)
+            telemetry_event(
+                str(exc)[:200],
+                level="error",
+                stage="epoch_error",
+                epoch=epoch_count,
+            )
             import traceback
 
             traceback.print_exc()

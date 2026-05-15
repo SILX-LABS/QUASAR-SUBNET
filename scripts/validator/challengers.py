@@ -52,9 +52,11 @@ def _looks_like_reset_state(state: ValidatorState) -> bool:
     # planning and may write DQ/failure telemetry into scores during the first
     # post-reset epoch. That telemetry must not cancel the reset anchor before
     # it has a chance to seat the frozen backlog once.
+    #
+    # Same for evaluated_uids: precheck/DQ bookkeeping can repopulate it before
+    # challenger planning, but that is not a real historical ranking state.
     return not any([
         getattr(state, "composite_scores", None),
-        getattr(state, "evaluated_uids", None),
         getattr(state, "h2h_latest", None),
     ])
 

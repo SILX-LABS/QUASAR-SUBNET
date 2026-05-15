@@ -21,6 +21,7 @@ import time
 from typing import Any
 
 from eval.state import log_event
+from scripts.validator.telemetry import telemetry_log
 
 logger = logging.getLogger("quasar.validator")
 
@@ -262,6 +263,13 @@ def wait_for_round_start(subtensor: Any, state, state_dir: str) -> int | None:
             current,
             remaining,
         )
+        telemetry_log({
+            "stage": "waiting_for_coordination_round_start",
+            "coordination/current_block": current,
+            "coordination/next_round_start_block": target,
+            "coordination/blocks_remaining": remaining,
+            "coordination/round_id": coord_round.round_id,
+        })
         log_event(
             f"waiting for coordination round start block {target} "
             f"({remaining} blocks remaining)",
@@ -397,6 +405,18 @@ def log_round_manifest(
         if len(deferred_uids) > 20:
             msg += f"+{len(deferred_uids) - 20}"
     logger.info(msg)
+    telemetry_log({
+        "stage": "coordination_round_manifest",
+        "coordination/round_id": coord_round.round_id,
+        "coordination/round_start_block": coord_round.round_start_block,
+        "coordination/seed_block": coord_round.eval_seed_block,
+        "coordination/cutoff_block": coord_round.commit_cutoff_block,
+        "coordination/activation_block": coord_round.activation_block,
+        "coordination/total_commitments": total_commitments,
+        "coordination/frozen_commitments": frozen_commitments,
+        "coordination/deferred_count": len(deferred_uids),
+        "coordination/deferred_uids": deferred_uids[:20],
+    })
     log_event(msg, state_dir=state_dir)
 
 
@@ -430,6 +450,22 @@ def wait_until_activation_block(
             time.sleep(wait_poll_seconds())
             continue
         if current >= activation_block:
+            logger.info(
+                "coordination: activation block %s reached at block %s",
+                activation_block,
+                current,
+            )
+            telemetry_log({
+                "stage": "coordination_activation_reached",
+                "winner_uid": winner_uid,
+                "coordination/current_block": current,
+                "coordination/activation_block": activation_block,
+            })
+            log_event(
+                f"coordination activation block {activation_block} reached "
+                f"(current block {current})",
+                state_dir=state_dir,
+            )
             return current
         remaining = activation_block - current
         subject = f"winner UID {winner_uid}" if winner_uid is not None else "round result"
@@ -441,6 +477,13 @@ def wait_until_activation_block(
             remaining,
             activation_block,
         )
+        telemetry_log({
+            "stage": "waiting_for_coordination_activation",
+            "winner_uid": winner_uid,
+            "coordination/current_block": current,
+            "coordination/activation_block": activation_block,
+            "coordination/blocks_remaining": remaining,
+        })
         log_event(
             f"{subject} ready; waiting for activation block "
             f"{activation_block} ({remaining} blocks remaining)",

@@ -3,3 +3,4 @@
 boto3
 lium.io==0.0.8
 bittensor-cli==9.13.1
+wandb>=0.17.0

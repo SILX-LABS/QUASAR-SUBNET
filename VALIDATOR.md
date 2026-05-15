@@ -83,6 +83,23 @@ LIUM_API_KEY=...
 QUASAR_LIUM_POD_NAME=quasar-eval
 ```
 
+### W&B Telemetry (Optional)
+
+Validators can stream operational status to a shared Weights & Biases project.
+Use one key per validator or a limited service-account key; do not share a
+personal API key in public chat or commit it to the repo.
+
+```env
+WANDB_ENABLED=1
+WANDB_PROJECT=sn24-validator
+WANDB_ENTITY=<team-or-user>
+VALIDATOR_NAME=<operator-or-validator-name>
+WANDB_API_KEY=<secret-from-wandb>
+```
+
+Each validator should use a distinct `VALIDATOR_NAME` so runs are easy to
+separate in the W&B dashboard.
+
 ---
 
 ## Running
