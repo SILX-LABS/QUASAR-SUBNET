@@ -514,9 +514,11 @@ function render(d) {
         var pct = ev.total > 0 ? Math.round((ev.progress / ev.total) * 100) : 0;
         var duelName = ev.challenger_repo || short(ev.hotkey, 12);
         duelLabel.innerHTML = ev.challenger_repo ? repoLink(ev.challenger_repo) : esc(duelName);
-        duelBar.style.width = (ev.loading ? 0 : pct) + "%";
-        duelProgress.textContent = ev.loading ? "Loading model \u2026" : ev.progress + " / " + ev.total + "  (" + pct + "%)";
-        duelWr.textContent = ev.loading ? "--" : "MU: " + Number(ev.mu_hat || 0).toFixed(6);
+        duelBar.style.width = ev.loading ? "12%" : pct + "%";
+        duelProgress.textContent = ev.status_text || (
+            ev.loading ? (ev.phase_label || "Loading model") + " \u2026" : ev.progress + " / " + ev.total + "  (" + pct + "%)"
+        );
+        duelWr.textContent = ev.loading ? (ev.phase || "--") : "MU: " + Number(ev.mu_hat || 0).toFixed(6);
     } else {
         duelSec.classList.add("duel-idle");
         duelLabel.textContent = status.label || "Idle";

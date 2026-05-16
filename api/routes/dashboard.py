@@ -1,6 +1,7 @@
 """Single-file dashboard feed for the lightweight Quasar UI."""
 
 from datetime import datetime, timezone
+import time
 
 from fastapi import APIRouter
 from fastapi.responses import JSONResponse
@@ -170,31 +171,64 @@ def _current_eval(progress, commitments):
             break
     commit = commitments.get(uid, {})
     total = progress.get("prompts_total") or current.get("prompts_total") or 0
-    done = (
-        progress.get("prompts_done")
-        or progress.get("current_prompt")
-        or current.get("prompts_done")
-        or progress.get("teacher_prompts_done")
-        or 0
-    )
-    loading_phases = {
+    if phase == "vllm_generating":
+        done = progress.get("teacher_prompts_done") or 0
+    else:
+        done = (
+            progress.get("prompts_done")
+            or progress.get("current_prompt")
+            or current.get("prompts_done")
+            or progress.get("teacher_prompts_done")
+            or 0
+        )
+    indeterminate_phases = {
         "pod_bootstrap",
         "pod_upload",
         "resumed_attaching",
         "vllm_starting",
-        "vllm_generating",
         "teacher_loading",
-        "teacher_generation",
         "teacher_logits",
         "gpu_precompute",
         "loading_student",
     }
+    phase_labels = {
+        "pod_bootstrap": "Preparing evaluator",
+        "pod_upload": "Uploading eval bundle",
+        "resumed_attaching": "Reattaching to eval",
+        "vllm_starting": "Starting teacher vLLM",
+        "vllm_generating": "Teacher generation",
+        "teacher_loading": "Loading teacher",
+        "teacher_generation": "Teacher generation",
+        "teacher_logits": "Teacher logits",
+        "gpu_precompute": "Preparing GPU tensors",
+        "loading_student": "Loading student model",
+        "finetune_probe": "Anti-finetune probe",
+        "chat_probe": "Chat response probe",
+        "capability_probe": "Capability probe",
+        "judge_probe": "Judge probe collection",
+        "chat_turns_probe": "Multi-turn probe",
+        "benchmark_probe": "Benchmark probes",
+        "fingerprint": "Activation fingerprint",
+        "scoring": "KL scoring",
+    }
+    phase_label = current.get("stage") or phase_labels.get(phase) or (phase or "Evaluation")
+    if phase == "vllm_generating" and total:
+        status_text = f"{phase_label}: {done}/{total} teacher prompts"
+    elif phase == "scoring" and (current.get("prompts_total") or total):
+        score_total = current.get("prompts_total") or total
+        status_text = f"{phase_label}: {done}/{score_total} prompts"
+    elif repo:
+        status_text = f"{phase_label}: {repo}"
+    else:
+        status_text = phase_label
     mu_hat = current.get("kl_running_mean")
     if mu_hat is None:
         mu_hat = progress.get("current_kl")
     return {
         "phase": phase,
-        "loading": phase in loading_phases,
+        "phase_label": phase_label,
+        "status_text": status_text,
+        "loading": phase in indeterminate_phases,
         "uid": uid,
         "challenger_repo": repo,
         "hotkey": commit.get("hotkey"),
@@ -204,6 +238,90 @@ def _current_eval(progress, commitments):
         "avg_king_loss": current.get("king_kl") or 0,
         "avg_challenger_loss": current.get("kl_running_mean") or 0,
     }
+
+
+def _dashboard_events(progress, current_eval, submissions):
+    """Return a concise operator activity stream, newest first.
+
+    Raw validator_log.json is useful for debugging, but it is too noisy for the
+    public dashboard. This stream elevates eval milestones and filters out
+    repetitive infrastructure chatter.
+    """
+    now = time.time()
+    events = []
+
+    if current_eval:
+        msg = current_eval.get("status_text") or current_eval.get("phase_label") or "Evaluation running"
+        uid = current_eval.get("uid")
+        if uid is not None and f"UID {uid}" not in msg:
+            msg = f"UID {uid}: {msg}"
+        events.append({"ts": now, "level": "info", "msg": msg})
+
+    if isinstance(progress, dict):
+        for item in reversed(progress.get("completed") or []):
+            if not isinstance(item, dict):
+                continue
+            name = item.get("student_name") or item.get("model") or "model"
+            status = item.get("status") or "done"
+            kl = item.get("kl")
+            suffix = f", KL={float(kl):.6f}" if isinstance(kl, (int, float)) else ""
+            events.append({
+                "ts": now,
+                "level": "info",
+                "msg": f"{name}: {status}{suffix}",
+            })
+
+    important = (
+        "H2H:",
+        "Running eval",
+        "local eval finished",
+        "Prechecked",
+        "DISQUALIFIED",
+        "TRANSIENT ERROR",
+        "winner UID",
+        "activation block",
+        "set_weights",
+        "dethroned",
+        "holds",
+        "scheduled",
+        "reset anchor",
+    )
+    noisy = (
+        "Starting epoch",
+        "Fetching chain state",
+        "Found ",
+        "Block ",
+        "disk",
+        "Local backend ready",
+        "Local eval workspace",
+        "Checking local eval dependencies",
+        "Enabling default logging",
+    )
+    for entry in reversed((validator_log() or [])[-160:]):
+        if not isinstance(entry, dict):
+            continue
+        msg = str(entry.get("msg") or entry.get("message") or "")
+        if not msg:
+            continue
+        if any(bit in msg for bit in noisy) and not any(bit in msg for bit in important):
+            continue
+        if any(bit in msg for bit in important):
+            events.append({
+                "ts": entry.get("ts"),
+                "level": entry.get("level") or "info",
+                "msg": msg,
+            })
+        if len(events) >= 80:
+            break
+
+    if not events:
+        pending = sum(1 for row in submissions if row.get("status") == "pending")
+        events.append({
+            "ts": now,
+            "level": "info",
+            "msg": f"Idle. {pending} pending commitment(s)." if pending else "Idle. No pending commitments.",
+        })
+    return events[:80]
 
 
 def _queue(commitments, history_rows):
@@ -461,7 +579,7 @@ def get_dashboard_json():
         "submissions": submissions,
         "validators": _validators(),
         "history": hist_rows,
-        "events": list(reversed((validator_log() or [])[-80:])),
+        "events": _dashboard_events(progress, current_eval, submissions),
     }
     return JSONResponse(
         content=_sanitize_floats(payload),

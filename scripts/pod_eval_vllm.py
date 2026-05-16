@@ -10147,6 +10147,17 @@ def main():
         _atomic_json_write(progress_path, snapshot)
     _write_progress()
 
+    def _set_student_progress(phase, student_name, student_idx, stage, **fields):
+        current = {
+            "student_name": student_name,
+            "student_idx": student_idx,
+            "stage": stage,
+        }
+        current.update(fields)
+        live_progress["phase"] = phase
+        live_progress["current"] = current
+        _write_progress()
+
     def _save_incremental_results():
         results["timings"] = {k: round(v, 1) for k, v in timings.items()}
         with open(args.output, "w") as f:
@@ -10239,9 +10250,13 @@ def main():
                 prefetch_future = prefetch_executor.submit(prefetch_model, next_name, next_rev)
 
         # Load student (or reuse king)
-        live_progress["phase"] = "loading_student"
-        live_progress["current"] = {"student_name": student_name, "student_idx": student_idx, "prompts_done": 0}
-        _write_progress()
+        _set_student_progress(
+            "loading_student",
+            student_name,
+            student_idx,
+            "Loading model weights",
+            prompts_done=0,
+        )
 
         is_king = (student_name == king_name)
 
@@ -10306,6 +10321,13 @@ def main():
             probe_this = False
         if probe_this:
             try:
+                _set_student_progress(
+                    "finetune_probe",
+                    student_name,
+                    student_idx,
+                    "Anti-finetune probe",
+                    prompts_done=0,
+                )
                 _fp_start = time.time()
                 probe = finetunability_probe(
                     student, tokenizer, device, block_seed=args.block_seed,
@@ -10377,6 +10399,13 @@ def main():
             chat_probe_this = False
         if chat_probe_this:
             try:
+                _set_student_progress(
+                    "chat_probe",
+                    student_name,
+                    student_idx,
+                    "Chat response probe",
+                    prompts_done=0,
+                )
                 _cp_start = time.time()
                 cprobe = chat_response_probe(student, tokenizer, device)
                 _cp_dur = time.time() - _cp_start
@@ -10512,6 +10541,13 @@ def main():
             cap_probe_this = False
         if cap_probe_this:
             try:
+                _set_student_progress(
+                    "capability_probe",
+                    student_name,
+                    student_idx,
+                    "Capability probe",
+                    prompts_done=0,
+                )
                 _cp_start = time.time()
                 cap = capability_probe(student, tokenizer, device)
                 _cp_dur = time.time() - _cp_start
@@ -10561,6 +10597,13 @@ def main():
             judge_collect_this = False
         if judge_collect_this:
             try:
+                _set_student_progress(
+                    "judge_probe",
+                    student_name,
+                    student_idx,
+                    "Judge response collection",
+                    prompts_done=0,
+                )
                 _jp_start = time.time()
                 judge_raw = judge_response_probe(student, tokenizer, device)
                 _jp_dur = time.time() - _jp_start
@@ -10603,6 +10646,13 @@ def main():
             chat_turns_collect_this = False
         if chat_turns_collect_this:
             try:
+                _set_student_progress(
+                    "chat_turns_probe",
+                    student_name,
+                    student_idx,
+                    "Multi-turn probe",
+                    prompts_done=0,
+                )
                 _ct_start = time.time()
                 chat_turns_raw = chat_turns_response_probe(
                     student, tokenizer, device)
@@ -10654,6 +10704,13 @@ def main():
             bench_this = False
         if bench_this:
             try:
+                _set_student_progress(
+                    "benchmark_probe",
+                    student_name,
+                    student_idx,
+                    "Benchmark probes",
+                    prompts_done=0,
+                )
                 bench_res = run_bench_battery(student, tokenizer, device)
                 total_w = bench_res.pop("_total_wall_s", 0.0)
                 results["students"].setdefault(student_name, {})
@@ -10724,6 +10781,13 @@ def main():
         # ── Activation fingerprint (for functional copy detection) ──
         if student is not None:
             try:
+                _set_student_progress(
+                    "fingerprint",
+                    student_name,
+                    student_idx,
+                    "Activation fingerprint",
+                    prompts_done=0,
+                )
                 fp_start = time.time()
                 fp = compute_activation_fingerprint(student, device)
                 fp_time = time.time() - fp_start
@@ -10760,6 +10824,15 @@ def main():
 
         t0 = time.time()
         pre_scoring_time = t0 - model_start
+        _set_student_progress(
+            "scoring",
+            student_name,
+            student_idx,
+            "KL scoring",
+            prompts_done=0,
+            prompts_total=effective_total,
+            best_kl_so_far=round(best_kl_so_far, 6) if best_kl_so_far else None,
+        )
         with torch.no_grad():
             for i in range(effective_total):
                 try:
@@ -10857,6 +10930,7 @@ def main():
                     live_progress["phase"] = "scoring"
                     live_progress["current"] = {
                         "student_name": student_name, "student_idx": student_idx,
+                        "stage": "KL scoring",
                         "prompts_done": i + 1, "prompts_total": effective_total,
                         "kl_running_mean": round(running_mean, 6),
                         "best_kl_so_far": round(best_kl_so_far, 6) if best_kl_so_far else None,
