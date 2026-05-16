@@ -322,6 +322,10 @@ def _dashboard_events(progress, current_eval, submissions, status):
         msg = str(entry.get("msg") or entry.get("message") or "")
         if not msg:
             continue
+        if status.get("mode") == "activation_wait" and "waiting for activation" in msg:
+            continue
+        if status.get("mode") == "round_wait" and "waiting for coordination round" in msg:
+            continue
         if any(bit in msg for bit in noisy) and not any(bit in msg for bit in important):
             continue
         if any(bit in msg for bit in important):
