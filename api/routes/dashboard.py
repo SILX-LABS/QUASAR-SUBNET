@@ -1,6 +1,7 @@
 """Single-file dashboard feed for the lightweight Quasar UI."""
 
 from datetime import datetime, timezone
+import re
 import time
 
 from fastapi import APIRouter
@@ -240,7 +241,7 @@ def _current_eval(progress, commitments):
     }
 
 
-def _dashboard_events(progress, current_eval, submissions):
+def _dashboard_events(progress, current_eval, submissions, status):
     """Return a concise operator activity stream, newest first.
 
     Raw validator_log.json is useful for debugging, but it is too noisy for the
@@ -255,6 +256,20 @@ def _dashboard_events(progress, current_eval, submissions):
         uid = current_eval.get("uid")
         if uid is not None and f"UID {uid}" not in msg:
             msg = f"UID {uid}: {msg}"
+        events.append({"ts": now, "level": "info", "msg": msg})
+    elif status.get("mode") == "activation_wait":
+        msg = f"Winner UID {status.get('winner_uid')} waiting for activation"
+        if status.get("activation_block"):
+            msg += f" at block {status.get('activation_block')}"
+        if status.get("blocks_remaining") is not None:
+            msg += f" ({status.get('blocks_remaining')} blocks remaining)"
+        events.append({"ts": now, "level": "info", "msg": msg})
+    elif status.get("mode") == "round_wait":
+        msg = "Waiting for next coordination round"
+        if status.get("next_round_start_block"):
+            msg += f" at block {status.get('next_round_start_block')}"
+        if status.get("blocks_remaining") is not None:
+            msg += f" ({status.get('blocks_remaining')} blocks remaining)"
         events.append({"ts": now, "level": "info", "msg": msg})
 
     if isinstance(progress, dict):
@@ -297,6 +312,10 @@ def _dashboard_events(progress, current_eval, submissions):
         "Checking local eval dependencies",
         "Enabling default logging",
     )
+    seen = {
+        re.sub(r"\d+", "#", str(event.get("msg") or "")).lower()
+        for event in events
+    }
     for entry in reversed((validator_log() or [])[-160:]):
         if not isinstance(entry, dict):
             continue
@@ -306,6 +325,10 @@ def _dashboard_events(progress, current_eval, submissions):
         if any(bit in msg for bit in noisy) and not any(bit in msg for bit in important):
             continue
         if any(bit in msg for bit in important):
+            key = re.sub(r"\d+", "#", msg).lower()
+            if key in seen:
+                continue
+            seen.add(key)
             events.append({
                 "ts": entry.get("ts"),
                 "level": entry.get("level") or "info",
@@ -558,6 +581,7 @@ def get_dashboard_json():
     king_revision = (consensus_king or {}).get("revision") if consensus_king else None
     if not king_revision:
         king_revision = king_commit.get("revision")
+    status = _dashboard_status(progress, current_eval, latest, consensus_king, submissions)
     payload = {
         "market": market,
         "king": {
@@ -573,13 +597,13 @@ def get_dashboard_json():
         },
         "consensus_king": consensus_king,
         "state_king_uid": state_king_uid,
-        "status": _dashboard_status(progress, current_eval, latest, consensus_king, submissions),
+        "status": status,
         "current_eval": current_eval,
         "queue": submissions,
         "submissions": submissions,
         "validators": _validators(),
         "history": hist_rows,
-        "events": _dashboard_events(progress, current_eval, submissions),
+        "events": _dashboard_events(progress, current_eval, submissions, status),
     }
     return JSONResponse(
         content=_sanitize_floats(payload),
