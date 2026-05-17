@@ -158,7 +158,13 @@ def _scheduled_uids(progress):
 def _history_rows(rounds, commitments):
     out = []
     for rnd in reversed(rounds[-80:]):
-        king_loss = rnd.get("king_h2h_kl") or rnd.get("king_kl")
+        king_loss = None
+        for king_res in rnd.get("results") or []:
+            if king_res.get("is_king") and king_res.get("kl") is not None:
+                king_loss = king_res.get("kl")
+                break
+        if king_loss is None:
+            king_loss = rnd.get("king_h2h_kl") or rnd.get("king_kl")
         for res in rnd.get("results") or []:
             if res.get("is_king") or res.get("is_reference"):
                 continue
@@ -192,7 +198,7 @@ def _history_rows(rounds, commitments):
                 verdict_label = "GATE BLOCK"
             elif duel_win:
                 verdict = "duel_win"
-                verdict_label = "DUEL WIN"
+                verdict_label = "KL WIN"
             else:
                 verdict = "held"
                 verdict_label = "HELD"
