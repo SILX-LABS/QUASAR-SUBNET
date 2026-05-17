@@ -957,11 +957,17 @@ def _dashboard_status(progress, current_eval, latest, consensus_king, submission
     active = bool(progress.get("active"))
     state_king_uid = latest.get("king_uid")
     chain_king_uid = (consensus_king or {}).get("uid")
-    winner_uid = progress.get("winner_uid") or state_king_uid or chain_king_uid
+    progress_winner_uid = progress.get("winner_uid")
+    if active:
+        winner_uid = progress_winner_uid or chain_king_uid or state_king_uid
+    else:
+        winner_uid = chain_king_uid or state_king_uid
     reveal_pending = (
-        state_king_uid is not None
+        active
+        and phase == "waiting_for_coordination_activation"
+        and progress_winner_uid is not None
         and chain_king_uid is not None
-        and int(state_king_uid) != int(chain_king_uid)
+        and int(progress_winner_uid) != int(chain_king_uid)
     )
     status = {
         "active": active,
@@ -970,6 +976,7 @@ def _dashboard_status(progress, current_eval, latest, consensus_king, submission
         "winner_uid": winner_uid,
         "state_king_uid": state_king_uid,
         "chain_king_uid": chain_king_uid,
+        "progress_winner_uid": progress_winner_uid,
         "weight_reveal_pending": reveal_pending,
         "current_block": progress.get("current_block") or (consensus_king or {}).get("block") or latest.get("block"),
         "next_round_start_block": progress.get("next_round_start_block"),
@@ -1137,6 +1144,11 @@ def get_dashboard_json():
     king_revision = (consensus_king or {}).get("revision") if consensus_king else None
     if not king_revision:
         king_revision = king_commit.get("revision")
+    latest_matches_king = (
+        state_king_uid is not None
+        and king_uid is not None
+        and int(state_king_uid) == int(king_uid)
+    )
     status = _dashboard_status(progress, current_eval, latest, consensus_king, submissions)
     payload = {
         "market": market,
@@ -1145,7 +1157,7 @@ def get_dashboard_json():
             "hf_repo": king_repo or "--",
             "king_revision": king_revision,
             "reign_number": sum(1 for rnd in history if rnd.get("king_changed")),
-            "crowned_at": crowned.get("timestamp") if crowned else _iso(latest.get("timestamp")),
+            "crowned_at": crowned.get("timestamp") if crowned else (_iso(latest.get("timestamp")) if latest_matches_king else None),
             "source": "chain_weights" if consensus_king else ("validator_state" if state_king_uid is not None else None),
             "support_stake": (consensus_king or {}).get("support_stake"),
             "support_fraction": (consensus_king or {}).get("support_fraction"),
