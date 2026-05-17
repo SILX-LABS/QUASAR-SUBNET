@@ -104,7 +104,10 @@
     "dashboardUrl": "http://localhost:3720",
     "allowedOrigins": [
       "http://localhost:3720",
-      "http://localhost:3000"
+      "http://localhost:3000",
+      "http://localhost:8765",
+      "http://127.0.0.1:8765",
+      "https://sn24.quasarcopilot.com"
     ],
     "tmcBase": "https://api.taomarketcap.com"
   }
