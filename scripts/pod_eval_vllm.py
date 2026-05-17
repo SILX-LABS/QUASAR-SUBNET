@@ -9372,19 +9372,27 @@ def start_vllm_server(model_name, gpu_memory_utilization=0.90, max_model_len=163
     # dies with 429 under moderate load; the cached weights are fine, it's
     # just the metadata probe that gets rate-limited.
     force_offline = os.environ.get("QUASAR_VLLM_FORCE_OFFLINE", "").strip().lower() in {"1", "true", "yes"}
-    offline_ok = force_offline and _teacher_cache_complete(model_name, revision)
+    force_online = os.environ.get("QUASAR_VLLM_FORCE_ONLINE", "").strip().lower() in {"1", "true", "yes"}
+    cache_complete = _teacher_cache_complete(model_name, revision)
+    # Cached teacher weights are enough for vLLM to boot offline. Keeping the
+    # online metadata path as the default caused validators to hang before the
+    # vLLM subprocess was even spawned when HF metadata calls stalled.
+    offline_ok = cache_complete and not force_online
     if offline_ok:
         print(f"[vllm] Weights cached locally — starting vLLM with HF_HUB_OFFLINE=1", flush=True)
     else:
-        if _teacher_cache_complete(model_name, revision):
-            print(f"[vllm] Weights cached locally — starting vLLM online for metadata resolution", flush=True)
+        if cache_complete:
+            print(f"[vllm] Weights cached locally — starting vLLM online because QUASAR_VLLM_FORCE_ONLINE=1", flush=True)
         else:
             print(f"[vllm] Weights not yet cached — prefetching first (retries on 429)", flush=True)
-        try:
-            prefetch_model(model_name, revision=revision, max_retries=4)
-        except Exception as e:
-            print(f"[vllm] prefetch raised {type(e).__name__}: {e} — continuing with online vLLM start", flush=True)
-        offline_ok = force_offline and _teacher_cache_complete(model_name, revision)
+            try:
+                prefetch_model(model_name, revision=revision, max_retries=4)
+            except Exception as e:
+                print(f"[vllm] prefetch raised {type(e).__name__}: {e} — continuing with online vLLM start", flush=True)
+            cache_complete = _teacher_cache_complete(model_name, revision)
+            offline_ok = (force_offline or cache_complete) and not force_online
+            if offline_ok:
+                print(f"[vllm] Prefetch complete — starting vLLM with HF_HUB_OFFLINE=1", flush=True)
 
     vllm_python = os.environ.get("QUASAR_VLLM_PYTHON") or sys.executable
     cmd = [

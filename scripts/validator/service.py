@@ -1487,6 +1487,10 @@ def run_validator(network, netuid, wallet_name, hotkey_name, wallet_path,
             valid_models, disqualified, precheck_errors = run_precheck(
                 commitments, uid_to_hotkey, uid_to_coldkey, state, max_params_b, state_dir,
             )
+            # Precheck can repair DQ chains and repopulate hash metadata before
+            # the expensive eval begins. Persist that immediately so a restart
+            # cannot leave the dashboard or next round on stale copy state.
+            state.save()
             if coord_round is not None and precheck_errors:
                 logger.warning(
                     "coordination: precheck incomplete for UIDs %s; skipping eval so this "

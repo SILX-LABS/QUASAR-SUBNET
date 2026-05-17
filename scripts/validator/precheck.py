@@ -399,10 +399,21 @@ def precheck_all_models(commitments, uid_to_hotkey, uid_to_coldkey, state: Valid
             expected_hash = state.model_hashes.get(str(uid))
             stored_hotkey_quick = state.model_hashes.get(f"{uid}_hotkey")
             stored_block_quick = state.model_hashes.get(f"{uid}_block")
+            missing_integrity_metadata = (
+                expected_hash is None
+                or stored_hotkey_quick is None
+                or (this_commit_block is not None and stored_block_quick is None)
+            )
             hotkey_changed_quick = stored_hotkey_quick is not None and stored_hotkey_quick != hotkey
             block_changed_quick = this_commit_block and stored_block_quick and this_commit_block != stored_block_quick
             legacy_no_block_quick = expected_hash is not None and stored_block_quick is None and this_commit_block
-            if hotkey_changed_quick or block_changed_quick or legacy_no_block_quick:
+            if missing_integrity_metadata:
+                logger.info(
+                    f"UID {uid}: quick re-check: missing integrity/hash metadata "
+                    f"at block {this_commit_block}; running full precheck"
+                )
+                _needs_full_check = True
+            elif hotkey_changed_quick or block_changed_quick or legacy_no_block_quick:
                 reason = (
                     "hotkey changed (UID recycled)" if hotkey_changed_quick
                     else "new commitment" if block_changed_quick
