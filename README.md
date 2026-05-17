@@ -57,14 +57,16 @@ ranking:
   cannot crown a challenger, and composite alone cannot override a direct
   head-to-head regression.
 - Weight setting happens after evaluation by assigning the current king the full
-  validator weight.
+  validator weight. On-chain commit-reveal can make the visible chain weight lag
+  the latest local eval winner until the reveal period completes.
 
 ## Validator Timing
 
 Validators evaluate submissions in shared chain-coordinated rounds so the
 network converges on the same winner. A valid public pinned Quasar repo may wait
-until the next round before it is scored, and dashboard or chain weights can
-briefly lag evaluation results while updates settle.
+until the next round before it is scored. The dashboard distinguishes the latest
+local eval winner from the chain-revealed weight target when commit-reveal is
+still pending.
 
 Keep submitted repos public, pinned, valid, and unchanged after commit.
 

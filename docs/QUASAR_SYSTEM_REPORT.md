@@ -283,13 +283,15 @@ The API and dashboard are read-only visibility layers. They do not decide winner
 
 They expose:
 
-- Current king.
+- Chain-revealed king and latest local eval winner.
 - Queue/current evaluation progress.
 - Miner commitments.
 - Scores and composite records.
 - Disqualification reasons.
 - Metagraph data.
 - Market/subnet display data.
+- Commit-reveal lag state when a new local winner has been selected but chain
+  weights still reveal the previous target.
 
 The frontend reads public API/dashboard data. Backend deployment details are operational infrastructure, not part of the scoring mechanism.
 

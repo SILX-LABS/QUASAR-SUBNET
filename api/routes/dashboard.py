@@ -501,6 +501,101 @@ def _eval_log_events(progress, limit=32):
     return list(reversed(selected))
 
 
+def _event_fingerprint(msg):
+    return re.sub(r"\s+", " ", re.sub(r"\d+", "#", str(msg or "").lower())).strip()
+
+
+def _event_row(ts, level, msg, event_type="status"):
+    return {
+        "ts": ts,
+        "level": level or "info",
+        "type": event_type,
+        "event_type": event_type,
+        "msg": msg,
+    }
+
+
+def _friendly_validator_event(msg, status):
+    """Normalize internal validator log lines for the public dashboard."""
+    raw = str(msg or "").strip()
+    if not raw:
+        return None
+    lower = raw.lower()
+
+    if "waiting for coordination round" in lower:
+        return None
+    if "checking " in lower:
+        return None
+    if "disqualified" in lower:
+        return None
+    if status.get("weight_reveal_pending") and "winner uid" in lower and "waiting" in lower:
+        return None
+
+    m = re.search(r"Prechecked\s+(\d+)\s+models:\s+(\d+)\s+valid,\s+(\d+)\s+DQ,\s+(\d+)\s+error", raw)
+    if m:
+        return (
+            "precheck",
+            f"Precheck complete: {m.group(2)} valid, {m.group(3)} disqualified, {m.group(4)} error",
+        )
+
+    m = re.search(r"Running eval on local \((\d+)\s+models,\s+(\d+)\s+prompts", raw)
+    if m:
+        return (
+            "eval",
+            f"Evaluation started: {m.group(1)} models, {m.group(2)} prompts",
+        )
+
+    m = re.search(r"Running eval on local:\s+king vs\s+(\d+)\s+challengers,\s+(\d+)\s+prompts", raw)
+    if m:
+        return (
+            "eval",
+            f"Evaluation started: incumbent vs {m.group(1)} challengers, {m.group(2)} prompts",
+        )
+
+    m = re.search(r"H2H:\s+king=UID\s+(\d+)\s+vs\s+(\d+)\s+challengers", raw)
+    if m:
+        return ("eval", f"Round roster: UID {m.group(1)} vs {m.group(2)} challengers")
+
+    m = re.search(r"local eval finished:\s+exit_code=(\d+)\s+success=(True|False)", raw)
+    if m:
+        ok = m.group(2) == "True"
+        return ("eval", "Local evaluation finished" if ok else f"Local evaluation failed: exit {m.group(1)}")
+
+    m = re.search(r"coordination activation block\s+(\d+)\s+reached.*current=(\d+)", raw)
+    if m:
+        return ("chain", f"Activation boundary reached: block {m.group(1)} (current {m.group(2)})")
+
+    m = re.search(r"winner UID\s+(\d+)\s+ready.*activation block\s+(\d+)", raw)
+    if m:
+        return ("chain", f"Winner selected: UID {m.group(1)}; activation block {m.group(2)}")
+
+    m = re.search(r"UID\s+(\d+)\s+dethroned\s+UID\s+(\d+)", raw)
+    if m:
+        return ("result", f"New king published: UID {m.group(1)} dethroned UID {m.group(2)}")
+
+    m = re.search(r"No challengers at all\s+—\s+king UID\s+(\d+)\s+holds", raw)
+    if m:
+        return ("result", f"No challengers selected; UID {m.group(1)} holds")
+
+    if "set_weights failed" in lower:
+        return ("error", raw)
+    if "set_weights" in lower:
+        return ("chain", raw)
+    if "transient error" in lower:
+        m = re.search(r"UID\s+(\d+).*TRANSIENT ERROR\s+—\s+(.+)", raw)
+        if m:
+            return ("error", f"Transient precheck error on UID {m.group(1)}: {m.group(2)}")
+        return ("error", raw)
+    if "round complete" in lower:
+        return ("result", raw)
+    if "scheduled" in lower and "round" in lower:
+        return ("schedule", raw)
+    if "reset anchor" in lower:
+        return ("schedule", raw)
+
+    return None
+
+
 def _current_eval(progress, commitments):
     if not progress.get("active"):
         return None
@@ -685,32 +780,33 @@ def _dashboard_events(progress, current_eval, submissions, status):
         uid = current_eval.get("uid")
         if uid is not None and f"UID {uid}" not in msg:
             msg = f"UID {uid}: {msg}"
-        events.append({"ts": now, "level": "info", "msg": msg})
+        events.append(_event_row(now, "info", msg, "eval"))
     elif status.get("weight_reveal_pending"):
-        events.append({
-            "ts": now,
-            "level": "info",
-            "msg": (
-                f"Latest eval winner UID {status.get('state_king_uid')}; "
-                f"chain weights still reveal UID {status.get('chain_king_uid')}"
+        events.append(_event_row(
+            now,
+            "info",
+            (
+                f"Weight reveal pending: latest eval UID {status.get('state_king_uid')}; "
+                f"chain still shows UID {status.get('chain_king_uid')}"
             ),
-        })
+            "chain",
+        ))
     elif status.get("mode") == "activation_wait":
         msg = f"Winner UID {status.get('winner_uid')} waiting for activation"
         if status.get("activation_block"):
             msg += f" at block {status.get('activation_block')}"
         if status.get("blocks_remaining") is not None:
             msg += f" ({status.get('blocks_remaining')} blocks remaining)"
-        events.append({"ts": now, "level": "info", "msg": msg})
+        events.append(_event_row(now, "info", msg, "chain"))
     elif status.get("mode") == "round_wait":
         msg = "Waiting for next coordination round"
         if status.get("next_round_start_block"):
             msg += f" at block {status.get('next_round_start_block')}"
         if status.get("blocks_remaining") is not None:
             msg += f" ({status.get('blocks_remaining')} blocks remaining)"
-        events.append({"ts": now, "level": "info", "msg": msg})
+        events.append(_event_row(now, "info", msg, "schedule"))
 
-    if isinstance(progress, dict):
+    if isinstance(progress, dict) and progress.get("active"):
         for item in reversed(progress.get("completed") or []):
             if not isinstance(item, dict):
                 continue
@@ -718,13 +814,11 @@ def _dashboard_events(progress, current_eval, submissions, status):
             item_status = item.get("status") or "done"
             kl = item.get("kl")
             suffix = f", KL={float(kl):.6f}" if isinstance(kl, (int, float)) else ""
-            events.append({
-                "ts": now,
-                "level": "info",
-                "msg": f"{name}: {item_status}{suffix}",
-            })
+            events.append(_event_row(now, "info", f"{name}: {item_status}{suffix}", "eval"))
 
     for event in _eval_log_events(progress):
+        event.setdefault("type", "eval")
+        event.setdefault("event_type", event.get("type") or "eval")
         events.append(event)
 
     important = (
@@ -732,7 +826,6 @@ def _dashboard_events(progress, current_eval, submissions, status):
         "Running eval",
         "local eval finished",
         "Prechecked",
-        "DISQUALIFIED",
         "TRANSIENT ERROR",
         "winner UID",
         "activation block",
@@ -754,7 +847,7 @@ def _dashboard_events(progress, current_eval, submissions, status):
         "Enabling default logging",
     )
     seen = {
-        re.sub(r"\d+", "#", str(event.get("msg") or "")).lower()
+        _event_fingerprint(event.get("msg"))
         for event in events
     }
     for entry in reversed((validator_log() or [])[-160:]):
@@ -770,25 +863,27 @@ def _dashboard_events(progress, current_eval, submissions, status):
         if any(bit in msg for bit in noisy) and not any(bit in msg for bit in important):
             continue
         if any(bit in msg for bit in important):
-            key = re.sub(r"\d+", "#", msg).lower()
+            normalized = _friendly_validator_event(msg, status)
+            if not normalized:
+                continue
+            event_type, public_msg = normalized
+            key = _event_fingerprint(public_msg)
             if key in seen:
                 continue
             seen.add(key)
-            events.append({
-                "ts": entry.get("ts"),
-                "level": entry.get("level") or "info",
-                "msg": msg,
-            })
+            level = entry.get("level") or ("error" if event_type == "error" else "info")
+            events.append(_event_row(entry.get("ts"), level, public_msg, event_type))
         if len(events) >= 80:
             break
 
     if not events:
         pending = sum(1 for row in submissions if row.get("status") == "pending")
-        events.append({
-            "ts": now,
-            "level": "info",
-            "msg": f"Idle. {pending} pending commitment(s)." if pending else "Idle. No pending commitments.",
-        })
+        events.append(_event_row(
+            now,
+            "info",
+            f"Idle. {pending} pending commitment(s)." if pending else "Idle. No pending commitments.",
+            "status",
+        ))
     return events[:80]
 
 
