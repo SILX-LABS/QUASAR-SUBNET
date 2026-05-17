@@ -496,12 +496,13 @@ function render(d) {
     if (regBurn != null) document.getElementById("reg-cost").textContent = Number(regBurn).toFixed(6) + " \u03C4";
 
     var king = d.king || {};
+    var status = d.status || {};
     var histAll = d.history || [];
     var topModel = null;
     for (var ti = 0; ti < histAll.length; ti++) if (histAll[ti].accepted && histAll[ti].challenger_repo) { topModel = histAll[ti]; break; }
     var chainUid = king.uid == null ? null : Number(king.uid);
     var stateUid = d.state_king_uid == null ? null : Number(d.state_king_uid);
-    var revealPending = stateUid != null && chainUid != null && stateUid !== chainUid;
+    var revealPending = !!status.weight_reveal_pending;
     var displayWinner = revealPending && topModel && Number(topModel.uid) === stateUid ? topModel : null;
     var kingRepo = displayWinner ? displayWinner.challenger_repo : (king.hf_repo || (topModel ? topModel.challenger_repo : "--"));
     var kingRev = king.king_revision || "";
@@ -519,7 +520,6 @@ function render(d) {
     renderChart(d);
 
     var ev = d.current_eval;
-    var status = d.status || {};
     var duelSec = document.getElementById("duel-section");
     var duelLabel = document.getElementById("duel-label");
     var duelBar = document.getElementById("duel-bar");
@@ -554,7 +554,8 @@ function render(d) {
     var lwEl = document.getElementById("last-winner");
     var winner = null;
     for (var i = 0; i < (d.history || []).length; i++) if (d.history[i].accepted) { winner = d.history[i]; break; }
-    if (winner) {
+    var showWinnerCard = winner && (revealPending || (chainUid != null && Number(winner.uid) === chainUid));
+    if (showWinnerCard) {
         lwEl.innerHTML = '<span style="width:100%">' + repoLink(winner.challenger_repo) + '</span>' +
             '<span>MU_HAT: ' + Number(winner.mu_hat || 0).toFixed(6) + '</span>' +
             '<span>LCB: ' + Number(winner.lcb || 0).toFixed(6) + '</span>' +
@@ -563,7 +564,7 @@ function render(d) {
             '<span>CHALL_LOSS: ' + Number(winner.avg_challenger_loss || 0).toFixed(4) + '</span>' +
             (winner.wall_time_s ? '<span>' + Number(winner.wall_time_s).toFixed(0) + 's</span>' : '');
     } else {
-        lwEl.textContent = "NO CROWNED CHALLENGER YET";
+        lwEl.textContent = chainUid != null ? "NO PENDING CROWN; CHAIN KING UID " + chainUid : "NO CROWNED CHALLENGER YET";
     }
 
 
