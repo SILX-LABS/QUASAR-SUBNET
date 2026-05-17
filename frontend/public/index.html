@@ -489,16 +489,22 @@ function render(d) {
     var histAll = d.history || [];
     var topModel = null;
     for (var ti = 0; ti < histAll.length; ti++) if (histAll[ti].accepted && histAll[ti].challenger_repo) { topModel = histAll[ti]; break; }
-    var kingRepo = king.hf_repo || (topModel ? topModel.challenger_repo : "--");
+    var chainUid = king.uid == null ? null : Number(king.uid);
+    var stateUid = d.state_king_uid == null ? null : Number(d.state_king_uid);
+    var revealPending = stateUid != null && chainUid != null && stateUid !== chainUid;
+    var displayWinner = revealPending && topModel && Number(topModel.uid) === stateUid ? topModel : null;
+    var kingRepo = displayWinner ? displayWinner.challenger_repo : (king.hf_repo || (topModel ? topModel.challenger_repo : "--"));
     var kingRev = king.king_revision || "";
     var kingLinkTop = document.getElementById("king-link-top");
     kingLinkTop.href = kingRepo !== "--" ? "https://huggingface.co/" + kingRepo : "#";
     kingLinkTop.textContent = kingRepo;
-    document.getElementById("king-rev").innerHTML = kingRev && kingRepo !== "--" ? '@ <a href="https://huggingface.co/' + esc(kingRepo) + '/commit/' + esc(kingRev) + '" target="_blank" style="color:var(--ink);opacity:0.6">' + esc(kingRev.slice(0, 8)) + '</a>' : "";
+    document.getElementById("king-rev").innerHTML = !displayWinner && kingRev && kingRepo !== "--" ? '@ <a href="https://huggingface.co/' + esc(kingRepo) + '/commit/' + esc(kingRev) + '" target="_blank" style="color:var(--ink);opacity:0.6">' + esc(kingRev.slice(0, 8)) + '</a>' : "";
     var healthEl = document.getElementById("king-health");
     healthEl.textContent = "\u25CF ";
     healthEl.style.color = "#2a2";
-    document.getElementById("king-reign").textContent = king.reign_number != null ? "REIGN #" + king.reign_number + (king.crowned_at ? " \u2014 " + String(king.crowned_at).slice(0, 16) + "Z" : "") : "";
+    document.getElementById("king-reign").textContent = revealPending
+        ? "LATEST EVAL WINNER UID " + stateUid + " / CHAIN REVEALED UID " + chainUid
+        : (king.reign_number != null ? "REIGN #" + king.reign_number + (king.crowned_at ? " \u2014 " + String(king.crowned_at).slice(0, 16) + "Z" : "") : "");
 
     renderChart(d);
 
@@ -530,7 +536,9 @@ function render(d) {
         else if (status.next_round_start_block) detail += " Next round #" + status.next_round_start_block + ".";
         if (status.blocks_remaining != null) detail += " " + status.blocks_remaining + " blocks remaining.";
         duelProgress.textContent = detail;
-        duelWr.textContent = status.winner_uid != null ? "WINNER UID: " + status.winner_uid : (status.mode || "--");
+        duelWr.textContent = status.weight_reveal_pending
+            ? "PENDING REVEAL: UID " + status.state_king_uid
+            : (status.winner_uid != null ? "WINNER UID: " + status.winner_uid : (status.mode || "--"));
     }
 
     var lwEl = document.getElementById("last-winner");

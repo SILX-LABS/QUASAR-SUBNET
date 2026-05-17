@@ -686,6 +686,15 @@ def _dashboard_events(progress, current_eval, submissions, status):
         if uid is not None and f"UID {uid}" not in msg:
             msg = f"UID {uid}: {msg}"
         events.append({"ts": now, "level": "info", "msg": msg})
+    elif status.get("weight_reveal_pending"):
+        events.append({
+            "ts": now,
+            "level": "info",
+            "msg": (
+                f"Latest eval winner UID {status.get('state_king_uid')}; "
+                f"chain weights still reveal UID {status.get('chain_king_uid')}"
+            ),
+        })
     elif status.get("mode") == "activation_wait":
         msg = f"Winner UID {status.get('winner_uid')} waiting for activation"
         if status.get("activation_block"):
@@ -851,12 +860,22 @@ def _dashboard_status(progress, current_eval, latest, consensus_king, submission
     progress = progress or {}
     phase = progress.get("phase") or progress.get("stage")
     active = bool(progress.get("active"))
-    winner_uid = progress.get("winner_uid") or (consensus_king or {}).get("uid") or latest.get("king_uid")
+    state_king_uid = latest.get("king_uid")
+    chain_king_uid = (consensus_king or {}).get("uid")
+    winner_uid = progress.get("winner_uid") or state_king_uid or chain_king_uid
+    reveal_pending = (
+        state_king_uid is not None
+        and chain_king_uid is not None
+        and int(state_king_uid) != int(chain_king_uid)
+    )
     status = {
         "active": active,
         "phase": phase,
         "active_eval": current_eval is not None,
         "winner_uid": winner_uid,
+        "state_king_uid": state_king_uid,
+        "chain_king_uid": chain_king_uid,
+        "weight_reveal_pending": reveal_pending,
         "current_block": progress.get("current_block") or (consensus_king or {}).get("block") or latest.get("block"),
         "next_round_start_block": progress.get("next_round_start_block"),
         "activation_block": progress.get("activation_block"),
@@ -876,10 +895,16 @@ def _dashboard_status(progress, current_eval, latest, consensus_king, submission
             "detail": f"UID {winner_uid} holds. No model eval is running.",
         })
     elif phase == "waiting_for_coordination_round_start":
+        detail = "No model eval is running."
+        if reveal_pending:
+            detail = (
+                f"Latest eval winner is UID {state_king_uid}; revealed chain "
+                f"weights still show UID {chain_king_uid}."
+            )
         status.update({
             "mode": "round_wait",
             "label": "Waiting for next coordination round",
-            "detail": "No model eval is running.",
+            "detail": detail,
         })
     elif active:
         status.update({
