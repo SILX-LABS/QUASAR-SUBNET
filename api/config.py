@@ -38,7 +38,7 @@ Public API for Quasar, a Bittensor subnet built to crush the long-context barrie
 
 ## How It Works
 
-Miners submit Quasar-compatible models and validators score them with the composite evaluator. KL is one distribution-fit axis, while king selection uses composite worst/weighted scores. Validators set weights to the current king.
+Miners submit Quasar-compatible models and validators score them with paired KL duels plus the composite evaluator. A challenger must beat the incumbent on paired KL and pass the composite quality gate to take the crown. Validators set weights to the current king.
 
 ## Quick Start
 

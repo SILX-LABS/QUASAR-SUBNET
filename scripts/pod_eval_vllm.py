@@ -126,6 +126,324 @@ def free_gpu():
             print(f"[gpu] synchronize failed during cleanup: {e}", flush=True)
 
 
+def _normalize_eos_ids(eos_token_id) -> set[int]:
+    if eos_token_id is None:
+        return set()
+    if isinstance(eos_token_id, int):
+        return {int(eos_token_id)}
+    try:
+        return {int(x) for x in eos_token_id if x is not None and int(x) >= 0}
+    except TypeError:
+        return set()
+
+
+def _sample_next_token(
+    logits: torch.Tensor,
+    *,
+    do_sample: bool,
+    temperature: float = 1.0,
+    top_p: float = 1.0,
+    top_k: int | None = None,
+) -> torch.Tensor:
+    if not do_sample:
+        return torch.argmax(logits, dim=-1, keepdim=True)
+
+    temp = max(float(temperature or 1.0), 1e-6)
+    filtered = logits.float() / temp
+
+    if top_k is not None and int(top_k) > 0:
+        k = min(int(top_k), filtered.shape[-1])
+        keep_vals, _ = torch.topk(filtered, k, dim=-1)
+        kth = keep_vals[..., -1, None]
+        filtered = torch.where(
+            filtered < kth,
+            torch.full_like(filtered, -float("inf")),
+            filtered,
+        )
+
+    if top_p is not None and 0.0 < float(top_p) < 1.0:
+        sorted_logits, sorted_idx = torch.sort(filtered, descending=True, dim=-1)
+        sorted_probs = torch.softmax(sorted_logits, dim=-1)
+        cumulative = torch.cumsum(sorted_probs, dim=-1)
+        remove = cumulative > float(top_p)
+        remove[..., 1:] = remove[..., :-1].clone()
+        remove[..., 0] = False
+        sorted_logits = sorted_logits.masked_fill(remove, -float("inf"))
+        filtered = torch.full_like(filtered, -float("inf"))
+        filtered.scatter_(dim=-1, index=sorted_idx, src=sorted_logits)
+
+    probs = torch.softmax(filtered, dim=-1)
+    if not torch.isfinite(probs).all() or probs.sum(dim=-1).min().item() <= 0:
+        return torch.argmax(logits, dim=-1, keepdim=True)
+    return torch.multinomial(probs, num_samples=1)
+
+
+def quasar_memory_generate(
+    model,
+    input_ids: torch.Tensor,
+    *,
+    max_new_tokens: int,
+    do_sample: bool = False,
+    temperature: float = 1.0,
+    top_p: float = 1.0,
+    top_k: int | None = None,
+    pad_token_id: int | None = None,
+    eos_token_id=None,
+    attention_mask: torch.Tensor | None = None,
+    use_cache: bool = True,
+    **kwargs,
+) -> torch.Tensor:
+    """Generate through Quasar's recurrent ``memory_states`` cache.
+
+    HF ``generate(use_cache=True)`` currently calls ``Cache.get_seq_length()``
+    on Quasar's linear-attention cache and raises. Quasar itself exposes its
+    usable recurrent state as ``memory_states``. This helper bypasses HF
+    GenerationMixin for single-sample eval probes, carries ``memory_states``
+    manually, and falls back to safe no-cache HF generation if the loaded model
+    does not expose that state.
+    """
+    cache_enabled = os.environ.get("QUASAR_MEMORY_GENERATE", "1") != "0"
+    if not cache_enabled or not use_cache or max_new_tokens <= 0:
+        return model.generate(
+            input_ids,
+            max_new_tokens=max_new_tokens,
+            do_sample=do_sample,
+            temperature=temperature,
+            top_p=top_p,
+            pad_token_id=pad_token_id,
+            eos_token_id=eos_token_id,
+            attention_mask=attention_mask,
+            use_cache=False,
+            **kwargs,
+        )
+
+    if input_ids.ndim != 2 or int(input_ids.shape[0]) != 1:
+        return model.generate(
+            input_ids,
+            max_new_tokens=max_new_tokens,
+            do_sample=do_sample,
+            temperature=temperature,
+            top_p=top_p,
+            pad_token_id=pad_token_id,
+            eos_token_id=eos_token_id,
+            attention_mask=attention_mask,
+            use_cache=False,
+            **kwargs,
+        )
+
+    eos_ids = _normalize_eos_ids(eos_token_id)
+    if not eos_ids and pad_token_id is not None:
+        eos_ids = {int(pad_token_id)}
+
+    generated: list[torch.Tensor] = []
+    memory_states = None
+    prompt_len = int(input_ids.shape[1])
+    cur_ids = input_ids
+    position_ids = torch.arange(
+        prompt_len, device=input_ids.device, dtype=torch.long,
+    ).unsqueeze(0)
+
+    try:
+        for step in range(int(max_new_tokens)):
+            out = model(
+                input_ids=cur_ids,
+                position_ids=position_ids,
+                memory_states=memory_states,
+                use_cache=True,
+                return_dict=True,
+            )
+            next_token = _sample_next_token(
+                out.logits[:, -1, :],
+                do_sample=do_sample,
+                temperature=temperature,
+                top_p=top_p,
+                top_k=top_k,
+            )
+            generated.append(next_token)
+            memory_states = getattr(out, "memory_states", None)
+            if memory_states is None and step == 0:
+                raise RuntimeError("model did not return Quasar memory_states")
+            if eos_ids and int(next_token[0, 0].item()) in eos_ids:
+                break
+            cur_ids = next_token
+            position_ids = torch.tensor(
+                [[prompt_len + step]],
+                device=input_ids.device,
+                dtype=torch.long,
+            )
+    except Exception as e:
+        if os.environ.get("QUASAR_MEMORY_GENERATE_WARN", "1") != "0":
+            print(
+                f"[quasar-memory-generate] fallback to HF no-cache: {str(e)[:160]}",
+                flush=True,
+            )
+        return model.generate(
+            input_ids,
+            max_new_tokens=max_new_tokens,
+            do_sample=do_sample,
+            temperature=temperature,
+            top_p=top_p,
+            pad_token_id=pad_token_id,
+            eos_token_id=eos_token_id,
+            attention_mask=attention_mask,
+            use_cache=False,
+            **kwargs,
+        )
+
+    if not generated:
+        return input_ids
+    return torch.cat([input_ids, torch.cat(generated, dim=1)], dim=1)
+
+
+def quasar_memory_generate_batch(
+    model,
+    input_ids_list: list[torch.Tensor],
+    *,
+    max_new_tokens: int,
+    do_sample: bool = False,
+    temperature: float = 1.0,
+    top_p: float = 1.0,
+    top_k: int | None = None,
+    pad_token_id: int | None = None,
+    eos_token_id=None,
+    use_cache: bool = True,
+) -> list[torch.Tensor]:
+    """Batched deterministic Quasar generation for probe prompts.
+
+    The prompt prefill stays unpadded and per-sample so prompt semantics match
+    the old path. The expensive decode loop is batched by stacking Quasar
+    ``memory_states`` and one-token inputs across active samples.
+    """
+    if not input_ids_list:
+        return []
+    if len(input_ids_list) == 1 or do_sample:
+        return [
+            quasar_memory_generate(
+                model,
+                ids,
+                max_new_tokens=max_new_tokens,
+                do_sample=do_sample,
+                temperature=temperature,
+                top_p=top_p,
+                top_k=top_k,
+                pad_token_id=pad_token_id,
+                eos_token_id=eos_token_id,
+                use_cache=use_cache,
+            )
+            for ids in input_ids_list
+        ]
+
+    cache_enabled = os.environ.get("QUASAR_MEMORY_GENERATE", "1") != "0"
+    if not cache_enabled or not use_cache or max_new_tokens <= 0:
+        return [
+            model.generate(
+                ids,
+                max_new_tokens=max_new_tokens,
+                do_sample=False,
+                temperature=temperature,
+                top_p=top_p,
+                pad_token_id=pad_token_id,
+                eos_token_id=eos_token_id,
+                use_cache=False,
+            )
+            for ids in input_ids_list
+        ]
+
+    eos_ids = _normalize_eos_ids(eos_token_id)
+    if not eos_ids and pad_token_id is not None:
+        eos_ids = {int(pad_token_id)}
+
+    prompt_lens = [int(ids.shape[1]) for ids in input_ids_list]
+    memory_states_list: list[dict | None] = [None] * len(input_ids_list)
+    generated: list[list[torch.Tensor]] = [[] for _ in input_ids_list]
+    finished = [False] * len(input_ids_list)
+
+    try:
+        for idx, ids in enumerate(input_ids_list):
+            if ids.ndim != 2 or int(ids.shape[0]) != 1:
+                raise RuntimeError("batch memory generation expects [1, seq] inputs")
+            pos = torch.arange(
+                prompt_lens[idx], device=ids.device, dtype=torch.long,
+            ).unsqueeze(0)
+            out = model(
+                input_ids=ids,
+                position_ids=pos,
+                memory_states=None,
+                use_cache=True,
+                return_dict=True,
+            )
+            nxt = torch.argmax(out.logits[:, -1, :], dim=-1, keepdim=True)
+            generated[idx].append(nxt)
+            memory_states = getattr(out, "memory_states", None)
+            if memory_states is None:
+                raise RuntimeError("model did not return Quasar memory_states")
+            memory_states_list[idx] = memory_states
+            if eos_ids and int(nxt[0, 0].item()) in eos_ids:
+                finished[idx] = True
+
+        while (
+            any(not done for done in finished)
+            and max(len(tokens) for tokens in generated) < int(max_new_tokens)
+        ):
+            active = [i for i, done in enumerate(finished) if not done]
+            cur_ids = torch.cat([generated[i][-1] for i in active], dim=0)
+            pos = torch.tensor(
+                [[prompt_lens[i] + len(generated[i]) - 1] for i in active],
+                device=cur_ids.device,
+                dtype=torch.long,
+            )
+            keys = sorted(memory_states_list[active[0]].keys())
+            batched_memory = {
+                key: torch.cat([memory_states_list[i][key] for i in active], dim=0)
+                for key in keys
+            }
+            out = model(
+                input_ids=cur_ids,
+                position_ids=pos,
+                memory_states=batched_memory,
+                use_cache=True,
+                return_dict=True,
+            )
+            next_tokens = torch.argmax(out.logits[:, -1, :], dim=-1, keepdim=True)
+            next_memory = getattr(out, "memory_states", None)
+            if next_memory is None:
+                raise RuntimeError("model did not return batched Quasar memory_states")
+            for row, idx in enumerate(active):
+                token = next_tokens[row:row + 1]
+                generated[idx].append(token)
+                memory_states_list[idx] = {
+                    key: value[row:row + 1].contiguous()
+                    for key, value in next_memory.items()
+                }
+                if eos_ids and int(token[0, 0].item()) in eos_ids:
+                    finished[idx] = True
+    except Exception as e:
+        if os.environ.get("QUASAR_MEMORY_GENERATE_WARN", "1") != "0":
+            print(
+                f"[quasar-memory-generate] batch fallback to HF no-cache: {str(e)[:160]}",
+                flush=True,
+            )
+        return [
+            model.generate(
+                ids,
+                max_new_tokens=max_new_tokens,
+                do_sample=False,
+                temperature=temperature,
+                top_p=top_p,
+                pad_token_id=pad_token_id,
+                eos_token_id=eos_token_id,
+                use_cache=False,
+            )
+            for ids in input_ids_list
+        ]
+
+    return [
+        torch.cat([ids, torch.cat(tokens, dim=1)], dim=1)
+        if tokens else ids
+        for ids, tokens in zip(input_ids_list, generated)
+    ]
+
+
 def ensure_disk_space(teacher_name, threshold=85):
     """Check disk usage, clean non-teacher caches and stale files if above threshold.
 
@@ -479,7 +797,7 @@ CHAT_PROBE_PROMPTS = [
     "Say hello in one word.",
     "Reply with just the word: yes",
 ]
-CHAT_PROBE_MAX_TOKENS = int(os.environ.get("CHAT_PROBE_MAX_TOKENS", "768"))
+CHAT_PROBE_MAX_TOKENS = int(os.environ.get("CHAT_PROBE_MAX_TOKENS", "256"))
 CHAT_PROBE_MIN_ANSWER_CHARS = int(os.environ.get("CHAT_PROBE_MIN_ANSWER_CHARS", "1"))
 CHAT_PROBE_TERMINATE_THRESHOLD = float(os.environ.get("CHAT_PROBE_TERMINATE_THRESHOLD", "0.5"))
 
@@ -1121,23 +1439,34 @@ def judge_response_probe(model, tokenizer, device="cuda"):
     model.eval()
     try:
         with torch.no_grad():
-            for prompt in JUDGE_PROBE_PROMPTS:
+            responses: list[str] = [""] * len(JUDGE_PROBE_PROMPTS)
+            gen_tokens: list[int] = [0] * len(JUDGE_PROBE_PROMPTS)
+            pending: list[tuple[int, torch.Tensor]] = []
+            for idx, prompt in enumerate(JUDGE_PROBE_PROMPTS):
                 try:
                     rendered = _render_chat_prompt(tokenizer, prompt, enable_thinking=False)
                     ids = tokenizer(rendered, return_tensors="pt").input_ids.to(device)
-                    gen = model.generate(
-                        ids, max_new_tokens=JUDGE_PROBE_MAX_TOKENS,
-                        do_sample=False, temperature=1.0, top_p=1.0,
-                        pad_token_id=pad_id, eos_token_id=eos_ids, use_cache=False,
-                    )
-                    new_ids = gen[0, ids.shape[1]:]
-                    text = tokenizer.decode(new_ids, skip_special_tokens=True)
-                    out["responses"].append(_strip_thinking_probe(text))
-                    out["gen_tokens"].append(int(new_ids.shape[0]))
+                    pending.append((idx, ids))
                 except Exception as e:
-                    out["responses"].append("")
-                    out["gen_tokens"].append(0)
-                    print(f"[judge-probe] student gen error: {str(e)[:120]}", flush=True)
+                    print(f"[judge-probe] student render error: {str(e)[:120]}", flush=True)
+            gens = quasar_memory_generate_batch(
+                model,
+                [ids for _, ids in pending],
+                max_new_tokens=JUDGE_PROBE_MAX_TOKENS,
+                do_sample=False,
+                temperature=1.0,
+                top_p=1.0,
+                pad_token_id=pad_id,
+                eos_token_id=eos_ids,
+                use_cache=True,
+            )
+            for (idx, ids), gen in zip(pending, gens):
+                new_ids = gen[0, ids.shape[1]:]
+                text = tokenizer.decode(new_ids, skip_special_tokens=True)
+                responses[idx] = _strip_thinking_probe(text)
+                gen_tokens[idx] = int(new_ids.shape[0])
+            out["responses"].extend(responses)
+            out["gen_tokens"].extend(gen_tokens)
     finally:
         if was_training:
             model.train()
@@ -1656,39 +1985,59 @@ def chat_turns_response_probe(model, tokenizer, device="cuda"):
     model.eval()
     try:
         with torch.no_grad():
-            for convo in CHAT_TURNS_PROBE_PROMPTS:
-                turn_responses: list[str] = []
-                turn_tokens: list[int] = []
-                msgs: list[dict] = []
-                for user_turn in convo:
-                    msgs.append({"role": "user", "content": user_turn})
+            states = [
+                {
+                    "convo": convo,
+                    "msgs": [],
+                    "responses": [],
+                    "tokens": [],
+                }
+                for convo in CHAT_TURNS_PROBE_PROMPTS
+            ]
+            max_turns = max((len(convo) for convo in CHAT_TURNS_PROBE_PROMPTS), default=0)
+            for turn_idx in range(max_turns):
+                pending: list[tuple[int, torch.Tensor]] = []
+                for state_idx, state in enumerate(states):
+                    convo = state["convo"]
+                    if turn_idx >= len(convo):
+                        continue
+                    state["msgs"].append({"role": "user", "content": convo[turn_idx]})
                     try:
                         rendered = _render_chat_multi_turn(
-                            tokenizer, msgs, enable_thinking=False)
+                            tokenizer, state["msgs"], enable_thinking=False)
                         ids = tokenizer(
                             rendered, return_tensors="pt",
                             truncation=True, max_length=3072,
                         ).input_ids.to(device)
-                        gen = model.generate(
-                            ids, max_new_tokens=CHAT_TURNS_PROBE_MAX_TOKENS,
-                            do_sample=False, temperature=1.0, top_p=1.0,
-                            pad_token_id=pad_id, eos_token_id=eos_ids,
-                            use_cache=False,
-                        )
-                        new_ids = gen[0, ids.shape[1]:]
-                        text = tokenizer.decode(new_ids, skip_special_tokens=True)
-                        resp = _strip_thinking_probe(text)
-                        turn_responses.append(resp)
-                        turn_tokens.append(int(new_ids.shape[0]))
-                        msgs.append({"role": "assistant", "content": resp})
+                        pending.append((state_idx, ids))
                     except Exception as e:
-                        turn_responses.append("")
-                        turn_tokens.append(0)
-                        msgs.append({"role": "assistant", "content": ""})
-                        print(f"[chat-turns-probe] student gen error: "
+                        state["responses"].append("")
+                        state["tokens"].append(0)
+                        state["msgs"].append({"role": "assistant", "content": ""})
+                        print(f"[chat-turns-probe] student render error: "
                               f"{str(e)[:120]}", flush=True)
-                out["responses"].append(turn_responses)
-                out["gen_tokens"].append(turn_tokens)
+                gens = quasar_memory_generate_batch(
+                    model,
+                    [ids for _, ids in pending],
+                    max_new_tokens=CHAT_TURNS_PROBE_MAX_TOKENS,
+                    do_sample=False,
+                    temperature=1.0,
+                    top_p=1.0,
+                    pad_token_id=pad_id,
+                    eos_token_id=eos_ids,
+                    use_cache=True,
+                )
+                for (state_idx, ids), gen in zip(pending, gens):
+                    state = states[state_idx]
+                    new_ids = gen[0, ids.shape[1]:]
+                    text = tokenizer.decode(new_ids, skip_special_tokens=True)
+                    resp = _strip_thinking_probe(text)
+                    state["responses"].append(resp)
+                    state["tokens"].append(int(new_ids.shape[0]))
+                    state["msgs"].append({"role": "assistant", "content": resp})
+            for state in states:
+                out["responses"].append(state["responses"])
+                out["gen_tokens"].append(state["tokens"])
     finally:
         if was_training:
             model.train()
@@ -2246,11 +2595,14 @@ def chat_response_probe(model, tokenizer, device="cuda"):
         model.eval()
         terminated = 0
         non_empty = 0
+        generation_errors = 0
+        first_generation_error = ""
         gen_tokens_acc = 0
         content_chars_acc = 0
         reasoning_frac_acc = 0.0
 
         with torch.no_grad():
+            pending: list[tuple[str, torch.Tensor]] = []
             for prompt in CHAT_PROBE_PROMPTS:
                 msgs = [{"role": "user", "content": prompt}]
                 try:
@@ -2264,41 +2616,47 @@ def chat_response_probe(model, tokenizer, device="cuda"):
                             msgs, tokenize=False, add_generation_prompt=True,
                         )
                     ids = tokenizer(rendered, return_tensors="pt").input_ids.to(device)
-                    gen = model.generate(
-                        ids,
-                        max_new_tokens=CHAT_PROBE_MAX_TOKENS,
-                        do_sample=False,
-                        temperature=1.0,
-                        top_p=1.0,
-                        pad_token_id=pad_id,
-                        eos_token_id=eos_ids,
-                        use_cache=False,
-                    )
-                    new_ids = gen[0, ids.shape[1]:]
-                    gen_len = int(new_ids.shape[0])
-                    did_terminate = (gen_len < CHAT_PROBE_MAX_TOKENS) or (
-                        eos_ids is not None and int(new_ids[-1].item()) in eos_ids
-                    )
-                    raw_text = tokenizer.decode(new_ids, skip_special_tokens=True)
-                    stripped = _strip_thinking_probe(raw_text)
-                    raw_len = max(1, len(raw_text))
-                    reasoning_frac = 1.0 - (len(stripped) / raw_len)
-                    if did_terminate:
-                        terminated += 1
-                    if len(stripped) >= CHAT_PROBE_MIN_ANSWER_CHARS:
-                        non_empty += 1
-                    gen_tokens_acc += gen_len
-                    content_chars_acc += len(stripped)
-                    reasoning_frac_acc += max(0.0, min(1.0, reasoning_frac))
-                    stats["samples"].append({
-                        "prompt": prompt, "gen_tokens": gen_len,
-                        "terminated": did_terminate,
-                        "content_chars": len(stripped),
-                        "reasoning_frac": round(reasoning_frac, 3),
-                        "content_preview": stripped[:80],
-                    })
+                    pending.append((prompt, ids))
                 except Exception as e:
+                    generation_errors += 1
+                    if not first_generation_error:
+                        first_generation_error = str(e)[:160]
                     stats["samples"].append({"prompt": prompt, "error": str(e)[:120]})
+            gens = quasar_memory_generate_batch(
+                model,
+                [ids for _, ids in pending],
+                max_new_tokens=CHAT_PROBE_MAX_TOKENS,
+                do_sample=False,
+                temperature=1.0,
+                top_p=1.0,
+                pad_token_id=pad_id,
+                eos_token_id=eos_ids,
+                use_cache=True,
+            )
+            for (prompt, ids), gen in zip(pending, gens):
+                new_ids = gen[0, ids.shape[1]:]
+                gen_len = int(new_ids.shape[0])
+                did_terminate = (gen_len < CHAT_PROBE_MAX_TOKENS) or (
+                    eos_ids is not None and gen_len > 0 and int(new_ids[-1].item()) in eos_ids
+                )
+                raw_text = tokenizer.decode(new_ids, skip_special_tokens=True)
+                stripped = _strip_thinking_probe(raw_text)
+                raw_len = max(1, len(raw_text))
+                reasoning_frac = 1.0 - (len(stripped) / raw_len)
+                if did_terminate:
+                    terminated += 1
+                if len(stripped) >= CHAT_PROBE_MIN_ANSWER_CHARS:
+                    non_empty += 1
+                gen_tokens_acc += gen_len
+                content_chars_acc += len(stripped)
+                reasoning_frac_acc += max(0.0, min(1.0, reasoning_frac))
+                stats["samples"].append({
+                    "prompt": prompt, "gen_tokens": gen_len,
+                    "terminated": did_terminate,
+                    "content_chars": len(stripped),
+                    "reasoning_frac": round(reasoning_frac, 3),
+                    "content_preview": stripped[:80],
+                })
 
         n = max(1, len(CHAT_PROBE_PROMPTS))
         stats["prompts_tested"] = n
@@ -2307,6 +2665,13 @@ def chat_response_probe(model, tokenizer, device="cuda"):
         stats["mean_gen_tokens"] = round(gen_tokens_acc / n, 1)
         stats["mean_content_chars"] = round(content_chars_acc / n, 1)
         stats["mean_reasoning_fraction"] = round(reasoning_frac_acc / n, 3)
+
+        # Infrastructure failures in HF generation are not miner behavior.
+        # Quasar/linear-attention cache support can throw before any token is
+        # produced; treating that as chat collapse DQs the whole network.
+        if generation_errors == n:
+            stats["reason"] = f"probe_skip:generation_error:{first_generation_error}"
+            return stats
 
         min_ok = CHAT_PROBE_TERMINATE_THRESHOLD * n - 1e-9
         if terminated < min_ok and non_empty < min_ok:
@@ -2553,6 +2918,8 @@ def capability_probe(model, tokenizer, device="cuda"):
         was_training = model.training
         model.eval()
         with torch.no_grad():
+            pending: list[tuple[dict, torch.Tensor]] = []
+            rendered_errors: list[dict] = []
             for item in CAPABILITY_PROBE_PROMPTS:
                 msgs = [{"role": "user", "content": item["q"]}]
                 try:
@@ -2566,25 +2933,34 @@ def capability_probe(model, tokenizer, device="cuda"):
                             msgs, tokenize=False, add_generation_prompt=True,
                         )
                     ids = tokenizer(rendered, return_tensors="pt").input_ids.to(device)
-                    gen = model.generate(
-                        ids, max_new_tokens=CAPABILITY_PROBE_MAX_TOKENS,
-                        do_sample=False, temperature=1.0, top_p=1.0,
-                        pad_token_id=pad_id, eos_token_id=eos_ids, use_cache=False,
-                    )
-                    new_ids = gen[0, ids.shape[1]:]
-                    raw_text = tokenizer.decode(new_ids, skip_special_tokens=True)
-                    pred = _extract_capability_answer(raw_text, item["kind"])
-                    ok = _capability_score_one(pred, item)
-                    out["items"].append({
-                        "q": item["q"], "expected": item.get("a", item.get("kind", "")),
-                        "kind": item["kind"],
-                        "pred": pred, "ok": bool(ok),
-                        "tail": raw_text[-120:],
-                    })
-                    out["n"] += 1
-                    out["correct"] += ok
+                    pending.append((item, ids))
                 except Exception as e:
-                    out["items"].append({"q": item["q"], "error": str(e)[:120]})
+                    rendered_errors.append({"q": item["q"], "error": str(e)[:120]})
+            gens = quasar_memory_generate_batch(
+                model,
+                [ids for _, ids in pending],
+                max_new_tokens=CAPABILITY_PROBE_MAX_TOKENS,
+                do_sample=False,
+                temperature=1.0,
+                top_p=1.0,
+                pad_token_id=pad_id,
+                eos_token_id=eos_ids,
+                use_cache=True,
+            )
+            for (item, ids), gen in zip(pending, gens):
+                new_ids = gen[0, ids.shape[1]:]
+                raw_text = tokenizer.decode(new_ids, skip_special_tokens=True)
+                pred = _extract_capability_answer(raw_text, item["kind"])
+                ok = _capability_score_one(pred, item)
+                out["items"].append({
+                    "q": item["q"], "expected": item.get("a", item.get("kind", "")),
+                    "kind": item["kind"],
+                    "pred": pred, "ok": bool(ok),
+                    "tail": raw_text[-120:],
+                })
+                out["n"] += 1
+                out["correct"] += ok
+            out["items"].extend(rendered_errors)
         if was_training:
             model.train()
         out["pass_frac"] = out["correct"] / max(1, out["n"])
@@ -2754,22 +3130,22 @@ BENCH_NOISE_PER_ROUND = int(os.environ.get("BENCH_NOISE_PER_ROUND", "0"))
 BENCH_NOISE_PERTURB_K = int(os.environ.get("BENCH_NOISE_PERTURB_K", "2"))
 
 # Token budgets.
-BENCH_MATH_MAX_TOKENS = int(os.environ.get("BENCH_MATH_MAX_TOKENS", "384"))
-BENCH_CODE_MAX_TOKENS = int(os.environ.get("BENCH_CODE_MAX_TOKENS", "512"))
-BENCH_REASONING_MAX_TOKENS = int(os.environ.get("BENCH_REASONING_MAX_TOKENS", "128"))
+BENCH_MATH_MAX_TOKENS = int(os.environ.get("BENCH_MATH_MAX_TOKENS", "160"))
+BENCH_CODE_MAX_TOKENS = int(os.environ.get("BENCH_CODE_MAX_TOKENS", "256"))
+BENCH_REASONING_MAX_TOKENS = int(os.environ.get("BENCH_REASONING_MAX_TOKENS", "96"))
 BENCH_KNOWLEDGE_MAX_TOKENS = int(os.environ.get("BENCH_KNOWLEDGE_MAX_TOKENS", "48"))
-BENCH_IFEVAL_MAX_TOKENS = int(os.environ.get("BENCH_IFEVAL_MAX_TOKENS", "512"))
-BENCH_AIME_MAX_TOKENS = int(os.environ.get("BENCH_AIME_MAX_TOKENS", "1024"))
-BENCH_MBPP_MAX_TOKENS = int(os.environ.get("BENCH_MBPP_MAX_TOKENS", "512"))
-BENCH_TOOL_USE_MAX_TOKENS = int(os.environ.get("BENCH_TOOL_USE_MAX_TOKENS", "320"))
-BENCH_SELF_CONSISTENCY_MAX_TOKENS = int(os.environ.get("BENCH_SELF_CONSISTENCY_MAX_TOKENS", "512"))
+BENCH_IFEVAL_MAX_TOKENS = int(os.environ.get("BENCH_IFEVAL_MAX_TOKENS", "256"))
+BENCH_AIME_MAX_TOKENS = int(os.environ.get("BENCH_AIME_MAX_TOKENS", "384"))
+BENCH_MBPP_MAX_TOKENS = int(os.environ.get("BENCH_MBPP_MAX_TOKENS", "256"))
+BENCH_TOOL_USE_MAX_TOKENS = int(os.environ.get("BENCH_TOOL_USE_MAX_TOKENS", "192"))
+BENCH_SELF_CONSISTENCY_MAX_TOKENS = int(os.environ.get("BENCH_SELF_CONSISTENCY_MAX_TOKENS", "256"))
 BENCH_TOOL_USE_SANDBOX_TIMEOUT_S = float(os.environ.get("BENCH_TOOL_USE_SANDBOX_TIMEOUT_S", "4.0"))
 BENCH_ARC_MAX_TOKENS = int(os.environ.get("BENCH_ARC_MAX_TOKENS", "48"))
 BENCH_TRUTHFUL_MAX_TOKENS = int(os.environ.get("BENCH_TRUTHFUL_MAX_TOKENS", "48"))
 BENCH_LC_MAX_TOKENS = int(os.environ.get("BENCH_LC_MAX_TOKENS", "32"))
 BENCH_PROCEDURAL_MAX_TOKENS = int(os.environ.get("BENCH_PROCEDURAL_MAX_TOKENS", "64"))
-BENCH_ROBUSTNESS_MAX_TOKENS = int(os.environ.get("BENCH_ROBUSTNESS_MAX_TOKENS", "384"))
-BENCH_NOISE_MAX_TOKENS = int(os.environ.get("BENCH_NOISE_MAX_TOKENS", "384"))
+BENCH_ROBUSTNESS_MAX_TOKENS = int(os.environ.get("BENCH_ROBUSTNESS_MAX_TOKENS", "160"))
+BENCH_NOISE_MAX_TOKENS = int(os.environ.get("BENCH_NOISE_MAX_TOKENS", "160"))
 
 # Per-bench RNG stream offsets so the axes draw from independent
 # substreams even when given the same block_seed. Hex constants are
@@ -4165,14 +4541,106 @@ def _bench_generate(model, tokenizer, prompt: str, max_new_tokens: int,
     pad_id = getattr(tokenizer, "pad_token_id", None) or (eos_ids[0] if eos_ids else 0)
     rendered = _render_chat_prompt(tokenizer, prompt, enable_thinking=enable_thinking)
     ids = tokenizer(rendered, return_tensors="pt").input_ids.to(device)
-    gen = model.generate(
+    gen = quasar_memory_generate(
+        model,
         ids, max_new_tokens=max_new_tokens,
         do_sample=False, temperature=1.0, top_p=1.0,
-        pad_token_id=pad_id, eos_token_id=eos_ids, use_cache=False,
+        pad_token_id=pad_id, eos_token_id=eos_ids, use_cache=True,
     )
     new_ids = gen[0, ids.shape[1]:]
     text = tokenizer.decode(new_ids, skip_special_tokens=True)
     return text, int(new_ids.shape[0])
+
+
+def _bench_batch_size() -> int:
+    raw = (
+        os.environ.get("QUASAR_BENCH_BATCH_SIZE")
+        or os.environ.get("QUASAR_VLLM_CONCURRENCY")
+        or "8"
+    )
+    try:
+        return max(1, int(raw))
+    except Exception:
+        return 8
+
+
+def _bench_generate_batch(
+    model,
+    tokenizer,
+    prompts: list[str],
+    max_new_tokens: int,
+    device: str,
+    enable_thinking: bool = False,
+) -> list[tuple[str, int]]:
+    """Greedy bench generation for several prompts.
+
+    Prefill still happens per prompt inside ``quasar_memory_generate_batch``,
+    but the decode loop is batched. That keeps scoring semantics aligned with
+    the old single-prompt path while using much more of the GPU.
+    """
+    if not prompts:
+        return []
+    if len(prompts) == 1:
+        return [
+            _bench_generate(
+                model, tokenizer, prompts[0], max_new_tokens, device,
+                enable_thinking=enable_thinking,
+            )
+        ]
+
+    eos_ids = []
+    for tok in ("<|im_end|>", "<|endoftext|>"):
+        tid = tokenizer.convert_tokens_to_ids(tok)
+        if isinstance(tid, int) and tid >= 0:
+            eos_ids.append(tid)
+    if getattr(tokenizer, "eos_token_id", None) is not None:
+        eos_ids.append(int(tokenizer.eos_token_id))
+    eos_ids = list(set(eos_ids)) or None
+    pad_id = getattr(tokenizer, "pad_token_id", None) or (eos_ids[0] if eos_ids else 0)
+
+    batch_size = _bench_batch_size()
+    results: list[tuple[str, int] | None] = [None] * len(prompts)
+    for start in range(0, len(prompts), batch_size):
+        chunk = prompts[start:start + batch_size]
+        try:
+            rendered = [
+                _render_chat_prompt(tokenizer, prompt, enable_thinking=enable_thinking)
+                for prompt in chunk
+            ]
+            ids_list = [
+                tokenizer(text, return_tensors="pt").input_ids.to(device)
+                for text in rendered
+            ]
+            gens = quasar_memory_generate_batch(
+                model,
+                ids_list,
+                max_new_tokens=max_new_tokens,
+                do_sample=False,
+                temperature=1.0,
+                top_p=1.0,
+                pad_token_id=pad_id,
+                eos_token_id=eos_ids,
+                use_cache=True,
+            )
+            for offset, (ids, gen) in enumerate(zip(ids_list, gens)):
+                new_ids = gen[0, ids.shape[1]:]
+                text = tokenizer.decode(new_ids, skip_special_tokens=True)
+                results[start + offset] = (text, int(new_ids.shape[0]))
+        except Exception as batch_err:
+            if os.environ.get("QUASAR_BENCH_BATCH_WARN", "1") != "0":
+                print(
+                    f"[bench] batch generation fallback: {str(batch_err)[:160]}",
+                    flush=True,
+                )
+            for offset, prompt in enumerate(chunk):
+                try:
+                    results[start + offset] = _bench_generate(
+                        model, tokenizer, prompt, max_new_tokens, device,
+                        enable_thinking=enable_thinking,
+                    )
+                except Exception as single_err:
+                    results[start + offset] = (f"[generation-error] {single_err}", 0)
+    return [r if r is not None else ("", 0) for r in results]
 
 
 # ── math_bench ─────────────────────────────────────────────────────────
@@ -4310,13 +4778,16 @@ def math_bench_probe(model, tokenizer, device="cuda"):
         was_training = model.training
         model.eval()
         with torch.no_grad():
-            for it in samples:
+            prompt_texts = [
+                _math_format_prompt(it["question"], it.get("src", ""))
+                for it in samples
+            ]
+            generations = _bench_generate_batch(
+                model, tokenizer, prompt_texts,
+                BENCH_MATH_MAX_TOKENS, device, enable_thinking=False,
+            )
+            for it, (text, tok) in zip(samples, generations):
                 try:
-                    prompt_text = _math_format_prompt(it["question"], it.get("src", ""))
-                    text, tok = _bench_generate(
-                        model, tokenizer, prompt_text,
-                        BENCH_MATH_MAX_TOKENS, device, enable_thinking=False,
-                    )
                     pred = _math_extract_answer(text, it.get("src", ""))
                     ok = _math_score_one(pred, it["gold"])
                     out["items"].append({
@@ -4357,20 +4828,21 @@ def code_bench_probe(model, tokenizer, device="cuda"):
         was_training = model.training
         model.eval()
         with torch.no_grad():
-            for it in samples:
-                try:
-                    prompt_text = (
-                        "Complete the following Python function. "
-                        "Output only the function body (no extra explanation, no markdown fences).\n\n"
-                        f"{it['prompt']}"
-                    )
-                    gen, tok = _bench_generate(
-                        model, tokenizer, prompt_text,
-                        BENCH_CODE_MAX_TOKENS, device, enable_thinking=False,
-                    )
-                    generations.append((gen, int(tok), it))
-                except Exception as e:
-                    generations.append(("", 0, {**it, "gen_error": str(e)[:120]}))
+            prompt_texts = [
+                (
+                    "Complete the following Python function. "
+                    "Output only the function body (no extra explanation, no markdown fences).\n\n"
+                    f"{it['prompt']}"
+                )
+                for it in samples
+            ]
+            generated = _bench_generate_batch(
+                model, tokenizer, prompt_texts,
+                BENCH_CODE_MAX_TOKENS, device, enable_thinking=False,
+            )
+            generations.extend(
+                (gen, int(tok), it) for it, (gen, tok) in zip(samples, generated)
+            )
         if was_training:
             model.train()
         sandbox_input = [
@@ -4468,13 +4940,16 @@ def reasoning_bench_probe(model, tokenizer, device="cuda"):
         was_training = model.training
         model.eval()
         with torch.no_grad():
-            for it in samples:
+            prompt_texts = [
+                _reasoning_format_prompt(it["question"], it["gold"])
+                for it in samples
+            ]
+            generations = _bench_generate_batch(
+                model, tokenizer, prompt_texts,
+                BENCH_REASONING_MAX_TOKENS, device, enable_thinking=False,
+            )
+            for it, (text, tok) in zip(samples, generations):
                 try:
-                    prompt_text = _reasoning_format_prompt(it["question"], it["gold"])
-                    text, tok = _bench_generate(
-                        model, tokenizer, prompt_text,
-                        BENCH_REASONING_MAX_TOKENS, device, enable_thinking=False,
-                    )
                     pred = _reasoning_extract_answer(text, it["gold"])
                     ok = _reasoning_score_one(pred, it["gold"])
                     out["items"].append({
@@ -4562,13 +5037,13 @@ def knowledge_bench_probe(model, tokenizer, device="cuda"):
         was_training = model.training
         model.eval()
         with torch.no_grad():
-            for it in samples:
+            prompt_texts = [_format_mmlu_prompt(it) for it in samples]
+            generations = _bench_generate_batch(
+                model, tokenizer, prompt_texts,
+                BENCH_KNOWLEDGE_MAX_TOKENS, device, enable_thinking=False,
+            )
+            for it, (text, tok) in zip(samples, generations):
                 try:
-                    prompt_text = _format_mmlu_prompt(it)
-                    text, tok = _bench_generate(
-                        model, tokenizer, prompt_text,
-                        BENCH_KNOWLEDGE_MAX_TOKENS, device, enable_thinking=False,
-                    )
                     cleaned = _strip_thinking_probe(text or "").strip()
                     pred = _extract_mmlu_letter(cleaned, max_letter="J")
                     ok = 1 if pred and pred == it["gold_letter"] else 0
@@ -4610,12 +5085,13 @@ def ifeval_bench_probe(model, tokenizer, device="cuda"):
         was_training = model.training
         model.eval()
         with torch.no_grad():
-            for it in samples:
+            prompt_texts = [it["prompt"] for it in samples]
+            generations = _bench_generate_batch(
+                model, tokenizer, prompt_texts,
+                BENCH_IFEVAL_MAX_TOKENS, device, enable_thinking=False,
+            )
+            for it, (text, tok) in zip(samples, generations):
                 try:
-                    text, tok = _bench_generate(
-                        model, tokenizer, it["prompt"],
-                        BENCH_IFEVAL_MAX_TOKENS, device, enable_thinking=False,
-                    )
                     cleaned = _strip_thinking_probe(text or "")
                     all_pass, per = _ifev.evaluate_item(
                         cleaned, it["instruction_ids"], it.get("kwargs") or [],
@@ -4740,13 +5216,13 @@ def aime_bench_probe(model, tokenizer, device="cuda"):
         was_training = model.training
         model.eval()
         with torch.no_grad():
-            for it in samples:
+            prompt_texts = [_aime_format_prompt(it["question"]) for it in samples]
+            generations = _bench_generate_batch(
+                model, tokenizer, prompt_texts,
+                BENCH_AIME_MAX_TOKENS, device, enable_thinking=False,
+            )
+            for it, (text, tok) in zip(samples, generations):
                 try:
-                    prompt_text = _aime_format_prompt(it["question"])
-                    text, tok = _bench_generate(
-                        model, tokenizer, prompt_text,
-                        BENCH_AIME_MAX_TOKENS, device, enable_thinking=False,
-                    )
                     pred = _aime_extract_answer(text)
                     ok = _aime_score_one(pred, it["gold"])
                     out["items"].append({
@@ -4816,16 +5292,14 @@ def mbpp_bench_probe(model, tokenizer, device="cuda"):
         was_training = model.training
         model.eval()
         with torch.no_grad():
-            for it in samples:
-                try:
-                    prompt_text = _mbpp_build_prompt(it)
-                    gen, tok = _bench_generate(
-                        model, tokenizer, prompt_text,
-                        BENCH_MBPP_MAX_TOKENS, device, enable_thinking=False,
-                    )
-                    generations.append((gen, int(tok), it))
-                except Exception as e:
-                    generations.append(("", 0, {**it, "gen_error": str(e)[:120]}))
+            prompt_texts = [_mbpp_build_prompt(it) for it in samples]
+            generated = _bench_generate_batch(
+                model, tokenizer, prompt_texts,
+                BENCH_MBPP_MAX_TOKENS, device, enable_thinking=False,
+            )
+            generations.extend(
+                (gen, int(tok), it) for it, (gen, tok) in zip(samples, generated)
+            )
         if was_training:
             model.train()
         # MBPP solutions often don't stub the function signature at the
@@ -5140,13 +5614,13 @@ def arc_bench_probe(model, tokenizer, device="cuda"):
         was_training = model.training
         model.eval()
         with torch.no_grad():
-            for it in samples:
+            prompt_texts = [_format_arc_prompt(it) for it in samples]
+            generations = _bench_generate_batch(
+                model, tokenizer, prompt_texts,
+                BENCH_ARC_MAX_TOKENS, device, enable_thinking=False,
+            )
+            for it, (text, tok) in zip(samples, generations):
                 try:
-                    prompt_text = _format_arc_prompt(it)
-                    text, tok = _bench_generate(
-                        model, tokenizer, prompt_text,
-                        BENCH_ARC_MAX_TOKENS, device, enable_thinking=False,
-                    )
                     cleaned = _strip_thinking_probe(text or "").strip()
                     pred = _extract_mmlu_letter(cleaned, max_letter="E")
                     ok = 1 if pred and pred == it["gold_letter"] else 0
@@ -7292,36 +7766,37 @@ def robustness_bench_probe(model, tokenizer, device="cuda"):
         was_training = model.training
         model.eval()
         with torch.no_grad():
+            jobs = []
             for it in samples:
                 base_prompt = _math_format_prompt(
                     it["question"], it.get("src", ""),
                 )
                 for name, perturb in perturbations:
-                    try:
-                        prompt = perturb(base_prompt)
-                        text, tok = _bench_generate(
-                            model, tokenizer, prompt,
-                            BENCH_ROBUSTNESS_MAX_TOKENS, device,
-                            enable_thinking=False,
-                        )
-                        pred = _math_extract_answer(text, it.get("src", ""))
-                        ok = _math_score_one(pred, it["gold"])
-                        out["items"].append({
-                            "src": it.get("src", ""),
-                            "perturbation": name,
-                            "pred": (pred or "")[:80],
-                            "gold": str(it.get("gold", ""))[:40],
-                            "ok": bool(ok),
-                            "gen_tokens": int(tok),
-                        })
-                        out["n"] += 1
-                        out["correct"] += ok
-                    except Exception as e:
-                        out["items"].append({
-                            "src": it.get("src", ""),
-                            "perturbation": name,
-                            "error": str(e)[:120],
-                        })
+                    jobs.append((it, name, perturb(base_prompt)))
+            generations = _bench_generate_batch(
+                model, tokenizer, [prompt for _it, _name, prompt in jobs],
+                BENCH_ROBUSTNESS_MAX_TOKENS, device, enable_thinking=False,
+            )
+            for (it, name, _prompt), (text, tok) in zip(jobs, generations):
+                try:
+                    pred = _math_extract_answer(text, it.get("src", ""))
+                    ok = _math_score_one(pred, it["gold"])
+                    out["items"].append({
+                        "src": it.get("src", ""),
+                        "perturbation": name,
+                        "pred": (pred or "")[:80],
+                        "gold": str(it.get("gold", ""))[:40],
+                        "ok": bool(ok),
+                        "gen_tokens": int(tok),
+                    })
+                    out["n"] += 1
+                    out["correct"] += ok
+                except Exception as e:
+                    out["items"].append({
+                        "src": it.get("src", ""),
+                        "perturbation": name,
+                        "error": str(e)[:120],
+                    })
         if was_training:
             model.train()
         out["pass_frac"] = out["correct"] / max(1, out["n"])
@@ -7518,41 +7993,42 @@ def noise_resistance_bench_probe(model, tokenizer, device="cuda"):
         was_training = model.training
         model.eval()
         with torch.no_grad():
+            jobs = []
             for item_idx, it in enumerate(samples):
                 base_prompt = _math_format_prompt(
                     it["question"], it.get("src", ""),
                 )
                 for pert_idx, (name, perturb) in enumerate(perturbations):
-                    try:
-                        # Per-(item, pert) deterministic seed so internal
-                        # randomness inside a wrapper (typo positions, etc.)
-                        # is reproducible across validators in the same
-                        # round but rotates per block.
-                        sub_seed = (seed_root + item_idx * 1009 + pert_idx * 13) & 0x7FFFFFFF
-                        prompt = perturb(base_prompt, sub_seed)
-                        text, tok = _bench_generate(
-                            model, tokenizer, prompt,
-                            BENCH_NOISE_MAX_TOKENS, device,
-                            enable_thinking=False,
-                        )
-                        pred = _math_extract_answer(text, it.get("src", ""))
-                        ok = _math_score_one(pred, it["gold"])
-                        out["items"].append({
-                            "src": it.get("src", ""),
-                            "perturbation": name,
-                            "pred": (pred or "")[:80],
-                            "gold": str(it.get("gold", ""))[:40],
-                            "ok": bool(ok),
-                            "gen_tokens": int(tok),
-                        })
-                        out["n"] += 1
-                        out["correct"] += ok
-                    except Exception as e:
-                        out["items"].append({
-                            "src": it.get("src", ""),
-                            "perturbation": name,
-                            "error": str(e)[:120],
-                        })
+                    # Per-(item, pert) deterministic seed so internal
+                    # randomness inside a wrapper (typo positions, etc.)
+                    # is reproducible across validators in the same
+                    # round but rotates per block.
+                    sub_seed = (seed_root + item_idx * 1009 + pert_idx * 13) & 0x7FFFFFFF
+                    jobs.append((it, name, perturb(base_prompt, sub_seed)))
+            generations = _bench_generate_batch(
+                model, tokenizer, [prompt for _it, _name, prompt in jobs],
+                BENCH_NOISE_MAX_TOKENS, device, enable_thinking=False,
+            )
+            for (it, name, _prompt), (text, tok) in zip(jobs, generations):
+                try:
+                    pred = _math_extract_answer(text, it.get("src", ""))
+                    ok = _math_score_one(pred, it["gold"])
+                    out["items"].append({
+                        "src": it.get("src", ""),
+                        "perturbation": name,
+                        "pred": (pred or "")[:80],
+                        "gold": str(it.get("gold", ""))[:40],
+                        "ok": bool(ok),
+                        "gen_tokens": int(tok),
+                    })
+                    out["n"] += 1
+                    out["correct"] += ok
+                except Exception as e:
+                    out["items"].append({
+                        "src": it.get("src", ""),
+                        "perturbation": name,
+                        "error": str(e)[:120],
+                    })
         if was_training:
             model.train()
         out["pass_frac"] = out["correct"] / max(1, out["n"])
@@ -7571,12 +8047,13 @@ def procedural_bench_probe(model, tokenizer, device="cuda"):
         was_training = model.training
         model.eval()
         with torch.no_grad():
-            for it in samples:
+            prompt_texts = [it["prompt"] for it in samples]
+            generations = _bench_generate_batch(
+                model, tokenizer, prompt_texts,
+                BENCH_PROCEDURAL_MAX_TOKENS, device, enable_thinking=False,
+            )
+            for it, (text, tok) in zip(samples, generations):
                 try:
-                    text, tok = _bench_generate(
-                        model, tokenizer, it["prompt"],
-                        BENCH_PROCEDURAL_MAX_TOKENS, device, enable_thinking=False,
-                    )
                     cleaned = _strip_thinking_probe(text or "").strip()
                     gold = str(it.get("answer", ""))
                     ok = 1 if _answer_exact_in_text(gold, cleaned, strict=True) else 0
@@ -7629,13 +8106,13 @@ def truthful_bench_probe(model, tokenizer, device="cuda"):
         was_training = model.training
         model.eval()
         with torch.no_grad():
-            for it in samples:
+            prompt_texts = [_format_truthful_prompt(it) for it in samples]
+            generations = _bench_generate_batch(
+                model, tokenizer, prompt_texts,
+                BENCH_TRUTHFUL_MAX_TOKENS, device, enable_thinking=False,
+            )
+            for it, (text, tok) in zip(samples, generations):
                 try:
-                    prompt_text = _format_truthful_prompt(it)
-                    text, tok = _bench_generate(
-                        model, tokenizer, prompt_text,
-                        BENCH_TRUTHFUL_MAX_TOKENS, device, enable_thinking=False,
-                    )
                     cleaned = _strip_thinking_probe(text or "").strip()
                     pred = _extract_mmlu_letter(cleaned, max_letter="J")
                     ok = 1 if pred and pred == it["gold_letter"] else 0
@@ -7699,13 +8176,13 @@ def long_context_bench_probe(model, tokenizer, device="cuda"):
         was_training = model.training
         model.eval()
         with torch.no_grad():
-            for it in samples:
+            prompt_texts = [_format_long_context_prompt(it) for it in samples]
+            generations = _bench_generate_batch(
+                model, tokenizer, prompt_texts,
+                BENCH_LC_MAX_TOKENS, device, enable_thinking=False,
+            )
+            for it, (text, tok) in zip(samples, generations):
                 try:
-                    prompt_text = _format_long_context_prompt(it)
-                    text, tok = _bench_generate(
-                        model, tokenizer, prompt_text,
-                        BENCH_LC_MAX_TOKENS, device, enable_thinking=False,
-                    )
                     cleaned = _strip_thinking_probe(text or "").strip()
                     gold = str(it.get("answer", ""))
                     confuser_answers = it.get("confuser_answers") or []
@@ -7743,7 +8220,7 @@ def long_context_bench_probe(model, tokenizer, device="cuda"):
     return out
 
 
-def run_bench_battery(model, tokenizer, device="cuda"):
+def run_bench_battery(model, tokenizer, device="cuda", progress_cb=None):
     """Run all bench probes for one student. Returns a dict keyed by axis
     name (``math_bench`` / ``code_bench`` / ... / ``aime_bench`` / etc.).
     Each value is a dict with ``n``, ``correct``, ``pass_frac``, ``items``,
@@ -7795,14 +8272,42 @@ def run_bench_battery(model, tokenizer, device="cuda"):
                 "n": 0, "correct": 0, "pass_frac": 0.0, "wall_s": 0.0,
                 "_skipped": True,
             }
-    for name, fn in _probes:
+    total_probes = len(_probes)
+    for idx, (name, fn) in enumerate(_probes, start=1):
         st = time.time()
+        if callable(progress_cb):
+            try:
+                progress_cb(name, idx, total_probes, "start")
+            except Exception:
+                pass
+        print(f"[eval] Bench axis {idx}/{total_probes} {name}: start", flush=True)
         try:
             res = fn(model, tokenizer, device)
         except Exception as e:
             res = {"error": str(e)[:200], "n": 0, "correct": 0, "pass_frac": 0.0}
         res["wall_s"] = round(time.time() - st, 1)
         out[name] = res
+        if res.get("error"):
+            bench_summary = f"ERR {res.get('error')}"
+        elif res.get("_skipped"):
+            bench_summary = "SKIP"
+        elif res.get("n", 0) > 0:
+            bench_summary = (
+                f"{res.get('correct', 0)}/{res.get('n', 0)} "
+                f"({float(res.get('pass_frac', 0.0)) * 100:.0f}%)"
+            )
+        else:
+            bench_summary = "skip"
+        print(
+            f"[eval] Bench axis {idx}/{total_probes} {name}: "
+            f"{bench_summary} ({res['wall_s']:.1f}s)",
+            flush=True,
+        )
+        if callable(progress_cb):
+            try:
+                progress_cb(name, idx, total_probes, "done", res)
+            except Exception:
+                pass
     out["_total_wall_s"] = round(time.time() - t0, 1)
     out["_shadow_axes_enabled"] = BENCH_BATTERY_SHADOW_AXES
     return out
@@ -7884,7 +8389,7 @@ def prepare_teacher_probe_refs_hf(teacher, tokenizer, device="cuda", block_seed=
             # Chat-probe teacher anchor for the length axis. We run with the
             # same enable_thinking=False / greedy config as the student-side
             # ``chat_response_probe`` so the length ratio is apples-to-apples.
-            # CHAT_PROBE_MAX_TOKENS (default 768) is enough headroom for a
+            # CHAT_PROBE_MAX_TOKENS (default 256) is enough headroom for a
             # well-behaved teacher to terminate trivial prompts; if the
             # teacher itself rambles we want to know about that too.
             for prompt in CHAT_PROBE_PROMPTS:
@@ -8094,10 +8599,11 @@ def thinking_collapse_probe(model, tokenizer, device="cuda", teacher_samples=Non
                             msgs, tokenize=False, add_generation_prompt=True,
                         )
                     ids = tokenizer(rendered, return_tensors="pt").input_ids.to(device)
-                    gen = model.generate(
+                    gen = quasar_memory_generate(
+                        model,
                         ids, max_new_tokens=THINK_PROBE_MAX_TOKENS,
                         do_sample=False, temperature=1.0, top_p=1.0,
-                        pad_token_id=pad_id, eos_token_id=eos_ids, use_cache=False,
+                        pad_token_id=pad_id, eos_token_id=eos_ids, use_cache=True,
                     )
                     new_ids = gen[0, ids.shape[1]:]
                     gen_len = int(new_ids.shape[0])
@@ -10711,7 +11217,35 @@ def main():
                     "Benchmark probes",
                     prompts_done=0,
                 )
-                bench_res = run_bench_battery(student, tokenizer, device)
+                def _bench_progress(axis_name, axis_idx, axis_total, status, payload=None):
+                    axis_label = axis_name.replace("_bench", "").replace("_", " ").title()
+                    fields = {
+                        "prompts_done": 0,
+                        "bench_axis": axis_name,
+                        "bench_axis_label": axis_label,
+                        "bench_axis_index": axis_idx,
+                        "bench_axis_total": axis_total,
+                        "bench_axis_status": status,
+                    }
+                    if isinstance(payload, dict):
+                        fields.update({
+                            "bench_axis_n": payload.get("n", 0),
+                            "bench_axis_correct": payload.get("correct", 0),
+                            "bench_axis_pass_frac": payload.get("pass_frac", 0.0),
+                            "bench_axis_wall_s": payload.get("wall_s", 0.0),
+                            "bench_axis_error": payload.get("error"),
+                        })
+                    _set_student_progress(
+                        "benchmark_probe",
+                        student_name,
+                        student_idx,
+                        f"Benchmark probes: {axis_label}",
+                        **fields,
+                    )
+
+                bench_res = run_bench_battery(
+                    student, tokenizer, device, progress_cb=_bench_progress,
+                )
                 total_w = bench_res.pop("_total_wall_s", 0.0)
                 results["students"].setdefault(student_name, {})
                 summary_bits = []

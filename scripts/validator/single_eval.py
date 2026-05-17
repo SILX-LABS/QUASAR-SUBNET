@@ -15,8 +15,10 @@ Production policy:
   shard.
 * If no challengers are pending, the epoch is a no-op and the validator only
   refreshes weights for the stored king.
-* The crown is selected by composite score with a stability margin, not by
-  raw KL alone. Raw KL remains one telemetry/scoring axis.
+* The service applies the final crown gate: a challenger must pass paired KL
+  against the incumbent and must not regress on composite quality. Stored
+  composite scores still decide the incumbent/fallback king when no challenger
+  clears both gates.
 """
 
 from __future__ import annotations

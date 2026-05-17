@@ -41,6 +41,7 @@ logger = logging.getLogger("quasar.validator")
 # dethrone on one round" — partial pipes through composite axes amplify
 # noise on fewer axes.
 MIN_PROMPTS_FOR_LEADERBOARD = 150
+MIN_FILTERED_PROMPTS_FOR_LEADERBOARD = 100
 
 
 def migrate_dq_entries(state: ValidatorState, commitments: dict):
@@ -182,6 +183,24 @@ def update_h2h_state(state: ValidatorState, h2h_results, king_uid, winner_uid,
     # See MIN_PROMPTS_FOR_LEADERBOARD docstring above for the 2026-04-24
     # Pete-warned-us incident this prevents.
     king_prompts_completed = len(king_per_prompt) if king_per_prompt else 0
+    scored_prompt_totals = []
+    for row in h2h_results or []:
+        for key in ("prompts_total", "paired_prompts", "prompts_scored"):
+            try:
+                value = int(row.get(key))
+            except (TypeError, ValueError):
+                continue
+            if value > 0:
+                scored_prompt_totals.append(value)
+                break
+    round_prompt_capacity = max(scored_prompt_totals) if scored_prompt_totals else n_prompts
+    if n_prompts >= MIN_PROMPTS_FOR_LEADERBOARD and round_prompt_capacity:
+        canonical_prompt_threshold = max(
+            MIN_FILTERED_PROMPTS_FOR_LEADERBOARD,
+            min(MIN_PROMPTS_FOR_LEADERBOARD, int(round_prompt_capacity)),
+        )
+    else:
+        canonical_prompt_threshold = MIN_PROMPTS_FOR_LEADERBOARD
     single_eval_active = is_single_eval_mode()
     # In single-eval mode the composite selector is canonical. If the king
     # row is missing or has zero paired prompts, do not let the legacy H2H
@@ -191,14 +210,14 @@ def update_h2h_state(state: ValidatorState, h2h_results, king_uid, winner_uid,
         round_is_canonical = bool(h2h_results)
     else:
         round_is_canonical = (
-            king_prompts_completed >= MIN_PROMPTS_FOR_LEADERBOARD
+            king_prompts_completed >= canonical_prompt_threshold
             and not (king_uid is not None and king_h2h_kl is None)
         )
     if not round_is_canonical:
         logger.warning(
             f"🚧 Round at block {current_block} is PARTIAL "
             f"(king completed {king_prompts_completed}/{n_prompts} prompts, "
-            f"threshold={MIN_PROMPTS_FOR_LEADERBOARD}). h2h_history entry will "
+            f"threshold={canonical_prompt_threshold}). h2h_history entry will "
             f"be marked `_invalid_for_leaderboard=True`; skipping "
             f"top4_leaderboard/scores/h2h_tested_against_king writes."
         )
@@ -219,8 +238,8 @@ def update_h2h_state(state: ValidatorState, h2h_results, king_uid, winner_uid,
         "king_global_kl": round(king_kl, 6),
         "epsilon": None if single_eval_active else EPSILON,
         "epsilon_threshold": None if single_eval_active else round(king_h2h_kl * (1.0 - EPSILON), 6) if king_h2h_kl else None,
-        "paired_test_alpha": None if single_eval_active else PAIRED_TEST_ALPHA,
-        "dethrone_method": "composite_single_eval" if single_eval_active else "paired_t_test" if king_per_prompt else "legacy_epsilon",
+        "paired_test_alpha": PAIRED_TEST_ALPHA if single_eval_active or king_per_prompt else None,
+        "dethrone_method": "paired_kl_composite_gate" if single_eval_active else "paired_t_test" if king_per_prompt else "legacy_epsilon",
         "n_prompts": n_prompts, "results": h2h_results,
         "king_changed": king_changed,
         "new_king_uid": winner_uid if king_changed else None,
@@ -231,7 +250,8 @@ def update_h2h_state(state: ValidatorState, h2h_results, king_uid, winner_uid,
         "n_students": len(h2h_results),
         "king_prompts_completed": king_prompts_completed,
         "_invalid_for_leaderboard": not round_is_canonical,
-        "_min_prompts_for_leaderboard": MIN_PROMPTS_FOR_LEADERBOARD,
+        "_min_prompts_for_leaderboard": canonical_prompt_threshold,
+        "_requested_min_prompts_for_leaderboard": MIN_PROMPTS_FOR_LEADERBOARD,
     }
 
     # Only overwrite the canonical `h2h_latest` when the round is trustworthy.

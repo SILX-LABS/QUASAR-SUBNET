@@ -38,8 +38,9 @@ MIN_PROMPTS_FOR_SCORE_UPDATE = 150
 
 # ── Legacy composite-axis guard ─────────────────────────────────────────
 # Retained only for historical/non-production result decoding. Production
-# Quasar king selection is handled by scripts.validator.single_eval using
-# composite worst/weighted scores. Raw KL is one axis, never the crown gate.
+# Quasar king selection is finalized in scripts.validator.service: a challenger
+# must pass the paired-KL test and the composite quality gate. Raw KL and
+# composite alone are both insufficient crown gates.
 #
 # Floor choice: 0.20 is the "catastrophic failure" threshold for any axis
 # we care about. Concrete interpretation per axis:
@@ -150,8 +151,8 @@ def _composite_dethrone_veto(
     """Return a veto dict iff the challenger's composite is catastrophic.
 
     Legacy helper for old H2H result decoding. Production Quasar validators
-    do not crown from a KL gate; the final winner comes from the composite
-    selector in ``single_eval.py``.
+    do not crown from a KL gate; the final winner comes from the paired-KL
+    plus composite-quality selector in ``service.py``.
     Fail-open policy: the veto only triggers when we have ≥
     ``COMPOSITE_DETHRONE_MIN_AXES`` populated axes AND the worst is below
     the floor. If the composite couldn't be computed (missing data,
@@ -453,13 +454,13 @@ def process_results(results, models_to_eval, king_uid, state: ValidatorState, ui
 
     # Some resumed/legacy single-eval rounds may not contain the incumbent
     # king. Treat those as king-less for paired-test bookkeeping; the
-    # composite selector in apply_results_and_weights will use stored king
-    # state as the fallback.
+    # paired-KL plus composite-quality selector in apply_results_and_weights
+    # will use stored king state as the fallback.
     if king_uid is not None and king_uid not in models_to_eval:
         logger.info(
             f"single-eval: king UID {king_uid} not in this round (one-eval-per-"
             f"commitment policy); paired-test gate disabled, cross-round "
-            f"composite selector will pick the new king."
+            f"paired-KL plus composite-quality selector will pick the new king."
         )
         king_uid = None
         king_kl = float("inf")
@@ -528,7 +529,6 @@ def process_results(results, models_to_eval, king_uid, state: ValidatorState, ui
                 model_name, uid, fingerprint, state.state_dir,
                 commit_block=this_commit_block,
                 uid_to_commit_block=uid_to_commit_block,
-                uid_to_coldkey=uid_to_coldkey,
             )
             if is_copy:
                 if copy_uid == uid:
@@ -729,8 +729,9 @@ def process_results(results, models_to_eval, king_uid, state: ValidatorState, ui
             "composite floor veto will be waived for KL-significant challengers this round"
         )
     # Legacy KL dethrone path. Production Quasar single-eval skips this
-    # entirely; service.apply_results_and_weights chooses the winner via
-    # composite after h2h_results are annotated and merged.
+    # entirely; service.apply_results_and_weights chooses the winner after
+    # h2h_results are annotated and merged by requiring both paired-KL and
+    # composite-quality gates.
     dethroners: list[dict] = []  # passed paired-t-test vs king
     legacy_dethroners: list[dict] = []  # historical epsilon candidates
     if king_uid is not None and challengers and not is_single_eval_mode():
@@ -960,7 +961,7 @@ def process_results(results, models_to_eval, king_uid, state: ValidatorState, ui
     # ── Composite ranking telemetry ─────────────────────────────────────
     # Production Quasar does not crown here from raw KL or paired tests.
     # This local ordering is only used to build round rows; service.py
-    # applies the final single-eval composite selector after annotation.
+    # applies the final paired-KL plus composite-quality selector after annotation.
     students_data = results.get("students", {}) or {}
     try:
         _tmp_h2h = [{"uid": king_uid, "model": uid_to_model.get(king_uid), "is_king": True}] if king_uid else []
@@ -1081,16 +1082,24 @@ def process_results(results, models_to_eval, king_uid, state: ValidatorState, ui
                 default=(None, None),
             )
             ax_name, ax_val = bad
-            row["vs_king"] = (
-                vs.replace(" dethroned", f" blocked: {ax_name}={ax_val:.2f}")
-                if ax_name is not None
-                else vs.replace(" dethroned", " blocked by composite")
-            )
-            row["composite_veto"] = {
+            warning = {
                 "worst_axis": ax_name,
                 "worst_value": round(float(ax_val), 4) if ax_val is not None else None,
                 "floor": COMPOSITE_DETHRONE_FLOOR,
             }
+            if is_single_eval_mode():
+                # In single-eval, service.py applies the final paired-KL +
+                # composite-quality gate. Keep this low-axis warning visible
+                # for dashboard/debugging; the authoritative crown decision is
+                # stamped later via winner_uid / selection_gate.
+                row["composite_warning"] = warning
+            else:
+                row["vs_king"] = (
+                    vs.replace(" dethroned", f" blocked: {ax_name}={ax_val:.2f}")
+                    if ax_name is not None
+                    else vs.replace(" dethroned", " blocked by composite")
+                )
+                row["composite_veto"] = warning
         # Re-sort h2h_results by composite.worst (desc) so the leaderboard
         # endpoint and h2h_latest display rank order matches the ranking
         # key used for crown decisions. KL stays as an informational field

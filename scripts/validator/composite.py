@@ -16,9 +16,10 @@ Status: PRODUCTION — ranking + dethrone gate.
   * 2026-04-19 (commit 8eec9a2): promoted from shadow to production
     ranking key. ``composite.worst`` orders the leaderboard and selects
     the canonical challenger for display.
-  * Current Quasar policy: ``composite.worst`` is the primary crown key.
-    Tied/saturated worst scores fall back to ``composite.weighted`` with
-    the same dethrone margin. KL is retained as a distillation axis only.
+  * Current Quasar policy: composite is the quality gate and fallback
+    incumbent selector. A challenger still needs a paired KL win against
+    the incumbent before it can take the crown; composite alone is not
+    enough to override a head-to-head loss.
   * Same commit: the ``length`` axis is now always populated even when
     ``THINK_COLLAPSE_PROBE=0``. It falls back to the always-on
     ``chat_probe`` length vs a teacher anchor captured in

@@ -1,6 +1,7 @@
 import json
 import logging
 import math
+import re
 import time
 
 from eval.model_checker import (
@@ -40,6 +41,79 @@ def _canonical_duplicate_uid(uid: int, duplicate_uids: list[int], commitments: d
     candidates = {uid}
     candidates.update(other_uid for other_uid in duplicate_uids if other_uid in commitments)
     return min(candidates, key=lambda candidate_uid: _commit_sort_key(candidate_uid, commitments))
+
+
+def _copy_root_uid_from_dq(
+    uid: int,
+    commitments: dict,
+    uid_to_hotkey: dict,
+    state: ValidatorState,
+) -> int | None:
+    current_uid = uid
+    seen = {uid}
+    root_uid: int | None = None
+    while True:
+        commit = commitments.get(current_uid, {}) or {}
+        hotkey = uid_to_hotkey.get(current_uid, commit.get("hotkey", ""))
+        reason = get_dq_reason(
+            current_uid,
+            hotkey,
+            state.dq_reasons,
+            commit_block=commit.get("block"),
+        )
+        if not reason or not str(reason).startswith("copy:"):
+            break
+        match = re.search(r"\bUID\s+(\d+)\b", str(reason))
+        if not match:
+            break
+        try:
+            next_uid = int(match.group(1))
+        except (TypeError, ValueError):
+            break
+        if next_uid == uid or next_uid in seen or next_uid not in commitments:
+            break
+        root_uid = next_uid
+        seen.add(next_uid)
+        current_uid = next_uid
+    return root_uid
+
+
+def _duplicate_candidates_for_action(
+    uid: int,
+    duplicate_uids: list[int],
+    commitments: dict,
+    uid_to_hotkey: dict,
+    state: ValidatorState,
+) -> list[int]:
+    """Return duplicate UIDs that can legitimately anchor copy DQ.
+
+    A later copy may itself already be DQ'd. It must not become the
+    canonical "original" for future identical models; otherwise a copied copy
+    can falsely DQ the real owner's recommit. When a DQ reason points at a
+    root UID, use that root instead. Duplicate policy is strict: same-coldkey
+    recommits are still duplicates when the weight/content hash matches.
+    """
+    out: set[int] = set()
+    for other_uid in duplicate_uids or []:
+        if other_uid == uid or other_uid not in commitments:
+            continue
+        root_uid = _copy_root_uid_from_dq(other_uid, commitments, uid_to_hotkey, state)
+        candidate_uid = root_uid if root_uid is not None else other_uid
+        if candidate_uid == uid or candidate_uid not in commitments:
+            continue
+        candidate_commit = commitments.get(candidate_uid, {}) or {}
+        candidate_hotkey = uid_to_hotkey.get(candidate_uid, candidate_commit.get("hotkey", ""))
+        if root_uid is None and is_disqualified(
+            candidate_uid,
+            candidate_hotkey,
+            state.dq_reasons,
+            commit_block=candidate_commit.get("block"),
+        ):
+            # DQ'd duplicate without a parseable root. Do not let invalid
+            # state anchor future copy decisions.
+            continue
+        out.add(candidate_uid)
+    return sorted(out, key=lambda candidate_uid: _commit_sort_key(candidate_uid, commitments))
 
 
 def _dq_later_duplicate(
@@ -87,8 +161,7 @@ def _cosine_sim(a: list, b: list) -> float:
 
 
 def check_activation_fingerprint(model_name: str, uid: int, fingerprint: dict, state_dir,
-                                 commit_block=None, uid_to_commit_block=None,
-                                 uid_to_coldkey=None):
+                                 commit_block=None, uid_to_commit_block=None):
     """Compare the incoming model's activation fingerprint against stored ones.
 
     Returns: (is_copy, copy_uid, copy_model, original_uid, original_model, sim)
@@ -103,12 +176,8 @@ def check_activation_fingerprint(model_name: str, uid: int, fingerprint: dict, s
     of an earlier-committed model — avoids polluting the store with later copies and
     makes future griefing attempts much harder (the king's fingerprint is the canonical one).
 
-    Same-coldkey carve-out (2026-04-20, sebastian_020521 request): if the matched
-    UID shares a coldkey with `uid`, this is a miner iterating on their own model
-    across hotkeys (e.g. best26/* family). We still report the match in logs so
-    scoring can use it as a tiebreaker, but we do NOT DQ either side — a miner
-    griefing themselves is not the attack we're protecting against, and losing a
-    legitimate hotkey slot is worse than letting a self-copy sit un-crowned.
+    Duplicate policy is strict: same-coldkey recommits are still duplicates
+    when the activation fingerprint matches an earlier committed model.
     """
     from pathlib import Path
 
@@ -158,17 +227,6 @@ def check_activation_fingerprint(model_name: str, uid: int, fingerprint: dict, s
     original_uid = max_sim_uid
     original_model = max_sim_model
 
-    if is_copy and uid_to_coldkey is not None and max_sim_uid is not None:
-        my_ck = uid_to_coldkey.get(uid)
-        other_ck = uid_to_coldkey.get(max_sim_uid)
-        if my_ck and other_ck and my_ck == other_ck:
-            logger.info(
-                f"UID {uid} ({model_name}) activation-matches UID {max_sim_uid} "
-                f"({max_sim_model}) at sim={max_sim:.6f} BUT they share coldkey "
-                f"{my_ck[:12]}… — self-copy carve-out, skipping DQ for both sides."
-            )
-            is_copy = False
-
     if is_copy:
         # Resolve commit_block for both sides with layered fallback:
         #   self:  explicit arg > uid_to_commit_block > None
@@ -210,7 +268,10 @@ def check_activation_fingerprint(model_name: str, uid: int, fingerprint: dict, s
                 copy_model = max_sim_model
                 original_uid = uid
                 original_model = model_name
-            elif other_b == my_b and max_sim_uid is not None and max_sim_uid < uid:
+            # Same-block ties are resolved by lower UID as canonical. If the
+            # stored match has the higher UID, flip so the current lower UID
+            # stays original; otherwise keep the default "incoming UID is copy".
+            elif other_b == my_b and max_sim_uid is not None and max_sim_uid > uid:
                 copy_uid = max_sim_uid
                 copy_model = max_sim_model
                 original_uid = uid
@@ -355,6 +416,9 @@ def precheck_all_models(commitments, uid_to_hotkey, uid_to_coldkey, state: Valid
             continue
         if model_hash:
             duplicate_uids = duplicate_hash_uids(model_hash, uid, state.state_dir)
+            duplicate_uids = _duplicate_candidates_for_action(
+                uid, duplicate_uids, commitments, uid_to_hotkey, state,
+            )
             canonical_uid = _canonical_duplicate_uid(uid, duplicate_uids, commitments)
             if canonical_uid != uid:
                 _dq_later_duplicate(
@@ -379,6 +443,9 @@ def precheck_all_models(commitments, uid_to_hotkey, uid_to_coldkey, state: Valid
             continue
         if content_hash:
             duplicate_uids = duplicate_content_hash_uids(content_hash, uid, state.state_dir)
+            duplicate_uids = _duplicate_candidates_for_action(
+                uid, duplicate_uids, commitments, uid_to_hotkey, state,
+            )
             canonical_uid = _canonical_duplicate_uid(uid, duplicate_uids, commitments)
             if canonical_uid != uid:
                 _dq_later_duplicate(

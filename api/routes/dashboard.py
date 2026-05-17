@@ -1,17 +1,21 @@
 """Single-file dashboard feed for the lightweight Quasar UI."""
 
 from datetime import datetime, timezone
+import os
+from pathlib import Path
 import re
 import time
 
 from fastapi import APIRouter
 from fastapi.responses import JSONResponse
 
+from config import STATE_DIR
 from external import get_commitments, get_metagraph, get_price, get_weights
 from helpers.cache import _get_stale
 from helpers.sanitize import _sanitize_floats
 from state_store import (
     composite_scores,
+    current_round,
     disqualified,
     eval_progress,
     latest_round,
@@ -24,6 +28,8 @@ from state_store import (
 )
 
 router = APIRouter()
+
+PAIRED_DUEL_ALPHA = 0.03
 
 
 def _iso(value):
@@ -113,18 +119,46 @@ def _history_rows(rounds, commitments):
                 lcb = mu_hat
             delta = king_loss - res.get("kl") if king_loss is not None and res.get("kl") is not None else mu_hat
             accepted = bool(rnd.get("king_changed") and rnd.get("new_king_uid") == uid)
+            p_value = tt.get("p")
+            duel_win = bool(
+                not res.get("disqualified")
+                and mu_hat is not None and mu_hat > 0
+                and (lcb is None or lcb > 0)
+                and (p_value is None or p_value < PAIRED_DUEL_ALPHA)
+            )
+            if res.get("disqualified"):
+                verdict = "error"
+                verdict_label = "DQ"
+            elif accepted:
+                verdict = "crowned"
+                verdict_label = "CROWNED"
+            elif res.get("composite_veto"):
+                verdict = "gate_blocked"
+                verdict_label = "GATE BLOCK"
+            elif duel_win:
+                verdict = "duel_win"
+                verdict_label = "DUEL WIN"
+            else:
+                verdict = "held"
+                verdict_label = "HELD"
             out.append({
                 "uid": uid,
                 "challenger_repo": repo,
                 "hotkey": commit.get("hotkey"),
                 "accepted": accepted,
-                "verdict": "ok" if not res.get("disqualified") else "error",
+                "duel_win": duel_win,
+                "verdict": verdict,
+                "verdict_label": verdict_label,
+                "selection_detail": res.get("vs_king"),
+                "selection_gate": res.get("selection_gate"),
+                "composite_warning": res.get("composite_warning"),
+                "composite_veto": res.get("composite_veto"),
                 "error_code": "disqualified" if res.get("disqualified") else None,
                 "error_detail": res.get("dq_reason"),
                 "mu_hat": mu_hat or 0,
                 "lcb": lcb or 0,
                 "delta": delta or 0,
-                "p_value": tt.get("p"),
+                "p_value": p_value,
                 "t_stat": tt.get("t"),
                 "paired_prompts": tt.get("n") or res.get("paired_prompts"),
                 "se": tt.get("se"),
@@ -134,6 +168,267 @@ def _history_rows(rounds, commitments):
                 "timestamp": _iso(rnd.get("timestamp")),
             })
     return out
+
+
+def _latest_eval_log_path():
+    """Best-effort local eval log path for dashboard-only phase inference."""
+    cr = current_round() or {}
+    pod_eval = cr.get("pod_eval") if isinstance(cr.get("pod_eval"), dict) else {}
+    for key in ("log_remote", "log", "eval_output_log"):
+        raw = pod_eval.get(key)
+        if raw and os.path.exists(raw):
+            return raw
+    run_dir = pod_eval.get("run_dir")
+    if run_dir:
+        candidate = os.path.join(str(run_dir), "eval_output.log")
+        if os.path.exists(candidate):
+            return candidate
+    runs_dir = Path(STATE_DIR) / "local_eval_runs"
+    try:
+        runs = sorted(
+            (p for p in runs_dir.iterdir() if p.is_dir()),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        for run in runs[:3]:
+            candidate = run / "eval_output.log"
+            if candidate.exists():
+                return str(candidate)
+    except Exception:
+        pass
+    return None
+
+
+def _read_tail(path, max_bytes=256_000):
+    try:
+        size = os.path.getsize(path)
+        with open(path, "rb") as handle:
+            if size > max_bytes:
+                handle.seek(size - max_bytes)
+            return handle.read().decode("utf-8", errors="replace")
+    except Exception:
+        return ""
+
+
+def _latest_student_from_log(text):
+    matches = re.findall(r"^\[eval\] Student:\s+(.+?)(?:\s+\(|\s*$)", text, re.MULTILINE)
+    return matches[-1].strip() if matches else None
+
+
+def _infer_eval_phase_from_log(progress):
+    """Infer a fresher dashboard phase when pod eval_progress is stale.
+
+    Older eval runners wrote ``loading_student`` once and then spent many
+    minutes in probes without updating eval_progress.json. The stdout log is
+    still live, so use it as a dashboard-only truth source. This does not
+    affect validator scoring or the running eval process.
+    """
+    if not isinstance(progress, dict) or not progress.get("active"):
+        return None
+    phase = progress.get("phase") or progress.get("stage")
+    if phase not in {
+        "loading_student",
+        "finetune_probe",
+        "chat_probe",
+        "capability_probe",
+        "judge_probe",
+        "chat_turns_probe",
+        "benchmark_probe",
+        "fingerprint",
+    }:
+        return None
+    log_path = _latest_eval_log_path()
+    if not log_path:
+        return None
+    text = _read_tail(log_path)
+    if not text:
+        return None
+    student = _latest_student_from_log(text)
+    current = progress.get("current") if isinstance(progress.get("current"), dict) else {}
+    student = student or progress.get("current_student") or current.get("student_name")
+    tail_after_student = text
+    marker = f"[eval] Student: {student}" if student else None
+    if marker and marker in text:
+        tail_after_student = text.rsplit(marker, 1)[-1]
+
+    # Ordered from latest/most downstream to earliest. If a completed line is
+    # the last milestone we saw, show the next long-running step rather than
+    # the stale loading state.
+    checks = [
+        (r"\[\s*\d+/\d+\s*\]\s+KL=", "scoring", "KL scoring"),
+        (r"Fingerprint computed", "scoring", "KL scoring"),
+        (r"Bench battery", "fingerprint", "Activation fingerprint"),
+        (r"Chat-turns probe \(collect\):", "benchmark_probe", "Benchmark probes"),
+        (r"Judge probe \(collect\):", "chat_turns_probe", "Multi-turn probe"),
+        (r"Capability probe:", "judge_probe", "Judge probe collection"),
+        (r"Chat probe:", "capability_probe", "Capability probe"),
+        (r"Finetune probe:", "chat_probe", "Chat response probe"),
+        (r"Loaded in .*?s|King loaded", "finetune_probe", "Anti-finetune probe"),
+    ]
+    inferred = None
+    for pattern, inferred_phase, label in checks:
+        if re.search(pattern, tail_after_student):
+            inferred = (inferred_phase, label)
+            break
+    if not inferred:
+        return None
+    inferred_phase, label = inferred
+    try:
+        log_mtime = os.path.getmtime(log_path)
+    except OSError:
+        log_mtime = None
+    return {
+        "phase": inferred_phase,
+        "phase_label": label,
+        "student": student,
+        "log_path": log_path,
+        "log_mtime": log_mtime,
+    }
+
+
+def _uid_for_model(progress, model_name):
+    if not isinstance(progress, dict) or not model_name:
+        return None
+    models = progress.get("models") if isinstance(progress.get("models"), dict) else {}
+    for uid_str, model in models.items():
+        if model == model_name:
+            try:
+                return int(uid_str)
+            except (TypeError, ValueError):
+                return None
+    return None
+
+
+def _model_event_prefix(progress, model_name):
+    uid = _uid_for_model(progress, model_name)
+    if uid is not None:
+        return f"UID {uid}"
+    return model_name or "model"
+
+
+def _eval_log_events(progress, limit=32):
+    """Promote eval_output.log milestones into dashboard events.
+
+    ``eval_progress.json`` only contains the current stage. Long probes write
+    their useful milestones to stdout, so without this pass the public event
+    stream looks frozen or skips completed work.
+    """
+    if not isinstance(progress, dict) or not progress.get("active"):
+        return []
+    log_path = _latest_eval_log_path()
+    if not log_path:
+        return []
+    text = _read_tail(log_path)
+    if not text:
+        return []
+    try:
+        base_ts = os.path.getmtime(log_path)
+    except OSError:
+        base_ts = time.time()
+
+    events = []
+    current_student = None
+
+    def add(msg, level="info"):
+        if msg:
+            events.append({"ts": base_ts, "level": level, "msg": msg})
+
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        m = re.search(r"\[eval\] Student:\s+(.+?)(?:\s+\(|\s*$)", line)
+        if m:
+            current_student = m.group(1).strip()
+            add(f"{_model_event_prefix(progress, current_student)}: student model selected")
+            continue
+        m = re.search(r"\[vllm\] Ready in ([\d.]+s)", line)
+        if m:
+            add(f"Teacher vLLM ready in {m.group(1)}")
+            continue
+        m = re.search(r"\[(\d+)/(\d+)\]\s+latest:", line)
+        if m and m.group(1) == m.group(2):
+            add(f"Teacher generation reached {m.group(1)}/{m.group(2)} prompts")
+            continue
+        m = re.search(r"\[eval\] vLLM generation:\s+([\d.]+s)", line)
+        if m:
+            add(f"Teacher generation complete in {m.group(1)}")
+            continue
+        m = re.search(r"\[eval\] Teacher probe refs via vLLM:\s+(.+)", line)
+        if m:
+            add(f"Teacher probe references ready: {m.group(1)}")
+            continue
+        m = re.search(r"\[eval\] Filtered\s+(\d+)/(\d+)\s+prompts", line)
+        if m:
+            add(f"Prompt filter complete: skipped {m.group(1)}/{m.group(2)} short completions")
+            continue
+        m = re.search(r"\[eval\] Remaining:\s+(\d+)\s+prompts", line)
+        if m:
+            add(f"Student scoring set: {m.group(1)} prompts")
+            continue
+        m = re.search(r"\[eval\] Loaded in\s+([\d.]+s),\s+VRAM:\s+([^,]+)", line)
+        if m:
+            add(f"{_model_event_prefix(progress, current_student)}: model loaded in {m.group(1)}, VRAM {m.group(2)}")
+            continue
+        m = re.search(r"\[eval\] Finetune probe:\s+(.+?)\s+\(([\d.]+s)\)\s+(.+)$", line)
+        if m:
+            add(f"{_model_event_prefix(progress, current_student)}: anti-finetune probe {m.group(3).strip()} ({m.group(2)})")
+            continue
+        m = re.search(r"\[eval\] Chat probe:\s+(.+?)\s+\(([\d.]+s)\)\s+(.+)$", line)
+        if m:
+            add(f"{_model_event_prefix(progress, current_student)}: chat probe {m.group(3).strip()} ({m.group(2)}): {m.group(1)}")
+            continue
+        m = re.search(r"\[eval\] Capability probe:\s+(.+?)\s+\(([\d.]+s)\)", line)
+        if m:
+            add(f"{_model_event_prefix(progress, current_student)}: capability probe complete ({m.group(2)}): {m.group(1)}")
+            continue
+        m = re.search(r"\[eval\] Judge probe \(collect\):\s+(.+?)\s+\(([\d.]+s)\)", line)
+        if m:
+            add(f"{_model_event_prefix(progress, current_student)}: judge responses collected ({m.group(2)}): {m.group(1)}")
+            continue
+        m = re.search(r"\[eval\] Chat-turns probe \(collect\):\s+(.+?)\s+\(([\d.]+s)\)", line)
+        if m:
+            add(f"{_model_event_prefix(progress, current_student)}: multi-turn responses collected ({m.group(2)}): {m.group(1)}")
+            continue
+        m = re.search(r"\[eval\] Bench axis\s+(\d+)/(\d+)\s+([^:]+):\s+start", line)
+        if m:
+            add(
+                f"{_model_event_prefix(progress, current_student)}: benchmark "
+                f"{m.group(1)}/{m.group(2)} running: {m.group(3)}"
+            )
+            continue
+        m = re.search(r"\[eval\] Bench axis\s+(\d+)/(\d+)\s+([^:]+):\s+(.+?)\s+\(([\d.]+s)\)", line)
+        if m:
+            add(
+                f"{_model_event_prefix(progress, current_student)}: benchmark "
+                f"{m.group(1)}/{m.group(2)} complete ({m.group(5)}): "
+                f"{m.group(3)} {m.group(4)}"
+            )
+            continue
+        m = re.search(r"\[(\d+)/(\d+)\]\s+KL=", line)
+        if m:
+            add(f"{_model_event_prefix(progress, current_student)}: KL scoring {m.group(1)}/{m.group(2)} prompts")
+            continue
+        m = re.search(r"\[eval\]\s+([^:]+):\s+KL=([\d.]+)", line)
+        if m:
+            add(f"{_model_event_prefix(progress, current_student)}: KL complete {m.group(2)}")
+            continue
+        m = re.search(r"Bench battery:\s+(.+)", line)
+        if m:
+            add(f"{_model_event_prefix(progress, current_student)}: benchmark battery complete: {m.group(1)}")
+            continue
+        if "Fingerprint computed" in line:
+            add(f"{_model_event_prefix(progress, current_student)}: activation fingerprint computed")
+
+    if not events:
+        return []
+    # Preserve newest-first order with stable synthetic timestamps. The log has
+    # no per-line timestamps, so we space milestones by a few seconds.
+    selected = events[-limit:]
+    total = len(selected)
+    for idx, event in enumerate(selected):
+        event["ts"] = base_ts - (total - idx) * 3
+    return list(reversed(selected))
 
 
 def _current_eval(progress, commitments):
@@ -149,10 +444,14 @@ def _current_eval(progress, commitments):
         return None
     models = progress.get("models") if isinstance(progress.get("models"), dict) else {}
     current = progress.get("current") if isinstance(progress.get("current"), dict) else {}
+    pod = progress.get("pod") if isinstance(progress.get("pod"), dict) else {}
+    pod_current = pod.get("current") if isinstance(pod.get("current"), dict) else {}
     repo = (
         progress.get("current_student")
         or current.get("student_name")
         or current.get("model")
+        or pod_current.get("student_name")
+        or pod_current.get("model")
     )
     if not repo:
         order = progress.get("eval_order") or []
@@ -162,6 +461,10 @@ def _current_eval(progress, commitments):
                 break
     if not repo and not progress.get("prompts_total") and not current.get("prompts_total"):
         return None
+    inferred = _infer_eval_phase_from_log(progress)
+    if inferred:
+        phase = inferred["phase"]
+        repo = inferred.get("student") or repo
     uid = None
     for uid_str, model in models.items():
         if model == repo:
@@ -171,7 +474,13 @@ def _current_eval(progress, commitments):
                 uid = None
             break
     commit = commitments.get(uid, {})
-    total = progress.get("prompts_total") or current.get("prompts_total") or 0
+    total = (
+        pod_current.get("prompts_total")
+        or pod.get("prompts_total")
+        or progress.get("prompts_total")
+        or current.get("prompts_total")
+        or 0
+    )
     if phase == "vllm_generating":
         done = progress.get("teacher_prompts_done") or 0
     else:
@@ -179,6 +488,7 @@ def _current_eval(progress, commitments):
             progress.get("prompts_done")
             or progress.get("current_prompt")
             or current.get("prompts_done")
+            or pod_current.get("prompts_done")
             or progress.get("teacher_prompts_done")
             or 0
         )
@@ -191,6 +501,13 @@ def _current_eval(progress, commitments):
         "teacher_logits",
         "gpu_precompute",
         "loading_student",
+        "finetune_probe",
+        "chat_probe",
+        "capability_probe",
+        "judge_probe",
+        "chat_turns_probe",
+        "benchmark_probe",
+        "fingerprint",
     }
     phase_labels = {
         "pod_bootstrap": "Preparing evaluator",
@@ -213,18 +530,41 @@ def _current_eval(progress, commitments):
         "scoring": "KL scoring",
     }
     phase_label = current.get("stage") or phase_labels.get(phase) or (phase or "Evaluation")
-    if phase == "vllm_generating" and total:
-        status_text = f"{phase_label}: {done}/{total} teacher prompts"
-    elif phase == "scoring" and (current.get("prompts_total") or total):
-        score_total = current.get("prompts_total") or total
-        status_text = f"{phase_label}: {done}/{score_total} prompts"
-    elif repo:
-        status_text = f"{phase_label}: {repo}"
-    else:
-        status_text = phase_label
+    if inferred:
+        phase_label = inferred["phase_label"]
     mu_hat = current.get("kl_running_mean")
     if mu_hat is None:
         mu_hat = progress.get("current_kl")
+    metric_text = None
+    if phase == "vllm_generating" and total:
+        status_text = f"{phase_label}: {done}/{total} teacher prompts"
+        metric_text = f"TEACHER {done}/{total}"
+    elif phase == "scoring" and (current.get("prompts_total") or total):
+        score_total = current.get("prompts_total") or total
+        status_text = f"{phase_label}: {done}/{score_total} prompts"
+        metric_text = (
+            f"MU: {float(mu_hat):.6f}"
+            if isinstance(mu_hat, (int, float))
+            else f"{done}/{score_total}"
+        )
+    elif phase == "benchmark_probe" and current.get("bench_axis_label"):
+        axis_idx = current.get("bench_axis_index")
+        axis_total = current.get("bench_axis_total")
+        axis_prefix = (
+            f"{axis_idx}/{axis_total} "
+            if axis_idx is not None and axis_total is not None
+            else ""
+        )
+        status_text = f"Benchmark probes: {axis_prefix}{current.get('bench_axis_label')}"
+        metric_text = "RUNNING"
+    elif repo:
+        status_text = f"{phase_label}: {repo}"
+        metric_text = "RUNNING" if phase in indeterminate_phases else None
+    else:
+        status_text = phase_label
+        metric_text = "RUNNING" if phase in indeterminate_phases else None
+    if inferred and progress.get("phase") == "loading_student":
+        status_text += " (inferred from eval log)"
     return {
         "phase": phase,
         "phase_label": phase_label,
@@ -236,8 +576,11 @@ def _current_eval(progress, commitments):
         "progress": done,
         "total": total,
         "mu_hat": mu_hat or 0,
+        "metric_text": metric_text,
         "avg_king_loss": current.get("king_kl") or 0,
         "avg_challenger_loss": current.get("kl_running_mean") or 0,
+        "inferred_from_log": bool(inferred),
+        "log_updated_at": inferred.get("log_mtime") if inferred else None,
     }
 
 
@@ -277,14 +620,17 @@ def _dashboard_events(progress, current_eval, submissions, status):
             if not isinstance(item, dict):
                 continue
             name = item.get("student_name") or item.get("model") or "model"
-            status = item.get("status") or "done"
+            item_status = item.get("status") or "done"
             kl = item.get("kl")
             suffix = f", KL={float(kl):.6f}" if isinstance(kl, (int, float)) else ""
             events.append({
                 "ts": now,
                 "level": "info",
-                "msg": f"{name}: {status}{suffix}",
+                "msg": f"{name}: {item_status}{suffix}",
             })
+
+    for event in _eval_log_events(progress):
+        events.append(event)
 
     important = (
         "H2H:",

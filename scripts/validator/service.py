@@ -34,10 +34,12 @@ from scripts.validator.challengers import (
     check_models_exist,
     select_challengers,
 )
+from scripts.validator.composite import active_composite_axis_weights
 from scripts.validator.config import (
     EVAL_PROMPTS_FULL,
     EVAL_PROMPTS_H2H,
     MAX_KL_THRESHOLD,
+    PAIRED_TEST_ALPHA,
     REFERENCE_MODEL,
     REFERENCE_UID,
     TEACHER_MODEL,
@@ -81,6 +83,158 @@ logger = logging.getLogger("quasar.validator")
 
 
 # ── helpers ──────────────────────────────────────────────────────────────
+
+_RELATIVE_SELECTION_AXES = {"kl", "on_policy_rkl"}
+
+
+def _as_float(value, default=None):
+    try:
+        if value is None:
+            return default
+        out = float(value)
+    except (TypeError, ValueError):
+        return default
+    if out != out:
+        return default
+    return out
+
+
+def _composite_quality_score(record: dict | None) -> float | None:
+    """Composite score used only for crown gating.
+
+    The persisted composite ``weighted`` score includes relative axes such as
+    KL and on-policy RKL. Those are useful telemetry, but they should not be
+    the only reason an incumbent survives or a challenger wins after the
+    paired KL test has already measured head-to-head loss. For the final gate
+    we compare the non-relative quality axes: capability, length discipline,
+    judge/chat probes, and benchmark pass fractions.
+    """
+    if not isinstance(record, dict):
+        return None
+    axes = record.get("axes") or {}
+    if not isinstance(axes, dict):
+        return None
+    broken = set(record.get("broken_axes") or [])
+    weights = active_composite_axis_weights()
+    total_weight = 0.0
+    weighted_sum = 0.0
+    for axis, weight in weights.items():
+        if axis in _RELATIVE_SELECTION_AXES or axis in broken:
+            continue
+        val = _as_float(axes.get(axis))
+        if val is None:
+            continue
+        total_weight += float(weight)
+        weighted_sum += float(weight) * val
+    if total_weight <= 0:
+        return None
+    return weighted_sum / total_weight
+
+
+def _paired_kl_win(row: dict) -> bool:
+    tt = row.get("t_test") or {}
+    p_val = _as_float(tt.get("p"))
+    mean_delta = _as_float(tt.get("mean_delta"))
+    lcb = _as_float(tt.get("lcb"), mean_delta)
+    if p_val is None or mean_delta is None or lcb is None:
+        return False
+    return p_val < PAIRED_TEST_ALPHA and mean_delta > 0 and lcb > 0
+
+
+def _composite_quality_allows_dethrone(
+    challenger_record: dict | None,
+    incumbent_record: dict | None,
+    margin: float = SINGLE_EVAL_DETHRONE_MARGIN,
+) -> tuple[bool, dict]:
+    ch_quality = _composite_quality_score(challenger_record)
+    inc_quality = _composite_quality_score(incumbent_record)
+    detail = {
+        "challenger_quality": ch_quality,
+        "incumbent_quality": inc_quality,
+        "margin": margin,
+        "relative_axes_excluded": sorted(_RELATIVE_SELECTION_AXES),
+    }
+    if ch_quality is None:
+        detail["reason"] = "missing_challenger_quality"
+        return False, detail
+    if inc_quality is None:
+        detail["reason"] = "no_incumbent_quality"
+        return True, detail
+    if inc_quality <= 0:
+        detail["reason"] = "incumbent_quality_floor"
+        return ch_quality >= 0, detail
+    threshold = inc_quality * (1.0 - max(0.0, float(margin)))
+    detail["threshold"] = threshold
+    if ch_quality + 1e-12 >= threshold:
+        detail["reason"] = "quality_gate_passed"
+        return True, detail
+    detail["reason"] = "quality_regression"
+    return False, detail
+
+
+def _select_round_winner_with_kl_and_composite(h2h_results, king_uid, incumbent_record=None):
+    """Return a challenger only when both production gates agree.
+
+    Gate 1: the challenger significantly beats the incumbent on paired KL.
+    Gate 2: the challenger does not meaningfully regress on non-relative
+    composite quality. Among challengers that pass both gates, rank by that
+    quality score first and paired KL strength second.
+    """
+    incumbent_row = next(
+        (
+            row for row in (h2h_results or [])
+            if row.get("is_king") or (king_uid is not None and row.get("uid") == king_uid)
+        ),
+        None,
+    )
+    incumbent_comp = (
+        (incumbent_row or {}).get("composite")
+        or incumbent_record
+        or {}
+    )
+    candidates = []
+    for row in h2h_results or []:
+        if row.get("is_king") or row.get("is_reference") or row.get("disqualified"):
+            continue
+        if king_uid is not None and row.get("uid") == king_uid:
+            continue
+        if not row.get("dethrone_eligible", True):
+            continue
+        if not _paired_kl_win(row):
+            continue
+        comp = row.get("composite") or {}
+        allowed, detail = _composite_quality_allows_dethrone(comp, incumbent_comp)
+        row["selection_gate"] = detail
+        if not allowed:
+            row["composite_veto"] = detail
+            continue
+        tt = row.get("t_test") or {}
+        quality = _composite_quality_score(comp) or 0.0
+        weighted = _as_float(comp.get("weighted"), 0.0)
+        worst = _as_float(comp.get("worst"), 0.0)
+        mean_delta = _as_float(tt.get("mean_delta"), 0.0)
+        kl = _as_float(row.get("kl"), float("inf"))
+        try:
+            uid_rank = -int(row.get("uid") or 0)
+        except (TypeError, ValueError):
+            uid_rank = 0
+        candidates.append((quality, weighted, worst, mean_delta, -kl, uid_rank, row))
+    if not candidates:
+        return None
+    candidates.sort(reverse=True)
+    winner = candidates[0][6]
+    winner["selection_gate"]["reason"] = "paired_kl_and_quality_winner"
+    return winner
+
+
+def _incumbent_can_hold(h2h_results, king_uid) -> bool:
+    if king_uid is None:
+        return False
+    king_row = next((row for row in (h2h_results or []) if row.get("uid") == king_uid), None)
+    if king_row and king_row.get("disqualified"):
+        return False
+    return True
+
 
 def _log_git_revision():
     try:
@@ -905,8 +1059,8 @@ def apply_results_and_weights(
     )
     # SINGLE_EVAL_MODE: process_results has refreshed composite_scores for
     # every scored participant. Restrict kingship to the current round's
-    # challenger(s) plus the incumbent king, then apply the composite dethrone
-    # gate before weights are set.
+    # challenger(s) plus the incumbent king, then apply the final paired-KL +
+    # composite-quality crown gate before weights are set.
     if is_single_eval_mode():
         try:
             # Dethrone candidates = THIS ROUND's participants only.
@@ -979,6 +1133,11 @@ def apply_results_and_weights(
         except Exception as exc:
             logger.warning(f"single-eval king-by-composite failed (non-fatal): {exc}")
             composite_king_uid, composite_record = None, None
+        incumbent_composite_record = None
+        if king_uid is not None:
+            incumbent_composite_record = (
+                (getattr(state, "composite_scores", {}) or {}).get(str(king_uid))
+            )
         if composite_king_uid is None:
             # If process_results couldn't find a winner either, hold the prior
             # king's weights rather than dropping to zero.
@@ -993,13 +1152,50 @@ def apply_results_and_weights(
                         composite_record = composite_scores.get(str(king_uid))
             except Exception:
                 pass
-        if composite_king_uid is not None:
+        round_winner = _select_round_winner_with_kl_and_composite(
+            h2h_results,
+            king_uid,
+            incumbent_record=incumbent_composite_record,
+        )
+        if round_winner is not None:
+            paired_uid = round_winner.get("uid")
+            if paired_uid != winner_uid:
+                gate = round_winner.get("selection_gate") or {}
+                logger.info(
+                    "single-eval: UID %s selected by paired KL + composite "
+                    "quality gate over composite selection UID %s "
+                    "(KL=%s, mean_delta=%s, p=%s, quality=%s vs incumbent=%s)",
+                    paired_uid,
+                    composite_king_uid,
+                    round_winner.get("kl"),
+                    (round_winner.get("t_test") or {}).get("mean_delta"),
+                    (round_winner.get("t_test") or {}).get("p"),
+                    gate.get("challenger_quality"),
+                    gate.get("incumbent_quality"),
+                )
+            winner_uid = paired_uid
+            winner_kl = float(round_winner.get("kl"))
+        elif composite_king_uid is not None:
+            fallback_uid = composite_king_uid
+            if (
+                king_uid is not None
+                and composite_king_uid != king_uid
+                and _incumbent_can_hold(h2h_results, king_uid)
+            ):
+                logger.info(
+                    "single-eval: composite preferred UID %s, but no "
+                    "challenger cleared paired KL + quality; preserving "
+                    "incumbent UID %s",
+                    composite_king_uid,
+                    king_uid,
+                )
+                fallback_uid = king_uid
             if composite_king_uid != winner_uid:
                 logger.info(
-                    f"single-eval: overriding round-local winner UID {winner_uid} "
-                    f"with cross-round composite king UID {composite_king_uid}"
+                    f"single-eval: no paired-KL challenger cleared the "
+                    f"composite quality gate; preserving UID {fallback_uid}"
                 )
-            winner_uid = composite_king_uid
+            winner_uid = fallback_uid
             # Keep winner_kl as KL telemetry (state.scores entry) instead of
             # composite-worst — the worst axis frequently bottoms at 0.0
             # because miners haven't built mbpp/aime yet, which made every
@@ -1007,14 +1203,18 @@ def apply_results_and_weights(
             # breaks trust with miners.
             # The dashboard already exposes composite scores separately, so
             # the announcement KL should be the actual teacher-distance score.
-            winner_kl_global = state.scores.get(str(composite_king_uid))
+            winner_kl_global = state.scores.get(str(winner_uid))
             if winner_kl_global is not None and winner_kl_global > 0:
                 winner_kl = float(winner_kl_global)
             else:
                 # Fall back to composite weighted (≠ 0 in practice) before
                 # composite worst as a last-ditch placeholder.
-                weighted = (composite_record or {}).get("weighted")
-                worst = (composite_record or {}).get("worst")
+                fallback_record = (
+                    composite_record if winner_uid == composite_king_uid
+                    else (getattr(state, "composite_scores", {}) or {}).get(str(winner_uid), {})
+                )
+                weighted = (fallback_record or {}).get("weighted")
+                worst = (fallback_record or {}).get("worst")
                 if weighted is not None and float(weighted) > 0:
                     winner_kl = float(weighted)
                 elif worst is not None:

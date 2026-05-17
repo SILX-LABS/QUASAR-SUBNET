@@ -29,9 +29,16 @@ logger = logging.getLogger("quasar.validator")
 # env knobs: honest validators must compute the same manifest without relying
 # on operator configuration.
 COORDINATED_ROUNDS = True
-COORD_ROUND_BLOCKS = 360
+COORD_PROTOCOL_VERSION = 2
+# Two subnet epochs. The 360-block window was too tight for coordinated
+# single-eval rounds when several validators were running local GPUs; slow
+# validators could still be evaluating while faster validators had already
+# moved on to the next manifest.
+COORD_ROUND_BLOCKS = 720
 COORD_COMMIT_FINALITY_BLOCKS = 20
-COORD_ACTIVATION_DELAY_BLOCKS = 120
+# Activate after 600 blocks, leaving the final 120-block buffer for state
+# persistence and weight-setting before the next coordinated round.
+COORD_ACTIVATION_DELAY_BLOCKS = 600
 COORD_START_GRACE_BLOCKS = 20
 
 
@@ -74,6 +81,7 @@ def wait_poll_seconds() -> int:
 
 @dataclass(frozen=True)
 class CoordinationRound:
+    protocol_version: int
     round_id: int
     round_blocks: int
     round_start_block: int
@@ -95,6 +103,7 @@ def build_coordination_round(current_block: int) -> CoordinationRound:
     finality = commit_finality_blocks()
     delay = activation_delay_blocks()
     return CoordinationRound(
+        protocol_version=COORD_PROTOCOL_VERSION,
         round_id=rid,
         round_blocks=rb,
         round_start_block=start,
@@ -111,6 +120,7 @@ def coordination_round_from_dict(data: dict[str, Any] | None) -> CoordinationRou
         return None
     try:
         return CoordinationRound(
+            protocol_version=int(data.get("protocol_version", 1)),
             round_id=int(data["round_id"]),
             round_blocks=int(data["round_blocks"]),
             round_start_block=int(data["round_start_block"]),
@@ -395,7 +405,8 @@ def log_round_manifest(
     state_dir: str,
 ) -> None:
     msg = (
-        f"coordination round {coord_round.round_id}: seed_block="
+        f"coordination v{coord_round.protocol_version} round "
+        f"{coord_round.round_id}: round_blocks={coord_round.round_blocks}, seed_block="
         f"{coord_round.eval_seed_block}, cutoff={coord_round.commit_cutoff_block}, "
         f"activation={coord_round.activation_block}, frozen="
         f"{frozen_commitments}/{total_commitments}"
@@ -407,7 +418,9 @@ def log_round_manifest(
     logger.info(msg)
     telemetry_log({
         "stage": "coordination_round_manifest",
+        "coordination/protocol_version": coord_round.protocol_version,
         "coordination/round_id": coord_round.round_id,
+        "coordination/round_blocks": coord_round.round_blocks,
         "coordination/round_start_block": coord_round.round_start_block,
         "coordination/seed_block": coord_round.eval_seed_block,
         "coordination/cutoff_block": coord_round.commit_cutoff_block,

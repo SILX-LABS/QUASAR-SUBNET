@@ -50,12 +50,21 @@ Validators align evaluation by chain-coordinated rounds, so startup time should
 not decide which submissions are scored. A validator may wait for the next round
 before evaluating or setting weights.
 
+Current coordination protocol: v2. Rounds are 720 blocks (two subnet epochs),
+with activation at round start + 600 blocks. All validators must run the same
+coordination protocol before the rollout activation window; mixing v1 and v2
+will split round manifests.
+
 Keep local state persistent. Only reset validator state during an announced
 rollout or explicit operator recovery.
 
 For an announced coordination reset, stop the validator, back up and clear the
 local `QUASAR_STATE_DIR`, then pull/start the updated code with the other
 validators. Do not wipe wallet keys or validator config.
+
+Duplicate policy is strict: if two commitments have identical weights,
+identical tensor content, or a near-identical activation fingerprint, the
+earlier on-chain commitment is canonical. Same-coldkey recommits are not exempt.
 
 ### Default Network Settings
 
@@ -64,6 +73,8 @@ QUASAR_NETWORK=finney
 QUASAR_NETUID=24
 QUASAR_VALIDATOR_TEMPO=600
 SINGLE_EVAL_MODE=1
+QUASAR_EVAL_PROMPTS_H2H=150
+QUASAR_VLLM_CONCURRENCY=8
 ```
 
 ### Wallet Settings

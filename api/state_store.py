@@ -154,7 +154,15 @@ def current_round():
 
 
 def latest_round():
-    return read_state(H2H_LATEST_FILE, {})
+    latest = read_state(H2H_LATEST_FILE, {})
+    if latest:
+        return latest
+    history = round_history()
+    if history:
+        fallback = dict(history[-1])
+        fallback["_source"] = "h2h_history_fallback"
+        return fallback
+    return {}
 
 
 def validator_log():

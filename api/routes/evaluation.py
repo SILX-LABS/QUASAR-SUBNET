@@ -35,7 +35,7 @@ router = APIRouter()
 
 
 @router.get("/api/leaderboard", tags=["Evaluation"], summary="Composite leaderboard",
-         description="Returns the current king and top contenders ranked by composite score. KL is one scored axis, not the king-selection gate.")
+         description="Returns the current king and top contenders with composite scores. Dethroning requires both paired-KL evidence and the composite quality gate.")
 def get_leaderboard():
     top4 = top4_leaderboard() or {}
     scores_data = scores()
@@ -135,7 +135,7 @@ def get_leaderboard():
     leaderboard = {
         "king": king_data,
         "contenders": contenders,
-        "ranking_method": "composite_single_eval",
+        "ranking_method": "paired_kl_composite_gate",
         "phase": top4.get("phase", "unknown"),
         "initial_eval_complete": top4.get("initial_eval_complete", False),
         "completed_at": top4.get("completed_at"),
@@ -368,14 +368,9 @@ Response includes:
 - `king_changed`: Whether the king changed after composite ranking
 """)
 def get_latest_round():
-    path = os.path.join(STATE_DIR, "h2h_latest.json")
-    if os.path.exists(path):
-        try:
-            with open(path) as f:
-                data = json.load(f)
-            return _sanitize_floats(data)
-        except Exception:
-            pass
+    data = latest_round()
+    if data:
+        return _sanitize_floats(data)
     return {"error": "No evaluation round data yet"}
 
 

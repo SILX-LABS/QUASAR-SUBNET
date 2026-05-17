@@ -5,8 +5,8 @@
 Quasar is SILX Labs' competitive small-model subnet on Bittensor. Miners train
 Quasar-compatible language models, publish them as public Hugging Face
 repositories, and commit the pinned model revision on-chain. Validators verify
-each valid commitment, score it with the production composite evaluator, and set
-weights to the current king.
+each valid commitment, score it with paired KL duels plus the production
+composite evaluator, and set weights to the current king.
 
 ## Network
 
@@ -16,7 +16,7 @@ weights to the current king.
 - Base checkpoint: [`silx-ai/Quasar-3B-A1B-Preview`](https://huggingface.co/silx-ai/Quasar-3B-A1B-Preview)
 - Launch teacher: [`Qwen/Qwen3.5-4B`](https://huggingface.co/Qwen/Qwen3.5-4B)
 - Model family: Quasar 3B total / about 1B active Mixture-of-Experts
-- Ranking: single-eval composite; KL is one axis, not the king-selection gate
+- Ranking: dethroning requires both a valid paired-KL win and a composite quality pass
 
 ## How It Works
 
@@ -53,8 +53,9 @@ ranking:
   handled consistently.
 - Each model receives normalized per-axis scores plus aggregate `worst` and
   `weighted` composite scores.
-- King selection uses composite score, with KL treated as one distribution-fit
-  signal rather than the whole ranking system.
+- King selection uses both paired-KL evidence and composite quality. KL alone
+  cannot crown a challenger, and composite alone cannot override a direct
+  head-to-head regression.
 - Weight setting happens after evaluation by assigning the current king the full
   validator weight.
 
@@ -203,7 +204,8 @@ permanent, but the miner can register a new hotkey and submit a different model.
 ## Anti-Gaming
 
 - Weight hashes and content hashes are tracked for duplicate detection.
-- Earlier on-chain commitment owns an identical weight hash.
+- Earlier on-chain commitment owns an identical weight or content hash, even
+  when the later commitment uses the same coldkey.
 - Re-sharded copies are checked through content hashing.
 - Public revision integrity is verified continuously.
 - Quantized submissions are rejected.

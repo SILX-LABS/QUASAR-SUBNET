@@ -128,7 +128,7 @@ def health():
     return {
         "status": "ok",
         "netuid": NETUID,
-        "dethrone_method": "composite_single_eval",
+        "dethrone_method": "paired_kl_composite_gate",
         "king_uid": king_uid,
         "king_kl": round(king_kl, 6) if king_kl is not None else None,
         "n_scored": n_scored,

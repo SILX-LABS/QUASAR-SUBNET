@@ -297,7 +297,7 @@ th:last-child, td:last-child { text-align: right; }
         <div class="scroll-box scroll-hist">
             <table>
                 <thead><tr>
-                    <th>UID</th><th>Repo</th><th>Hotkey</th><th>Verdict</th><th>mu_hat</th><th>LCB</th><th>King Loss</th><th>Chall Loss</th><th>When</th>
+                    <th>UID</th><th>Repo</th><th>Hotkey</th><th>Result</th><th>mu_hat</th><th>LCB</th><th>King Loss</th><th>Chall Loss</th><th>When</th>
                 </tr></thead>
                 <tbody id="hist"></tbody>
             </table>
@@ -307,7 +307,7 @@ th:last-child, td:last-child { text-align: right; }
 
 <script>
 var DEMO_MODE = new URLSearchParams(window.location.search).has("demo");
-var DATA_URLS = DEMO_MODE ? ["/demo-dashboard.json"] : ["/api/dashboard.json", "https://s3.hippius.com/quasar/dashboard.json"];
+var DATA_URLS = DEMO_MODE ? ["/demo-dashboard.json"] : ["https://s3.hippius.com/quasar/dashboard.json", "/api/dashboard.json"];
 var POLL_MS = 5000;
 var _lastData = null;
 var _chartMode = localStorage.getItem("chartMode") || "ppl";
@@ -518,7 +518,9 @@ function render(d) {
         duelProgress.textContent = ev.status_text || (
             ev.loading ? (ev.phase_label || "Loading model") + " \u2026" : ev.progress + " / " + ev.total + "  (" + pct + "%)"
         );
-        duelWr.textContent = ev.loading ? (ev.phase || "--") : "MU: " + Number(ev.mu_hat || 0).toFixed(6);
+        duelWr.textContent = ev.metric_text || (
+            ev.loading ? (ev.phase_label || ev.phase || "--") : "MU: " + Number(ev.mu_hat || 0).toFixed(6)
+        );
     } else {
         duelSec.classList.add("duel-idle");
         duelLabel.textContent = status.label || "Idle";
@@ -571,9 +573,15 @@ function render(d) {
         : history.map(function(h) {
             var isErr = h.verdict === "error";
             var errInfo = ERROR_MESSAGES[h.error_code];
+            var detailBits = [];
+            if (h.selection_detail) detailBits.push(h.selection_detail);
+            if (h.composite_warning && h.composite_warning.worst_axis) {
+                detailBits.push("Composite warning: " + h.composite_warning.worst_axis + "=" + Number(h.composite_warning.worst_value || 0).toFixed(4));
+            }
+            var verdictTitle = detailBits.join(" | ");
             var verdictCell = isErr
                 ? '<td title="' + esc((errInfo ? errInfo.title + ': ' + errInfo.message(h.error_detail || '') : (h.error_code || 'error'))) + '" style="color:#c22;cursor:help">' + esc(errInfo ? errInfo.title.toUpperCase() : "ERROR") + '</td>'
-                : '<td>' + (h.accepted ? "CHALLENGER" : "KING") + '</td>';
+                : '<td title="' + esc(verdictTitle) + '">' + esc(h.verdict_label || (h.accepted ? "CROWNED" : (h.duel_win ? "KL WIN" : "HELD"))) + '</td>';
             var ago = timeAgo(h.timestamp);
             if (!isErr && h.wall_time_s) ago += " (" + Number(h.wall_time_s).toFixed(0) + "s)";
             return '<tr><td>' + (h.uid != null ? h.uid : "--") + '</td><td>' + repoLink(h.challenger_repo) + '</td><td>' + hotkeyLink(h.hotkey) + '</td>' + verdictCell +
