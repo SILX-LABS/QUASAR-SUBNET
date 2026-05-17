@@ -151,6 +151,57 @@ def _dq_later_duplicate(
     disqualified.add(duplicate_uid)
 
 
+def _canonicalize_existing_copy_dq(
+    uid: int,
+    hotkey: str,
+    reason: str | None,
+    commitments: dict,
+    uid_to_hotkey: dict,
+    state: ValidatorState,
+) -> str | None:
+    """Rewrite stale copy-chain DQs to point at the real root commitment."""
+    if not reason or not str(reason).startswith("copy:"):
+        return reason
+    root_uid = _copy_root_uid_from_dq(uid, commitments, uid_to_hotkey, state)
+    if root_uid is None or root_uid == uid:
+        return reason
+
+    match = re.search(r"\bUID\s+(\d+)\b", str(reason))
+    if match:
+        try:
+            if int(match.group(1)) == root_uid:
+                return reason
+        except (TypeError, ValueError):
+            pass
+
+    relation_match = re.search(r"copy:\s+(.+?)\s+(?:as|to|of)\s+UID\s+\d+", str(reason))
+    relation = relation_match.group(1).strip() if relation_match else "identical tensor content"
+    commit = commitments.get(uid, {}) or {}
+    root_commit = commitments.get(root_uid, {}) or {}
+    commit_block = commit.get("block")
+    root_block = root_commit.get("block")
+    root_model = root_commit.get("model", "?")
+    new_reason = (
+        f"copy: {relation} as UID {root_uid} ({root_model}), "
+        f"committed later at block {commit_block} vs {root_block}"
+    )
+    if new_reason != reason:
+        logger.info(
+            "UID %s: canonicalized stale copy DQ target to UID %s "
+            "(was: %s)",
+            uid,
+            root_uid,
+            reason,
+        )
+        disqualify(
+            hotkey,
+            new_reason,
+            state.dq_reasons,
+            commit_block=commit_block,
+        )
+    return new_reason
+
+
 def _cosine_sim(a: list, b: list) -> float:
     dot = sum(x * y for x, y in zip(a, b))
     norm_a = math.sqrt(sum(x * x for x in a))
@@ -311,6 +362,9 @@ def precheck_all_models(commitments, uid_to_hotkey, uid_to_coldkey, state: Valid
         this_commit_block = commit.get("block")
         if is_disqualified(uid, hotkey, state.dq_reasons, commit_block=this_commit_block):
             reason = get_dq_reason(uid, hotkey, state.dq_reasons, commit_block=this_commit_block)
+            reason = _canonicalize_existing_copy_dq(
+                uid, hotkey, reason, commitments, uid_to_hotkey, state,
+            )
             logger.info(f"UID {uid} ({model_repo}): DISQUALIFIED — {reason}")
             disqualified.add(uid)
             continue

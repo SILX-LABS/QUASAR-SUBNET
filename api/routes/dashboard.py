@@ -81,6 +81,61 @@ def _dq_reason(uid, commit, hotkey, dq):
     return dq.get(uid_key)
 
 
+def _copy_root_uid(uid, commitments, dq):
+    """Follow stale copy DQ chains for display only.
+
+    Validators can carry old state such as ``109 -> 73`` even when ``73`` is
+    already a DQ'd copy of ``156``. The dashboard should show the root owner
+    so miners are not debugging the wrong UID while the next precheck rewrites
+    local state.
+    """
+    seen = {uid}
+    current = uid
+    root = None
+    while True:
+        commit = commitments.get(current, {}) or {}
+        reason = _dq_reason(current, commit, commit.get("hotkey"), dq)
+        if not reason or not str(reason).startswith("copy:"):
+            break
+        match = re.search(r"\bUID\s+(\d+)\b", str(reason))
+        if not match:
+            break
+        try:
+            next_uid = int(match.group(1))
+        except (TypeError, ValueError):
+            break
+        if next_uid in seen or next_uid not in commitments:
+            break
+        root = next_uid
+        seen.add(next_uid)
+        current = next_uid
+    return root
+
+
+def _canonical_dq_reason(uid, commit, hotkey, dq, commitments):
+    reason = _dq_reason(uid, commit, hotkey, dq)
+    if not reason or not str(reason).startswith("copy:"):
+        return reason
+    root_uid = _copy_root_uid(uid, commitments, dq)
+    if root_uid is None:
+        return reason
+    match = re.search(r"\bUID\s+(\d+)\b", str(reason))
+    try:
+        if match and int(match.group(1)) == root_uid:
+            return reason
+    except (TypeError, ValueError):
+        pass
+    relation_match = re.search(r"copy:\s+(.+?)\s+(?:as|to|of)\s+UID\s+\d+", str(reason))
+    relation = relation_match.group(1).strip() if relation_match else "identical tensor content"
+    root_commit = commitments.get(root_uid, {}) or {}
+    root_block = root_commit.get("block")
+    root_model = _repo(root_commit) or "unknown"
+    return (
+        f"copy: {relation} as UID {root_uid} ({root_model}), "
+        f"committed later at block {(commit or {}).get('block')} vs {root_block}"
+    )
+
+
 def _scheduled_uids(progress):
     if not isinstance(progress, dict):
         return set()
@@ -265,6 +320,13 @@ def _infer_eval_phase_from_log(progress):
         (r"Finetune probe:", "chat_probe", "Chat response probe"),
         (r"Loaded in .*?s|King loaded", "finetune_probe", "Anti-finetune probe"),
     ]
+    latest_kl = None
+    for match in re.finditer(r"\[\s*(\d+)/(\d+)\]\s+KL=", tail_after_student):
+        try:
+            latest_kl = (int(match.group(1)), int(match.group(2)))
+        except (TypeError, ValueError):
+            latest_kl = None
+
     inferred = None
     for pattern, inferred_phase, label in checks:
         if re.search(pattern, tail_after_student):
@@ -283,6 +345,8 @@ def _infer_eval_phase_from_log(progress):
         "student": student,
         "log_path": log_path,
         "log_mtime": log_mtime,
+        "progress_done": latest_kl[0] if latest_kl and inferred_phase == "scoring" else None,
+        "progress_total": latest_kl[1] if latest_kl and inferred_phase == "scoring" else None,
     }
 
 
@@ -443,17 +507,26 @@ def _current_eval(progress, commitments):
     }:
         return None
     models = progress.get("models") if isinstance(progress.get("models"), dict) else {}
-    current = progress.get("current") if isinstance(progress.get("current"), dict) else {}
     pod = progress.get("pod") if isinstance(progress.get("pod"), dict) else {}
     pod_current = pod.get("current") if isinstance(pod.get("current"), dict) else {}
+    progress_current = progress.get("current") if isinstance(progress.get("current"), dict) else {}
+    current = pod_current or progress_current
     repo = (
         progress.get("current_student")
-        or current.get("student_name")
-        or current.get("model")
         or pod_current.get("student_name")
         or pod_current.get("model")
+        or current.get("student_name")
+        or current.get("model")
     )
-    if not repo:
+    teacher_only_phases = {
+        "vllm_starting",
+        "vllm_generating",
+        "teacher_loading",
+        "teacher_generation",
+        "teacher_logits",
+        "gpu_precompute",
+    }
+    if not repo and phase not in teacher_only_phases:
         order = progress.get("eval_order") or []
         for item in order:
             if item.get("role") != "king":
@@ -486,12 +559,19 @@ def _current_eval(progress, commitments):
     else:
         done = (
             progress.get("prompts_done")
-            or progress.get("current_prompt")
             or current.get("prompts_done")
             or pod_current.get("prompts_done")
+            or progress.get("current_prompt")
             or progress.get("teacher_prompts_done")
             or 0
         )
+    if inferred and phase == "scoring":
+        inferred_done = inferred.get("progress_done")
+        inferred_total = inferred.get("progress_total")
+        if isinstance(inferred_done, int):
+            done = max(int(done or 0), inferred_done)
+        if isinstance(inferred_total, int) and inferred_total > 0:
+            total = inferred_total
     indeterminate_phases = {
         "pod_bootstrap",
         "pod_upload",
@@ -714,7 +794,7 @@ def _submission_rows(commitments, history_rows, king_uid, progress):
         if not repo:
             continue
         hotkey = commit.get("hotkey")
-        reason = _dq_reason(uid, commit, hotkey, dq)
+        reason = _canonical_dq_reason(uid, commit, hotkey, dq, commitments)
         uid_str = str(uid)
         has_composite = uid_str in composites
         has_legacy_score = uid_str in scored
