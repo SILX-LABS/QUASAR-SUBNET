@@ -1598,7 +1598,20 @@ def run_validator(network, netuid, wallet_name, hotkey_name, wallet_path,
                     winner_uid=king_uid,
                 )
                 weights_set = False
-                if king_uid is not None:
+                if coord_round is not None and king_source == "chain_consensus":
+                    logger.warning(
+                        "coordination: no challengers were available; leaving "
+                        "existing weights unchanged instead of refreshing a "
+                        "chain-consensus incumbent without a model comparison"
+                    )
+                    log_event(
+                        "No challengers in coordinated round; keeping existing "
+                        "weights unchanged because chain consensus alone is not "
+                        "an eval result",
+                        level="warning",
+                        state_dir=state_dir,
+                    )
+                elif king_uid is not None:
                     weights_set = _safe_set_weights(
                         subtensor, wallet, netuid, n_uids,
                         build_winner_take_all_weights(n_uids, king_uid), king_uid, state_dir,

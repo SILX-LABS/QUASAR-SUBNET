@@ -8,6 +8,7 @@ from eval.scoring import disqualify
 from eval.state import ValidatorState
 from scripts.validator.config import MAX_KL_THRESHOLD, TOP_N_ALWAYS_INCLUDE
 from scripts.validator.coordination import (
+    maintenance_challenger_uids,
     reset_anchor_challenger_uids,
     scheduled_challenger_uids,
 )
@@ -180,10 +181,21 @@ def select_challengers(valid_models, state: ValidatorState, king_uid, king_kl,
                 scheduled = scheduled_challenger_uids(
                     valid_models, coord_round, cap, king_uid=king_uid,
                 )
-                logger.info(
-                    f"single-eval: coordination scheduled {len(scheduled)} "
-                    f"challenger(s) for round {coord_round.round_id}: {scheduled}"
-                )
+                if not scheduled:
+                    scheduled = maintenance_challenger_uids(
+                        valid_models, coord_round, cap, king_uid=king_uid,
+                    )
+                    logger.info(
+                        f"single-eval: coordination maintenance scheduled "
+                        f"{len(scheduled)} contender(s) for round "
+                        f"{coord_round.round_id}: {scheduled}"
+                    )
+                else:
+                    logger.info(
+                        f"single-eval: coordination scheduled "
+                        f"{len(scheduled)} challenger(s) for round "
+                        f"{coord_round.round_id}: {scheduled}"
+                    )
             challengers = {uid: valid_models[uid] for uid in scheduled}
         else:
             evict_stale_evaluated_uids(state, valid_models)

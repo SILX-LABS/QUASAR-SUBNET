@@ -213,6 +213,42 @@ def scheduled_challenger_uids(
     return scheduled
 
 
+def maintenance_challenger_uids(
+    valid_models: dict[int, dict],
+    coord_round: CoordinationRound,
+    cap: int,
+    *,
+    king_uid: int | None = None,
+) -> list[int]:
+    """Deterministically rotate valid non-king contenders in quiet rounds.
+
+    Chain consensus is useful as a shared incumbent, but it is not evidence
+    that the incumbent is still the best model. If a coordinated round has no
+    newly assigned commitments, validators should still pressure-test the
+    incumbent against the same frozen candidate set instead of refreshing chain
+    weights blindly. This rotation is based only on the frozen commitments and
+    the round id, so every validator schedules the same maintenance batch.
+    """
+    cap = int(cap)
+    items: list[tuple[int, int]] = []
+    for uid, info in (valid_models or {}).items():
+        if uid == king_uid or (info or {}).get("is_reference"):
+            continue
+        try:
+            commit_block = int((info or {}).get("commit_block") or (info or {}).get("block") or 0)
+        except (TypeError, ValueError, OverflowError):
+            commit_block = 0
+        items.append((commit_block, int(uid)))
+    items.sort()
+    if not items:
+        return []
+    if cap <= 0 or cap >= len(items):
+        return [uid for _commit_block, uid in items]
+    start = int(coord_round.round_id) % len(items)
+    rotated = items[start:] + items[:start]
+    return [uid for _commit_block, uid in rotated[:cap]]
+
+
 def reset_anchor_challenger_uids(
     valid_models: dict[int, dict],
     cap: int,
