@@ -169,8 +169,6 @@ body {
 .scroll-queue { max-height: 200px; }
 .scroll-events { max-height: 160px; }
 
-.scroll-hist { max-height: 60vh; }
-
 table {
     width: 100%;
     border-collapse: collapse;
@@ -285,15 +283,9 @@ th:last-child, td:last-child { text-align: right; }
     #smooth-slider { width: 60px; }
     .chart-wrap { aspect-ratio: 3 / 2; }
     .scroll-box { overflow-x: auto; }
-    .scroll-hist table,
 
     .scroll-queue table { table-layout: auto; min-width: 500px; }
     .scroll-events table { table-layout: auto; min-width: 520px; }
-    .scroll-hist table { min-width: 700px; }
-    .scroll-hist th:nth-child(6),
-    .scroll-hist td:nth-child(6),
-    .scroll-hist th:nth-child(8),
-    .scroll-hist td:nth-child(8) { display: none; }
     .duel-info span { min-width: 80px; }
     #last-winner { display: flex; flex-wrap: wrap; gap: 2px 12px; }
 }
@@ -364,18 +356,6 @@ th:last-child, td:last-child { text-align: right; }
             <table>
                 <thead><tr><th>UID</th><th>Repo</th><th>Hotkey</th><th>Block</th><th>Status</th></tr></thead>
                 <tbody id="queue"></tbody>
-            </table>
-        </div>
-    </div>
-
-    <div>
-        <div class="section-label">Evaluation History</div>
-        <div class="scroll-box scroll-hist">
-            <table>
-                <thead><tr>
-                    <th>UID</th><th>Repo</th><th>Hotkey</th><th>Result</th><th>mu_hat</th><th>LCB</th><th>King Loss</th><th>Chall Loss</th><th>When</th>
-                </tr></thead>
-                <tbody id="hist"></tbody>
             </table>
         </div>
     </div>
@@ -673,31 +653,6 @@ function render(d) {
             return '<tr><td title="' + esc(e.ts || "") + '">' + timeAgo(e.ts) + '</td><td class="event-type">' + esc(String(kind).toUpperCase()) + '</td><td>' + esc(e.msg || e.message || "") + '</td></tr>';
         }).join("");
 
-    var hb = document.getElementById("hist");
-    var history = d.history || [];
-    hb.innerHTML = history.length === 0
-        ? '<tr><td colspan="9" style="text-align:center;padding:16px">No duels yet</td></tr>'
-        : history.map(function(h) {
-            var isErr = h.verdict === "error";
-            var errInfo = ERROR_MESSAGES[h.error_code];
-            var detailBits = [];
-            if (h.selection_detail) detailBits.push(h.selection_detail);
-            if (h.composite_warning && h.composite_warning.worst_axis) {
-                detailBits.push("Composite warning: " + h.composite_warning.worst_axis + "=" + Number(h.composite_warning.worst_value || 0).toFixed(4));
-            }
-            var verdictTitle = detailBits.join(" | ");
-            var verdictCell = isErr
-                ? '<td title="' + esc((errInfo ? errInfo.title + ': ' + errInfo.message(h.error_detail || '') : (h.error_code || 'error'))) + '" style="color:#c22;cursor:help">' + esc(errInfo ? errInfo.title.toUpperCase() : "ERROR") + '</td>'
-                : '<td title="' + esc(verdictTitle) + '">' + esc(h.verdict_label || (h.accepted ? "CROWNED" : (h.duel_win ? "KL WIN" : "HELD"))) + '</td>';
-            var ago = timeAgo(h.timestamp);
-            if (!isErr && h.wall_time_s) ago += " (" + Number(h.wall_time_s).toFixed(0) + "s)";
-            return '<tr><td>' + (h.uid != null ? h.uid : "--") + '</td><td>' + repoLink(h.challenger_repo) + '</td><td>' + hotkeyLink(h.hotkey) + '</td>' + verdictCell +
-                '<td>' + (isErr ? "--" : Number(h.mu_hat || 0).toFixed(6)) + '</td>' +
-                '<td>' + (isErr ? "--" : Number(h.lcb || 0).toFixed(6)) + '</td>' +
-                '<td>' + (isErr ? "--" : Number(h.avg_king_loss || 0).toFixed(4)) + '</td>' +
-                '<td>' + (isErr ? "--" : Number(h.avg_challenger_loss || 0).toFixed(4)) + '</td>' +
-                '<td title="' + esc(h.timestamp || "") + '">' + ago + '</td></tr>';
-        }).join("");
 }
 
 async function poll() {
