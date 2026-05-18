@@ -79,6 +79,66 @@ body {
     margin-top: 4px;
 }
 
+.status-grid {
+    display: grid;
+    grid-template-columns: minmax(0, 1.25fr) minmax(280px, 0.75fr);
+    gap: 16px;
+    align-items: stretch;
+}
+.status-panel {
+    border: 1px solid rgba(127,127,127,0.35);
+    padding: 12px;
+    min-width: 0;
+}
+.status-panel .section-label {
+    margin-bottom: 10px;
+}
+.status-line {
+    display: flex;
+    justify-content: space-between;
+    gap: 12px;
+    font-size: 12px;
+}
+.status-line + .status-line { margin-top: 6px; }
+.status-kicker {
+    color: var(--ink-muted);
+    text-transform: uppercase;
+    font-size: 10px;
+    letter-spacing: 0.04em;
+}
+.status-value {
+    font-weight: 700;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    text-align: right;
+}
+.status-note {
+    color: var(--ink-muted);
+    font-size: 11px;
+    margin-top: 8px;
+}
+.table-summary {
+    color: var(--ink-muted);
+    font-weight: 600;
+    font-size: 10px;
+    letter-spacing: 0.04em;
+}
+.status-badge {
+    display: inline-block;
+    min-width: 64px;
+    text-align: center;
+    border: 1px solid rgba(127,127,127,0.45);
+    padding: 1px 6px;
+    font-size: 10px;
+    font-weight: 700;
+    text-transform: uppercase;
+}
+.status-badge.king { border-color: #2a2; color: #2a2; }
+.status-badge.disqualified { border-color: #c22; color: #c22; }
+.status-badge.scheduled { border-color: #c80; color: #c80; }
+.status-badge.pending { border-color: #777; color: #777; }
+
 .duel-bar-wrap {
     border: 1px solid var(--ink);
     height: 14px;
@@ -206,6 +266,9 @@ th:last-child, td:last-child { text-align: right; }
         padding: 16px 12px;
         gap: 16px;
     }
+    .status-grid { grid-template-columns: 1fr; }
+    .status-line { flex-direction: column; gap: 2px; }
+    .status-value { text-align: left; }
     #top-bar {
         flex-wrap: wrap;
         gap: 4px 0;
@@ -257,6 +320,19 @@ th:last-child, td:last-child { text-align: right; }
         </div>
     </div>
 
+    <div class="status-grid">
+        <div id="duel-section" class="status-panel duel-idle">
+            <div class="section-label" id="duel-label">Validator State</div>
+            <div class="duel-bar-wrap"><div class="duel-bar" id="duel-bar" style="width:0%"></div></div>
+            <div class="duel-info"><span id="duel-progress">--</span><span id="duel-wr">--</span></div>
+        </div>
+
+        <div class="status-panel">
+            <div class="section-label">Chain King</div>
+            <div id="last-winner" style="font-size:12px;line-height:1.6;min-height:48px;">--</div>
+        </div>
+    </div>
+
     <div>
         <div class="section-label" style="display:flex;justify-content:space-between;align-items:center;">
             <span id="chart-label">Perplexity</span>
@@ -267,17 +343,6 @@ th:last-child, td:last-child { text-align: right; }
         </div>
         <div class="chart-wrap"><svg id="chart"></svg></div>
         <div class="chart-meta" id="chart-meta"><span>--</span></div>
-    </div>
-
-    <div id="duel-section" class="duel-idle">
-        <div class="section-label" id="duel-label">Status</div>
-        <div class="duel-bar-wrap"><div class="duel-bar" id="duel-bar" style="width:0%"></div></div>
-        <div class="duel-info"><span id="duel-progress">--</span><span id="duel-wr">--</span></div>
-    </div>
-
-    <div>
-        <div class="section-label">Latest Crowned Model</div>
-        <div id="last-winner" style="font-size:12px;line-height:1.8;min-height:48px;display:flex;flex-wrap:wrap;gap:0 16px;">--</div>
     </div>
 
     <div>
@@ -291,7 +356,10 @@ th:last-child, td:last-child { text-align: right; }
     </div>
 
     <div>
-        <div class="section-label">Submissions</div>
+        <div class="section-label" style="display:flex;justify-content:space-between;align-items:center;">
+            <span>Submissions</span>
+            <span class="table-summary" id="queue-summary">--</span>
+        </div>
         <div class="scroll-box scroll-queue">
             <table>
                 <thead><tr><th>UID</th><th>Repo</th><th>Hotkey</th><th>Block</th><th>Status</th></tr></thead>
@@ -555,26 +623,45 @@ function render(d) {
     var winner = null;
     for (var i = 0; i < (d.history || []).length; i++) if (d.history[i].accepted) { winner = d.history[i]; break; }
     var showWinnerCard = winner && (revealPending || (chainUid != null && Number(winner.uid) === chainUid));
-    if (showWinnerCard) {
-        lwEl.innerHTML = '<span style="width:100%">' + repoLink(winner.challenger_repo) + '</span>' +
-            '<span>MU_HAT: ' + Number(winner.mu_hat || 0).toFixed(6) + '</span>' +
-            '<span>LCB: ' + Number(winner.lcb || 0).toFixed(6) + '</span>' +
-            '<span>DELTA: ' + Number(winner.delta || 0).toFixed(4) + '</span>' +
-            '<span>KING_LOSS: ' + Number(winner.avg_king_loss || 0).toFixed(4) + '</span>' +
-            '<span>CHALL_LOSS: ' + Number(winner.avg_challenger_loss || 0).toFixed(4) + '</span>' +
-            (winner.wall_time_s ? '<span>' + Number(winner.wall_time_s).toFixed(0) + 's</span>' : '');
-    } else {
-        lwEl.textContent = chainUid != null ? "NO PENDING CROWN; CHAIN KING UID " + chainUid : "NO CROWNED CHALLENGER YET";
-    }
+    var supportPct = king.support_fraction != null ? (Number(king.support_fraction) * 100).toFixed(1) + "%" : "--";
+    var kingRows = [
+        ['UID', chainUid != null ? chainUid : "--"],
+        ['Repo', kingRepo !== "--" ? repoLink(kingRepo) : "--"],
+        ['Revision', kingRev ? '<a href="https://huggingface.co/' + esc(kingRepo) + '/commit/' + esc(kingRev) + '" target="_blank" style="color:var(--ink)">' + esc(kingRev.slice(0, 10)) + '</a>' : "--"],
+        ['Support', supportPct],
+    ];
+    lwEl.innerHTML = kingRows.map(function(row) {
+        return '<div class="status-line"><span class="status-kicker">' + row[0] + '</span><span class="status-value">' + row[1] + '</span></div>';
+    }).join("") + (revealPending
+        ? '<div class="status-note">Pending reveal: latest eval selected UID ' + esc(status.state_king_uid) + ', chain still shows UID ' + esc(chainUid) + '.</div>'
+        : (showWinnerCard
+            ? '<div class="status-note">Latest accepted eval matches the revealed chain king.</div>'
+            : ((d.history || []).length
+                ? '<div class="status-note">No pending reveal. Historical eval rows below are not the live crown.</div>'
+                : '<div class="status-note">Clean reset active. No evaluation history is currently published.</div>')));
 
 
 
     var qEl = document.getElementById("queue");
     var q = d.queue || [];
+    var counts = q.reduce(function(acc, row) {
+        var key = row.status || "valid";
+        acc[key] = (acc[key] || 0) + 1;
+        return acc;
+    }, {});
+    var summaryBits = [];
+    if (counts.king) summaryBits.push("king " + counts.king);
+    if (counts.scheduled) summaryBits.push("scheduled " + counts.scheduled);
+    if (counts.valid) summaryBits.push("valid " + counts.valid);
+    if (counts.pending) summaryBits.push("pending " + counts.pending);
+    if (counts.disqualified) summaryBits.push("dq " + counts.disqualified);
+    document.getElementById("queue-summary").textContent = summaryBits.join(" / ") || "--";
     qEl.innerHTML = q.length === 0
         ? '<tr><td colspan="5" style="text-align:center;padding:16px">No submissions visible</td></tr>'
         : q.map(function(e) {
-            return '<tr title="' + esc(e.status_detail || "") + '"><td>' + (e.uid != null ? e.uid : "--") + '</td><td>' + repoLink(e.hf_repo) + '</td><td>' + hotkeyLink(e.hotkey) + '</td><td>' + (e.block ? '#' + e.block : '--') + '</td><td>' + esc(e.status_label || (e.reeval ? 'SEEN' : 'PENDING')) + '</td></tr>';
+            var rowStatus = e.status || "valid";
+            var label = e.status_label || rowStatus;
+            return '<tr title="' + esc(e.status_detail || "") + '"><td>' + (e.uid != null ? e.uid : "--") + '</td><td>' + repoLink(e.hf_repo) + '</td><td>' + hotkeyLink(e.hotkey) + '</td><td>' + (e.block ? '#' + e.block : '--') + '</td><td><span class="status-badge ' + esc(rowStatus) + '">' + esc(label) + '</span></td></tr>';
         }).join("");
 
     var evEl = document.getElementById("events");

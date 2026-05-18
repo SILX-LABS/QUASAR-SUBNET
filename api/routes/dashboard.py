@@ -877,7 +877,7 @@ def _dashboard_events(progress, current_eval, submissions, status):
             break
 
     if not events:
-        pending = sum(1 for row in submissions if row.get("status") == "pending")
+        pending = sum(1 for row in submissions if row.get("status") in {"valid", "scheduled"})
         events.append(_event_row(
             now,
             "info",
@@ -922,22 +922,13 @@ def _submission_rows(commitments, history_rows, king_uid, progress):
             status = "scheduled"
             label = "SCHEDULED"
             detail = "Selected for the current coordination round."
-        elif has_composite:
-            status = "scored"
-            label = "SCORED"
-            detail = "Composite score recorded from a validator round."
-        elif was_tested:
-            status = "tested"
-            label = "TESTED"
-            detail = "Appears in recent H2H or king-test history."
-        elif has_legacy_score:
-            status = "scored"
-            label = "SCORED"
-            detail = "Legacy KL score recorded."
         else:
-            status = "pending"
-            label = "PENDING"
-            detail = "Valid commitment waiting for a scheduled evaluation round."
+            status = "valid"
+            label = "VALID"
+            if seen:
+                detail = "Valid commitment with historical eval data; waiting for the next scheduled comparison."
+            else:
+                detail = "Valid commitment waiting for a scheduled evaluation round."
         rows.append({
             "uid": uid,
             "hf_repo": repo,
@@ -1015,7 +1006,7 @@ def _dashboard_status(progress, current_eval, latest, consensus_king, submission
             "detail": phase or "Round state is active.",
         })
     else:
-        pending = sum(1 for row in submissions if row.get("status") == "pending")
+        pending = sum(1 for row in submissions if row.get("status") in {"valid", "scheduled"})
         status.update({
             "mode": "idle",
             "label": "Idle between rounds",
