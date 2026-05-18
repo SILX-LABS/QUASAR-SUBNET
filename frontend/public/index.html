@@ -575,10 +575,15 @@ function render(d) {
     var duelWr = document.getElementById("duel-wr");
     if (ev) {
         duelSec.classList.remove("duel-idle");
-        var pct = ev.total > 0 ? Math.round((ev.progress / ev.total) * 100) : 0;
+        var pct = ev.progress_percent != null
+            ? Math.round(Number(ev.progress_percent))
+            : (ev.total > 0 ? Math.round((ev.progress / ev.total) * 100) : 0);
+        pct = Math.max(0, Math.min(100, pct || 0));
         var duelName = ev.challenger_repo || short(ev.hotkey, 12);
         duelLabel.innerHTML = ev.challenger_repo ? repoLink(ev.challenger_repo) : esc(duelName);
-        duelBar.style.width = ev.loading ? "12%" : pct + "%";
+        duelBar.style.width = (ev.total > 0 || ev.progress_percent != null)
+            ? pct + "%"
+            : (ev.loading ? "12%" : "0%");
         duelProgress.textContent = ev.status_text || (
             ev.loading ? (ev.phase_label || "Loading model") + " \u2026" : ev.progress + " / " + ev.total + "  (" + pct + "%)"
         );

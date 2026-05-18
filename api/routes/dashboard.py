@@ -673,6 +673,7 @@ def _current_eval(progress, commitments):
             done = max(int(done or 0), inferred_done)
         if isinstance(inferred_total, int) and inferred_total > 0:
             total = inferred_total
+    progress_mode = "prompts"
     indeterminate_phases = {
         "pod_bootstrap",
         "pod_upload",
@@ -720,6 +721,7 @@ def _current_eval(progress, commitments):
     if phase == "vllm_generating" and total:
         status_text = f"{phase_label}: {done}/{total} teacher prompts"
         metric_text = f"TEACHER {done}/{total}"
+        progress_mode = "teacher_prompts"
     elif phase == "scoring" and (current.get("prompts_total") or total):
         score_total = current.get("prompts_total") or total
         status_text = f"{phase_label}: {done}/{score_total} prompts"
@@ -728,16 +730,28 @@ def _current_eval(progress, commitments):
             if isinstance(mu_hat, (int, float))
             else f"{done}/{score_total}"
         )
+        total = score_total
+        progress_mode = "kl_prompts"
     elif phase == "benchmark_probe" and current.get("bench_axis_label"):
         axis_idx = current.get("bench_axis_index")
         axis_total = current.get("bench_axis_total")
+        try:
+            axis_idx_i = int(axis_idx)
+            axis_total_i = int(axis_total)
+        except (TypeError, ValueError):
+            axis_idx_i = None
+            axis_total_i = None
+        if axis_idx_i is not None and axis_total_i and axis_total_i > 0:
+            done = max(0, min(axis_total_i, axis_idx_i))
+            total = axis_total_i
+            progress_mode = "benchmark_axes"
         axis_prefix = (
             f"{axis_idx}/{axis_total} "
             if axis_idx is not None and axis_total is not None
             else ""
         )
         status_text = f"Benchmark probes: {axis_prefix}{current.get('bench_axis_label')}"
-        metric_text = "RUNNING"
+        metric_text = f"{done}/{total}" if total else "RUNNING"
     elif repo:
         status_text = f"{phase_label}: {repo}"
         metric_text = "RUNNING" if phase in indeterminate_phases else None
@@ -756,6 +770,11 @@ def _current_eval(progress, commitments):
         "hotkey": commit.get("hotkey"),
         "progress": done,
         "total": total,
+        "progress_mode": progress_mode,
+        "progress_percent": (
+            max(0, min(100, round((float(done) / float(total)) * 100)))
+            if total else None
+        ),
         "mu_hat": mu_hat or 0,
         "metric_text": metric_text,
         "avg_king_loss": current.get("king_kl") or 0,
