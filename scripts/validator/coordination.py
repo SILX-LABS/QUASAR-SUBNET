@@ -36,7 +36,10 @@ COORD_ROUND_BLOCKS = 720
 COORD_COMMIT_FINALITY_BLOCKS = 20
 # Activate late in the round after validators have had time to complete evals.
 COORD_ACTIVATION_DELAY_BLOCKS = 600
-COORD_START_GRACE_BLOCKS = 20
+# Validators may join a round shortly after its seed block. With two-epoch
+# rounds this is half of the first epoch, so a restart a few minutes late still
+# evaluates the same frozen candidate set instead of idling for the next round.
+COORD_START_GRACE_BLOCKS = max(1, COORD_ROUND_BLOCKS // 4)
 
 
 def _env_int(name: str, default: int) -> int:
@@ -279,11 +282,12 @@ def reset_anchor_challenger_uids(
 
 
 def wait_for_round_start(subtensor: Any, state, state_dir: str) -> int | None:
-    """Wait until the chain is in a deterministic round-start window.
+    """Wait until the chain is in a deterministic round-join window.
 
     This is the core alignment rule: validators do not begin evaluation based
-    on local process start time. If they wake up mid-round, they wait for the
-    next chain round start and plan from there with everyone else.
+    on local process start time. If they wake up early in a fresh round, they
+    join that round; if they wake up too late, they wait for the next chain
+    round start and plan from there with everyone else.
     """
     if not coordination_enabled():
         return None
