@@ -30,13 +30,12 @@ logger = logging.getLogger("quasar.validator")
 # on operator configuration.
 COORDINATED_ROUNDS = True
 COORD_PROTOCOL_VERSION = 2
-# One subnet epoch. This keeps validators moving on the normal cadence while
-# owner/child-key weight support is being coordinated.
-COORD_ROUND_BLOCKS = 360
+# Two subnet epochs. This gives slower validators enough room to finish the
+# same frozen candidate set before the coordinated activation window.
+COORD_ROUND_BLOCKS = 720
 COORD_COMMIT_FINALITY_BLOCKS = 20
-# Activate one third into the round, leaving the rest of the epoch for state
-# persistence and weight-setting before the next coordinated round.
-COORD_ACTIVATION_DELAY_BLOCKS = 120
+# Activate late in the round after validators have had time to complete evals.
+COORD_ACTIVATION_DELAY_BLOCKS = 600
 COORD_START_GRACE_BLOCKS = 20
 
 
