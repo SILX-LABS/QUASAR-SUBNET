@@ -421,23 +421,101 @@ def _safe_set_weights(subtensor, wallet, netuid, n_uids, weights, winner_uid, st
         return False
 
 
+def _weight_refresh_blocks(subtensor, netuid: int) -> int:
+    configured = os.environ.get("QUASAR_WEIGHT_REFRESH_BLOCKS")
+    if configured:
+        try:
+            return max(1, int(configured))
+        except (TypeError, ValueError):
+            logger.warning(
+                f"Invalid QUASAR_WEIGHT_REFRESH_BLOCKS={configured!r}; falling back to chain rate limit"
+            )
+    try:
+        return max(1, int(subtensor.weights_rate_limit(netuid)))
+    except Exception:
+        try:
+            hparams = subtensor.get_subnet_hyperparameters(netuid=netuid)
+            return max(1, int(getattr(hparams, "weights_rate_limit")))
+        except Exception:
+            return 100
+
+
+def _validator_update_age(subtensor, netuid: int, validator_uid: int) -> tuple[int, int, int] | None:
+    try:
+        metagraph, current_block, _ = fetch_metagraph(subtensor, netuid)
+        last_update = int(metagraph.last_update[validator_uid])
+        return max(0, int(current_block) - last_update), last_update, int(current_block)
+    except Exception as exc:
+        logger.warning(f"Could not read validator last_update for UID {validator_uid}: {exc}")
+        return None
+
+
+def _has_pending_weight_commit(subtensor, netuid: int, hotkey_ss58: str | None) -> bool:
+    if not hotkey_ss58:
+        return False
+    try:
+        commits = subtensor.get_timelocked_weight_commits(netuid=netuid)
+    except Exception as exc:
+        logger.debug(f"Could not read timelocked weight commits: {exc}")
+        return False
+    for commit in commits or []:
+        try:
+            commit_hotkey = commit[0]
+        except Exception:
+            commit_hotkey = None
+        if commit_hotkey == hotkey_ss58:
+            return True
+    return False
+
+
 def _sync_king_weights(subtensor, wallet, netuid, n_uids, king_uid, validator_uid, state_dir):
     if king_uid is None or validator_uid is None:
         return
+    refresh_blocks = _weight_refresh_blocks(subtensor, netuid)
+    age_info = _validator_update_age(subtensor, netuid, validator_uid)
+    if age_info is None:
+        return
+    age, last_update, current_block = age_info
     try:
         current_weight_target = get_validator_weight_target(subtensor, netuid, validator_uid)
     except Exception as exc:
         current_weight_target = None
         logger.warning(f"Could not read current validator weights: {exc}")
-    if current_weight_target == king_uid:
+
+    hotkey_ss58 = getattr(getattr(wallet, "hotkey", None), "ss58_address", None)
+    if current_weight_target != king_uid and _has_pending_weight_commit(subtensor, netuid, hotkey_ss58):
+        logger.info(
+            f"Validator weights still reveal UID {current_weight_target}, "
+            f"but a pending commit exists for UID {validator_uid}; waiting for reveal"
+        )
         return
-    logger.warning(
-        f"Validator weights stale before eval: chain UID {current_weight_target} != king UID {king_uid}; syncing"
-    )
-    log_event(
-        f"Syncing stale weights before eval: chain UID {current_weight_target} -> king UID {king_uid}",
-        level="warning", state_dir=state_dir,
-    )
+
+    if age <= refresh_blocks:
+        if current_weight_target != king_uid:
+            logger.info(
+                f"Validator weights still reveal UID {current_weight_target}, "
+                f"but last_update is fresh ({age}/{refresh_blocks} blocks); "
+                "waiting for commit/reveal or weight-rate limit"
+            )
+        return
+
+    if current_weight_target == king_uid:
+        logger.warning(
+            f"Validator weights already target UID {king_uid}, but last_update is stale "
+            f"({age} blocks since {last_update}; current={current_block}); refreshing"
+        )
+        log_event(
+            f"Refreshing validator weights for UID {king_uid}: last_update age {age} blocks",
+            level="warning", state_dir=state_dir,
+        )
+    else:
+        logger.warning(
+            f"Validator weights stale before eval: chain UID {current_weight_target} != king UID {king_uid}; syncing"
+        )
+        log_event(
+            f"Syncing stale weights before eval: chain UID {current_weight_target} -> king UID {king_uid}",
+            level="warning", state_dir=state_dir,
+        )
     _safe_set_weights(
         subtensor, wallet, netuid, n_uids,
         build_winner_take_all_weights(n_uids, king_uid), king_uid, state_dir,

@@ -188,6 +188,11 @@ QUASAR_STATE_DIR=/path/to/state
 Keep wallet files, provider keys, Hugging Face tokens, and state credentials out
 of git. Use a private environment file or your process manager's secret store.
 
+For validator rollout updates, use the 2026-05-18 local-state reset block in
+[`VALIDATOR.md`](VALIDATOR.md). The current production settings are
+`QUASAR_EVAL_PROMPTS_H2H=150`, `QUASAR_VLLM_CONCURRENCY=8`, isolated
+`.venv-vllm`, and a two-epoch chain coordination window.
+
 ## Disqualification
 
 Models are disqualified for the current commitment when they fail production

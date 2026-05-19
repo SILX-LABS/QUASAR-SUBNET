@@ -270,7 +270,8 @@ def select_challengers(valid_models, state: ValidatorState, king_uid, king_kl,
         if model_name in state.permanently_bad_models:
             state.evaluated_uids.add(uid_str)
             continue
-        best_ever = state.model_score_history.get(model_name, {}).get("best_kl")
+        history_entry = state.model_score_history.get(model_name, {})
+        best_ever = history_entry.get("best_kl") if isinstance(history_entry, dict) else None
         if trust_king_kl and best_ever is not None and king_kl < float("inf"):
             skip_threshold = max(king_kl * 2.0, king_kl + 0.05)
             if best_ever > skip_threshold:

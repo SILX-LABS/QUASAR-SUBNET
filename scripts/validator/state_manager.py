@@ -376,6 +376,12 @@ def update_model_tracking(state: ValidatorState, models_to_eval, current_block,
         if uid_str in state.scores and state.scores[uid_str] > 0:
             kl = state.scores[uid_str]
             prev = state.model_score_history.get(model_name, {})
+            if not isinstance(prev, dict):
+                logger.warning(
+                    f"model_score_history entry for {model_name} had legacy "
+                    f"{type(prev).__name__} shape; resetting that record"
+                )
+                prev = {}
             # A past rollback persisted {"best_kl": null,
             # "best_kl_before_rollback_*": <float>} for ~500 entries. Plain
             # ``prev.get("best_kl", float("inf"))`` returned None (default is
@@ -400,6 +406,9 @@ def update_model_tracking(state: ValidatorState, models_to_eval, current_block,
                         "block": current_block, "timestamp": time.time(),
                     }
                 existing = state.model_score_history.get(model_name, {})
+                if not isinstance(existing, dict):
+                    existing = {}
+                    state.model_score_history[model_name] = existing
                 if existing.get("best_kl") is None:
                     state.model_score_history.setdefault(model_name, {})["best_kl"] = round(kl, 6)
 

@@ -55,12 +55,12 @@ with activation at round start + 600 blocks. All validators must run the same
 coordination protocol before the rollout activation window; mixing v1 and v2
 will split round manifests.
 
-Keep local state persistent. Only reset validator state during an announced
-rollout or explicit operator recovery.
+Keep local state persistent. Only reset local validator state during an
+announced rollout or explicit operator recovery.
 
-For an announced coordination reset, stop the validator, back up and clear the
-local `QUASAR_STATE_DIR`, then pull/start the updated code with the other
-validators. Do not wipe wallet keys or validator config.
+For an announced catch-up reset, stop the validator, move `QUASAR_STATE_DIR`
+aside, and restart clean. This clears stale scoring/eval history so the
+reset-anchor can seat the frozen backlog in one clean round.
 
 Duplicate policy is strict: if two commitments have identical weights,
 identical tensor content, or a near-identical activation fingerprint, the
@@ -120,6 +120,35 @@ git clone https://github.com/SILX-LABS/QUASAR-SUBNET.git
 cd QUASAR-SUBNET
 python -m pip install -r requirements-validator.txt
 bash scripts/run_validator.sh
+```
+
+## Local State Reset (2026-05-18)
+
+Use this when validators are asked to reset local validator state for
+coordinated catch-up.
+
+```bash
+cd /path/to/QUASAR-SUBNET
+git pull --ff-only
+
+pm2 stop quasar-validator || true
+pkill -TERM -f '[p]od_eval.py|[v]llm.entrypoints.openai.api_server|[V]LLM::EngineCore' || true
+
+STATE_DIR="${QUASAR_STATE_DIR:-state}"
+BACKUP_DIR="${STATE_DIR}.backup.$(date +%Y%m%d-%H%M%S)"
+mv "$STATE_DIR" "$BACKUP_DIR" 2>/dev/null || true
+mkdir -p "$STATE_DIR"
+
+pm2 restart quasar-validator --update-env || pm2 start scripts/run_validator.sh --name quasar-validator
+pm2 save
+```
+
+Verify:
+
+```bash
+pm2 status quasar-validator
+pm2 logs quasar-validator --lines 120 --nostream
+cat "${QUASAR_STATE_DIR:-state}/eval_progress.json" 2>/dev/null || echo "no active eval yet"
 ```
 
 ### Recommended Process Manager

@@ -2337,6 +2337,7 @@ CAPABILITY_PROBE_MAX_TOKENS = int(os.environ.get("CAPABILITY_PROBE_MAX_TOKENS", 
 CAPABILITY_PROBE_N = int(os.environ.get("CAPABILITY_PROBE_N", "12"))
 CAPABILITY_PROBE_N_PROC_MATH = int(os.environ.get("CAPABILITY_PROBE_N_PROC_MATH", "24"))
 LENGTH_PENALTY_RATIO = float(os.environ.get("LENGTH_PENALTY_RATIO", "2.0"))
+LENGTH_MIN_RATIO = float(os.environ.get("LENGTH_MIN_RATIO", "0.08"))
 
 # Pool of common simple words used as random subjects for procedural
 # string-operation items (count_chars / count_vowels). Public but the
@@ -11678,12 +11679,18 @@ def main():
                         length_source = "chat_probe"
             if length_source is not None:
                 ratio = stud_mean_gen / teach_mean_gen
-                length_penalty = min(1.0, LENGTH_PENALTY_RATIO / max(ratio, 1e-6))
+                too_short_penalty = min(1.0, ratio / max(LENGTH_MIN_RATIO, 1e-6))
+                too_long_penalty = min(1.0, LENGTH_PENALTY_RATIO / max(ratio, 1e-6))
+                length_penalty = min(too_short_penalty, too_long_penalty)
                 student_result["length_axis"] = {
                     "student_mean_gen": round(stud_mean_gen, 1),
                     "teacher_mean_gen": round(teach_mean_gen, 1),
                     "ratio": round(ratio, 3),
                     "penalty": round(length_penalty, 3),
+                    "too_short_penalty": round(too_short_penalty, 3),
+                    "too_long_penalty": round(too_long_penalty, 3),
+                    "min_ratio": round(LENGTH_MIN_RATIO, 3),
+                    "too_short": ratio < LENGTH_MIN_RATIO,
                     "source": length_source,
                 }
                 print(f"  → Length axis ({length_source}): "
