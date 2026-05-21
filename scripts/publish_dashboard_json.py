@@ -2,6 +2,7 @@
 """Publish the compact dashboard payload to an S3-compatible bucket."""
 
 import argparse
+from contextlib import contextmanager
 import json
 import os
 import sys
@@ -35,16 +36,41 @@ def _env(name, default=None):
     return value if value not in (None, "") else default
 
 
+@contextmanager
+def _force_local_state_reads():
+    """Build publisher payloads from local validator state, not the upload bucket.
+
+    The API can read public state from S3 when it is running as a stateless web
+    service. The publisher is different: it is the process writing that S3 state
+    from the validator host. If the upload bucket env is visible while importing
+    the API state loader, the publisher can accidentally rebuild dashboard.json
+    from stale bucket objects and then re-upload that stale view.
+    """
+    keys = ("QUASAR_BUCKET_NAME", "QUASAR_STATE_BUCKET_NAME", "QUASAR_STATE_BASE_URL")
+    saved = {key: os.environ.get(key) for key in keys}
+    for key in keys:
+        os.environ.pop(key, None)
+    try:
+        yield
+    finally:
+        for key, value in saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
 def _dashboard_payload(source_url):
     if source_url:
         response = requests.get(source_url, timeout=20)
         response.raise_for_status()
         return response.json()
 
-    sys.path.insert(0, str(ROOT / "api"))
-    from routes.dashboard import get_dashboard_json
+    with _force_local_state_reads():
+        sys.path.insert(0, str(ROOT / "api"))
+        from routes.dashboard import get_dashboard_json
 
-    response = get_dashboard_json()
+        response = get_dashboard_json()
     body = getattr(response, "body", None)
     if body is None:
         return response
@@ -84,6 +110,18 @@ def _put_json(s3, bucket, key, body, acl=None):
         CacheControl="public, max-age=5, stale-while-revalidate=30",
         **put_kwargs,
     )
+
+
+def _put_dashboard_payloads(s3, bucket, key, body, acl=None):
+    keys = [key]
+    live_key = _env("QUASAR_BUCKET_LIVE_KEY")
+    if live_key:
+        live_key = live_key.lstrip("/")
+        if live_key and live_key not in keys:
+            keys.append(live_key)
+    for item in keys:
+        _put_json(s3, bucket, item, body, acl=acl)
+    return keys
 
 
 def _publish_state_files(s3, bucket, state_dir, prefix="", acl=None):
@@ -141,14 +179,15 @@ def main():
         return
 
     s3 = _client(endpoint, region, addressing_style)
-    _put_json(s3, bucket, key, body, acl=acl)
+    dashboard_keys = _put_dashboard_payloads(s3, bucket, key, body, acl=acl)
     state_files = []
     if not args.dashboard_only:
         state_files = _publish_state_files(
             s3, bucket, state_dir, prefix=state_prefix, acl=acl,
         )
     suffix = f" + {len(state_files)} state file(s)" if state_files else ""
-    print(f"published {len(body)} bytes to {endpoint.rstrip('/')}/{bucket}/{key}{suffix}")
+    key_suffix = f" ({', '.join(dashboard_keys)})" if len(dashboard_keys) > 1 else ""
+    print(f"published {len(body)} bytes to {endpoint.rstrip('/')}/{bucket}/{key}{key_suffix}{suffix}")
 
 
 if __name__ == "__main__":

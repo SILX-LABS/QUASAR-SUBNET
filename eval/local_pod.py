@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 import os
+import signal
 import shlex
 import shutil
 import socket
@@ -65,37 +66,64 @@ class LocalPodManager:
         if env:
             run_env.update({k: str(v) for k, v in env.items()})
         shell = os.environ.get("QUASAR_LOCAL_SHELL", "/bin/bash")
-        try:
-            if "nohup " in command and "disown" in command:
-                with tempfile.NamedTemporaryFile("w+", encoding="utf-8") as out_f, \
-                        tempfile.NamedTemporaryFile("w+", encoding="utf-8") as err_f:
-                    r = subprocess.run(
-                        [shell, "-lc", command],
-                        env=run_env,
-                        text=True,
-                        stdout=out_f,
-                        stderr=err_f,
-                        timeout=timeout,
-                        check=False,
-                    )
-                    out_f.seek(0)
-                    err_f.seek(0)
-                    stdout = out_f.read()
-                    stderr = err_f.read()
-            else:
-                r = subprocess.run(
+
+        def _wait_or_timeout(proc, stdout_pipe=False, stdout_file=None, stderr_file=None):
+            try:
+                if stdout_pipe:
+                    return proc.communicate(timeout=timeout)
+                proc.wait(timeout=timeout)
+                return "", ""
+            except subprocess.TimeoutExpired as exc:
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except Exception:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+                deadline = time.time() + 2
+                while proc.poll() is None and time.time() < deadline:
+                    time.sleep(0.1)
+                if proc.poll() is None:
+                    raise TimeoutError(
+                        f"Local command timed out after {timeout}s; process is still stuck after SIGKILL"
+                    ) from exc
+                if stdout_pipe:
+                    try:
+                        return proc.communicate(timeout=1)
+                    except Exception:
+                        return "", ""
+                return "", ""
+
+        if "nohup " in command and "disown" in command:
+            with tempfile.NamedTemporaryFile("w+", encoding="utf-8") as out_f, \
+                    tempfile.NamedTemporaryFile("w+", encoding="utf-8") as err_f:
+                r = subprocess.Popen(
                     [shell, "-lc", command],
                     env=run_env,
                     text=True,
-                    capture_output=True,
-                    timeout=timeout,
-                    check=False,
+                    stdout=out_f,
+                    stderr=err_f,
+                    start_new_session=True,
                 )
-                stdout = r.stdout or ""
-                stderr = r.stderr or ""
-            return {"stdout": stdout, "stderr": stderr, "exit_code": r.returncode, "success": r.returncode == 0}
-        except subprocess.TimeoutExpired as exc:
-            raise TimeoutError(f"Local command timed out after {timeout}s") from exc
+                _wait_or_timeout(r, stdout_file=out_f, stderr_file=err_f)
+                out_f.seek(0)
+                err_f.seek(0)
+                stdout = out_f.read()
+                stderr = err_f.read()
+        else:
+            r = subprocess.Popen(
+                [shell, "-lc", command],
+                env=run_env,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                start_new_session=True,
+            )
+            stdout, stderr = _wait_or_timeout(r, stdout_pipe=True)
+            stdout = stdout or ""
+            stderr = stderr or ""
+        return {"stdout": stdout, "stderr": stderr, "exit_code": r.returncode, "success": r.returncode == 0}
 
     def is_alive(self, timeout: int = 15) -> bool:
         try:
@@ -117,11 +145,15 @@ class LocalPodManager:
                 self.exec(f"{shlex.quote(self.python_bin)} -m venv {shlex.quote(str(venv_dir))}", timeout=180)
 
         quoted = shlex.quote(vllm_python)
+        verify_cmd = (
+            f"{quoted} -c 'import importlib.metadata as md, importlib.util; "
+            f"missing=[m for m in (\"torch\",\"vllm\") if importlib.util.find_spec(m) is None]; "
+            f"raise SystemExit(\"missing: \"+\",\".join(missing) if missing else 0); "
+            f"print(\"vllm=\"+md.version(\"vllm\")+\" torch=\"+md.version(\"torch\"))'"
+        )
         verify = self.exec(
-            f"{quoted} -c 'import torch, vllm, vllm._C; "
-            f"print(f\"vllm={{vllm.__version__}} torch={{torch.__version__}} "
-            f"cuda={{torch.version.cuda}} available={{torch.cuda.is_available()}}\")'",
-            timeout=120,
+            verify_cmd,
+            timeout=int(os.environ.get("QUASAR_LOCAL_DEP_CHECK_TIMEOUT", "20")),
         )
         if not verify.get("success"):
             req_file = Path.cwd() / "requirements-vllm.txt"
@@ -137,14 +169,12 @@ class LocalPodManager:
                 detail = (install.get("stderr") or install.get("stdout") or "").strip()[-2000:]
                 raise RuntimeError(f"local vLLM env install failed: {detail}")
             verify = self.exec(
-                f"{quoted} -c 'import torch, vllm, vllm._C; "
-                f"print(f\"vllm={{vllm.__version__}} torch={{torch.__version__}} "
-                f"cuda={{torch.version.cuda}} available={{torch.cuda.is_available()}}\")'",
-                timeout=120,
+                verify_cmd,
+                timeout=int(os.environ.get("QUASAR_LOCAL_DEP_CHECK_TIMEOUT", "20")),
             )
             if not verify.get("success"):
                 detail = (verify.get("stderr") or verify.get("stdout") or "").strip()[-2000:]
-                raise RuntimeError(f"local vLLM import check failed: {detail}")
+                raise RuntimeError(f"local vLLM dependency check failed: {detail}")
 
         self.vllm_python = vllm_python
         os.environ["QUASAR_VLLM_PYTHON"] = vllm_python
@@ -155,10 +185,11 @@ class LocalPodManager:
         del teacher_model
         py = shlex.quote(self.python_bin)
         check = self.exec(
-            f"{py} -c 'import torch, transformers, fla; "
-            f"print(f\"validator torch={{torch.__version__}} transformers={{transformers.__version__}} "
-            f"fla=ok cuda={{torch.cuda.is_available()}}\")'",
-            timeout=120,
+            f"{py} -c 'import importlib.util; "
+            f"missing=[m for m in (\"torch\",\"transformers\",\"fla\") if importlib.util.find_spec(m) is None]; "
+            f"raise SystemExit(\"missing: \"+\",\".join(missing) if missing else 0); "
+            f"print(\"validator deps present\")'",
+            timeout=int(os.environ.get("QUASAR_LOCAL_DEP_CHECK_TIMEOUT", "20")),
         )
         if not check.get("success"):
             detail = (check.get("stderr") or check.get("stdout") or "").strip()[-2000:]

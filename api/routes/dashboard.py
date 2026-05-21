@@ -155,6 +155,78 @@ def _scheduled_uids(progress):
     return scheduled
 
 
+def _read_current_pod_progress(round_state):
+    pod_eval = round_state.get("pod_eval") if isinstance(round_state.get("pod_eval"), dict) else {}
+    candidates = []
+    for key in ("progress_remote", "progress", "eval_progress"):
+        raw = pod_eval.get(key)
+        if raw:
+            candidates.append(str(raw))
+    run_dir = pod_eval.get("run_dir")
+    if run_dir:
+        candidates.append(os.path.join(str(run_dir), "eval_progress.json"))
+    for path in candidates:
+        try:
+            if os.path.exists(path):
+                import json
+
+                with open(path) as handle:
+                    data = json.load(handle)
+                return data if isinstance(data, dict) else {}
+        except Exception:
+            continue
+    return {}
+
+
+def _round_model_map(round_state):
+    models_to_eval = round_state.get("models_to_eval") if isinstance(round_state.get("models_to_eval"), dict) else {}
+    models = {}
+    for uid, item in models_to_eval.items():
+        if not isinstance(item, dict):
+            continue
+        model = item.get("model")
+        if model:
+            models[str(uid)] = model
+    return models
+
+
+def _completed_uids_from_pod(round_state, pod_progress):
+    if not isinstance(pod_progress, dict):
+        return set()
+    repo_to_uid = {repo: uid for uid, repo in _round_model_map(round_state).items()}
+    completed = set()
+    for item in pod_progress.get("completed") or []:
+        if not isinstance(item, dict):
+            continue
+        repo = item.get("student_name") or item.get("model")
+        uid = repo_to_uid.get(repo)
+        if uid is None:
+            continue
+        try:
+            completed.add(int(uid))
+        except (TypeError, ValueError):
+            continue
+    return completed
+
+
+def _augment_progress_with_pod(progress, round_state):
+    pod_progress = _read_current_pod_progress(round_state)
+    if not pod_progress:
+        return progress
+    augmented = dict(progress)
+    models = _round_model_map(round_state)
+    if models and not augmented.get("models"):
+        augmented["models"] = models
+    completed = pod_progress.get("completed")
+    if isinstance(completed, list) and completed:
+        augmented.setdefault("completed", completed)
+        augmented["pod_completed"] = completed
+        augmented["completed_uids"] = sorted(_completed_uids_from_pod(round_state, pod_progress))
+    if pod_progress.get("students_total") is not None:
+        augmented.setdefault("students_total", pod_progress.get("students_total"))
+    return augmented
+
+
 def _history_rows(rounds, commitments):
     out = []
     for rnd in reversed(rounds[-80:]):
@@ -216,15 +288,15 @@ def _history_rows(rounds, commitments):
                 "composite_veto": res.get("composite_veto"),
                 "error_code": "disqualified" if res.get("disqualified") else None,
                 "error_detail": res.get("dq_reason"),
-                "mu_hat": mu_hat or 0,
-                "lcb": lcb or 0,
-                "delta": delta or 0,
+                "mu_hat": mu_hat,
+                "lcb": lcb,
+                "delta": delta,
                 "p_value": p_value,
                 "t_stat": tt.get("t"),
                 "paired_prompts": tt.get("n") or res.get("paired_prompts"),
                 "se": tt.get("se"),
-                "avg_king_loss": king_loss or 0,
-                "avg_challenger_loss": res.get("kl") or 0,
+                "avg_king_loss": king_loss,
+                "avg_challenger_loss": res.get("kl"),
                 "wall_time_s": rnd.get("elapsed_seconds"),
                 "timestamp": _iso(rnd.get("timestamp")),
             })
@@ -811,7 +883,10 @@ def _dashboard_events(progress, current_eval, submissions, status):
             "chain",
         ))
     elif status.get("mode") == "activation_wait":
-        msg = f"Winner UID {status.get('winner_uid')} waiting for activation"
+        if status.get("progress_winner_uid") is not None:
+            msg = f"Eval winner UID {status.get('progress_winner_uid')} waiting for activation"
+        else:
+            msg = "Round result ready; waiting for activation"
         if status.get("activation_block"):
             msg += f" at block {status.get('activation_block')}"
         if status.get("blocks_remaining") is not None:
@@ -917,6 +992,17 @@ def _submission_rows(commitments, history_rows, king_uid, progress):
     recent = {row.get("uid") for row in history_rows[:50]}
     dq = disqualified()
     scheduled = _scheduled_uids(progress)
+    completed_uids = set()
+    for item in progress.get("completed_uids") or []:
+        try:
+            completed_uids.add(int(item))
+        except (TypeError, ValueError):
+            continue
+    waiting_activation = (
+        bool(progress.get("active"))
+        and (progress.get("phase") or progress.get("stage")) == "waiting_for_coordination_activation"
+    )
+    activation_block = progress.get("activation_block")
     rows = []
     for uid, commit in sorted(commitments.items()):
         repo = _repo(commit)
@@ -937,6 +1023,12 @@ def _submission_rows(commitments, history_rows, king_uid, progress):
             status = "disqualified"
             label = "DQ"
             detail = str(reason)
+        elif uid in completed_uids and waiting_activation:
+            status = "evaluated"
+            label = "WAITING"
+            detail = "Evaluated in the current round; result will apply at activation."
+            if activation_block:
+                detail += f" Activation block: {activation_block}."
         elif uid in scheduled:
             status = "scheduled"
             label = "SCHEDULED"
@@ -968,7 +1060,9 @@ def _dashboard_status(progress, current_eval, latest, consensus_king, submission
     state_king_uid = latest.get("king_uid")
     chain_king_uid = (consensus_king or {}).get("uid")
     progress_winner_uid = progress.get("winner_uid")
-    if active:
+    if active and phase == "waiting_for_coordination_activation":
+        winner_uid = progress_winner_uid
+    elif active:
         winner_uid = progress_winner_uid or chain_king_uid or state_king_uid
     else:
         winner_uid = chain_king_uid or state_king_uid
@@ -1001,10 +1095,16 @@ def _dashboard_status(progress, current_eval, latest, consensus_king, submission
             "detail": current_eval.get("challenger_repo") or current_eval.get("phase") or "Scoring current round.",
         })
     elif active and phase == "waiting_for_coordination_activation":
+        if progress_winner_uid is not None:
+            label = "Eval winner selected; waiting for activation"
+            detail = f"UID {progress_winner_uid} will activate at the coordination block."
+        else:
+            label = "Round result ready; waiting for activation"
+            detail = "No eval winner UID is recorded for this round; chain king remains separate."
         status.update({
             "mode": "activation_wait",
-            "label": "Winner selected; waiting for activation",
-            "detail": f"UID {winner_uid} holds. No model eval is running.",
+            "label": label,
+            "detail": detail,
         })
     elif phase == "waiting_for_coordination_round_start":
         detail = "No model eval is running."
@@ -1130,10 +1230,12 @@ def get_dashboard_json():
     history = round_history()
     hist_rows = _history_rows(history, commitments)
     consensus_king = _consensus_king(commitments)
+    round_state = current_round() or {}
     state_king_uid = latest.get("king_uid")
     king_uid = (consensus_king or {}).get("uid") if consensus_king else state_king_uid
     king_commit = commitments.get(king_uid, {})
     progress = normalize_eval_progress(eval_progress() or {})
+    progress = _augment_progress_with_pod(progress, round_state)
     current_eval = _current_eval(progress, commitments)
     submissions = _submission_rows(commitments, hist_rows, king_uid, progress)
     price = get_price() or {}

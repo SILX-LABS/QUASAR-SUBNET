@@ -610,6 +610,22 @@ def process_results(results, models_to_eval, king_uid, state: ValidatorState, ui
             rev = models_to_eval.get(uid, {}).get("revision", "main")
             record_failure(uid, state.failures, state.failure_models, f"{model_name}@{rev}")
             continue
+        if kl > MAX_KL_THRESHOLD:
+            reason = (
+                f"quality: KL={kl:.6f} exceeds max threshold "
+                f"{MAX_KL_THRESHOLD:.6f}"
+            )
+            logger.info(f"UID {uid} ({model_name}): DISQUALIFIED — {reason}")
+            log_event(
+                f"UID {uid} ({model_name}) DQ: {reason}",
+                level="warning", state_dir=str(state.state_dir),
+            )
+            hotkey = models_to_eval.get(uid, {}).get("hotkey", uid_to_hotkey.get(uid, str(uid)))
+            commit_block = models_to_eval.get(uid, {}).get("commit_block")
+            disqualify(hotkey, reason, state.dq_reasons, commit_block=commit_block)
+            state.scores[str(uid)] = MAX_KL_THRESHOLD + 1
+            state.evaluated_uids.add(str(uid))
+            continue
         this_round_uids.add(uid)
         if uid == king_uid:
             king_h2h_kl = kl
@@ -1174,7 +1190,12 @@ def _build_h2h_results(results, models_to_eval, king_uid, king_h2h_kl, king_per_
         commit_block = info.get("commit_block") or (commitments.get(uid, {}) or {}).get("block")
         dq_key = f"{hotkey}:{commit_block}" if hotkey and commit_block is not None else hotkey
         dq_reason = dq_reasons.get(dq_key) or (dq_reasons.get(hotkey) if hotkey else None) or dq_reasons.get(str(uid))
-        is_dq = bool(dq_reason) and not is_king
+        if not dq_reason and kl > MAX_KL_THRESHOLD:
+            dq_reason = (
+                f"quality: KL={kl:.6f} exceeds max threshold "
+                f"{MAX_KL_THRESHOLD:.6f}"
+            )
+        is_dq = bool(dq_reason)
         vs_king = ""
         t_test_info = None
         challenger_per_prompt = student_data.get("kl_per_prompt")
@@ -1226,6 +1247,7 @@ def _build_h2h_results(results, models_to_eval, king_uid, king_h2h_kl, king_per_
             "uid": uid,
             "model": model_name,
             "kl": round(kl, 6),
+            "commit_block": commit_block,
             "is_king": is_king,
             "vs_king": vs_king,
             "prompts_scored": prompts_scored,
@@ -1234,6 +1256,12 @@ def _build_h2h_results(results, models_to_eval, king_uid, king_h2h_kl, king_per_
             "dethrone_eligible": dethrone_eligible,
             "early_stopped": bool(student_data.get("early_stopped", False)),
         }
+        if isinstance(challenger_per_prompt, list):
+            entry["_selection_per_prompt"] = (
+                challenger_per_prompt[:paired_prompts]
+                if isinstance(paired_prompts, int) and paired_prompts > 0
+                else list(challenger_per_prompt)
+            )
         if is_dq:
             entry["disqualified"] = True
             entry["dq_reason"] = dq_reason

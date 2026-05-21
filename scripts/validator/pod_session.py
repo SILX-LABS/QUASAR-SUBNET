@@ -307,7 +307,10 @@ def run_eval_on_pod(pod: PodManager, models_to_eval: dict, king_uid, n_prompts: 
     status_inner = (
         f"if [ -f {shlex.quote(done_marker_remote)} ]; then echo QUASAR_STATUS:done; "
         f"elif [ ! -f {shlex.quote(pid_remote)} ]; then echo QUASAR_STATUS:starting; "
-        f"elif kill -0 \"$(cat {shlex.quote(pid_remote)})\" 2>/dev/null; then echo QUASAR_STATUS:running; "
+        f"elif kill -0 \"$(cat {shlex.quote(pid_remote)})\" 2>/dev/null; then "
+        f"echo QUASAR_STATUS:running; "
+        f"ps -p \"$(cat {shlex.quote(pid_remote)})\" -o stat= -o wchan= 2>/dev/null | "
+        f"head -1 | sed 's/^/QUASAR_PROC:/'; "
         "else echo QUASAR_STATUS:dead; fi"
     )
     status_cmd = f"bash -lc {shlex.quote(status_inner)}"
@@ -325,12 +328,16 @@ def run_eval_on_pod(pod: PodManager, models_to_eval: dict, king_uid, n_prompts: 
     # matching writer-side fix).
     _poll_last_err: dict = {"kind": None, "at": 0.0}
     _poll_started_at = time.time()
+    progress_health: dict = {"last_ok_at": None, "first_bad_at": None, "last_error": None}
 
     class _ProgressNotReady(Exception):
         pass
 
     def _poll_log_err(kind: str, msg: str):
         now = time.time()
+        if not progress_health.get("first_bad_at"):
+            progress_health["first_bad_at"] = now
+        progress_health["last_error"] = f"{kind}: {msg[:200]}"
         if _poll_last_err["kind"] == kind and (now - _poll_last_err["at"]) < 300:
             return
         _poll_last_err["kind"] = kind
@@ -378,6 +385,9 @@ def run_eval_on_pod(pod: PodManager, models_to_eval: dict, king_uid, n_prompts: 
                         )
                         raise
                 pod_phase = pod_progress.get("phase", "scoring")
+                progress_health["last_ok_at"] = time.time()
+                progress_health["first_bad_at"] = None
+                progress_health["last_error"] = None
                 progress["phase"] = pod_phase
                 progress["pod"] = pod_progress
                 if pod_progress.get("current"):
@@ -530,6 +540,7 @@ def run_eval_on_pod(pod: PodManager, models_to_eval: dict, king_uid, n_prompts: 
         result = {"stdout": "", "stderr": "", "exit_code": -1, "success": False}
         dead_streak = 0
         starting_streak = 0
+        uvm_hang_seen_at = None
         cuda_restarts = 0
         max_cuda_restarts = max(1, len(models_to_eval) + 1)
         deadline = time.time() + eval_timeout
@@ -595,6 +606,39 @@ def run_eval_on_pod(pod: PodManager, models_to_eval: dict, king_uid, n_prompts: 
             else:
                 dead_streak = 0
                 starting_streak = 0
+                proc_lines = [line for line in out.splitlines() if line.startswith("QUASAR_PROC:")]
+                proc_state = proc_lines[-1].replace("QUASAR_PROC:", "", 1).strip() if proc_lines else ""
+                if is_local_backend and proc_state.startswith("D") and "uvm" in proc_state.lower():
+                    now = time.time()
+                    if uvm_hang_seen_at is None:
+                        uvm_hang_seen_at = now
+                        logger.error("Local eval worker entered GPU UVM D-state: %s", proc_state)
+                    elif (now - uvm_hang_seen_at) > int(os.environ.get("QUASAR_UVM_HANG_GRACE_SECONDS", "90")):
+                        result = {
+                            "stdout": "",
+                            "stderr": f"gpu_uvm_hung: {proc_state[:200]}",
+                            "exit_code": -1,
+                            "success": False,
+                        }
+                        break
+                else:
+                    uvm_hang_seen_at = None
+                bad_since = progress_health.get("first_bad_at")
+                if bad_since and (
+                    time.time() - bad_since
+                ) > int(os.environ.get("QUASAR_PROGRESS_MISSING_TIMEOUT", "600")):
+                    logger.error(
+                        "Eval progress file missing/stale for >%ss: %s",
+                        int(time.time() - bad_since),
+                        progress_health.get("last_error") or "unknown",
+                    )
+                    result = {
+                        "stdout": "",
+                        "stderr": f"progress_missing_stale: {progress_health.get('last_error') or 'unknown'}",
+                        "exit_code": -1,
+                        "success": False,
+                    }
+                    break
             time.sleep(20)
         else:
             logger.error(f"Eval timed out after {eval_timeout}s — killing")

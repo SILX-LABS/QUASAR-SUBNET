@@ -58,7 +58,11 @@ from scripts.validator.coordination import (
 from scripts.validator.pod_manager import init_local_pod, init_pod
 from scripts.validator.pod_session import run_eval_on_pod
 from scripts.validator.precheck import precheck_all_models
-from scripts.validator.results import process_results
+from scripts.validator.results import (
+    MIN_PROMPTS_DETHRONE,
+    _pairwise_two_sided_p,
+    process_results,
+)
 from scripts.validator.side_effects import sync_king_runtime
 from scripts.validator.single_eval import (
     SINGLE_EVAL_DETHRONE_MARGIN,
@@ -172,6 +176,138 @@ def _composite_quality_allows_dethrone(
     return False, detail
 
 
+def _candidate_commit_block(row: dict) -> float:
+    block = _as_float(row.get("commit_block"))
+    return block if block is not None else float("inf")
+
+
+def _candidate_uid(row: dict) -> int | None:
+    try:
+        return int(row.get("uid"))
+    except (TypeError, ValueError):
+        return None
+
+
+def _selection_per_prompt(row: dict) -> list[float] | None:
+    vals = row.get("_selection_per_prompt") or row.get("per_prompt")
+    if not isinstance(vals, list):
+        return None
+    out: list[float] = []
+    for val in vals:
+        f = _as_float(val)
+        if f is None:
+            return None
+        out.append(f)
+    return out
+
+
+def _pairwise_candidates_tied(left: dict, right: dict) -> tuple[bool, dict]:
+    left_pp = _selection_per_prompt(left)
+    right_pp = _selection_per_prompt(right)
+    if not left_pp or not right_pp:
+        return False, {"reason": "missing_per_prompt", "n": 0}
+    mean_d, p_two, n_paired = _pairwise_two_sided_p(left_pp, right_pp)
+    tied = n_paired < MIN_PROMPTS_DETHRONE or p_two > PAIRED_TEST_ALPHA
+    return tied, {
+        "reason": "paired_candidate_test",
+        "mean_delta": mean_d,
+        "p_two": p_two,
+        "n": n_paired,
+    }
+
+
+def _resolve_round_winner_with_commit_tiebreak(candidates: list[tuple]) -> dict:
+    """Resolve live single-eval candidates with the legacy anti-clone rule.
+
+    The candidate tuple is ranked by the existing production key first. If
+    the top candidate is statistically indistinguishable from other passing
+    challengers on per-prompt KL, the tied component is treated as one model
+    family and the earliest on-chain commit wins inside that component.
+    """
+    candidates.sort(key=lambda cand: cand[:6], reverse=True)
+    if len(candidates) == 1:
+        return candidates[0][6]
+
+    seed = candidates[0]
+    by_uid: dict[int, tuple] = {}
+    for cand in candidates:
+        uid = _candidate_uid(cand[6])
+        if uid is not None:
+            by_uid[uid] = cand
+
+    seed_uid = _candidate_uid(seed[6])
+    if seed_uid is None:
+        return seed[6]
+
+    same_cluster: dict[int, set[int]] = {uid: {uid} for uid in by_uid}
+    pairwise_log = []
+    uid_items = list(by_uid.items())
+    for i in range(len(uid_items)):
+        uid_i, cand_i = uid_items[i]
+        for j in range(i + 1, len(uid_items)):
+            uid_j, cand_j = uid_items[j]
+            tied, stats = _pairwise_candidates_tied(cand_i[6], cand_j[6])
+            pairwise_log.append((uid_i, uid_j, tied, stats))
+            if tied:
+                same_cluster[uid_i].add(uid_j)
+                same_cluster[uid_j].add(uid_i)
+
+    component: set[int] = set()
+    stack = [seed_uid]
+    while stack:
+        uid = stack.pop()
+        if uid in component:
+            continue
+        component.add(uid)
+        for nbr in same_cluster.get(uid, ()):
+            if nbr not in component:
+                stack.append(nbr)
+
+    if len(component) <= 1:
+        return seed[6]
+
+    rank_index = {id(cand): idx for idx, cand in enumerate(candidates)}
+    component_candidates = [by_uid[uid] for uid in component]
+    component_candidates.sort(
+        key=lambda cand: (
+            _candidate_commit_block(cand[6]),
+            rank_index.get(id(cand), len(candidates)),
+        )
+    )
+    winner = component_candidates[0][6]
+
+    logger.info(
+        "single-eval: %s statistically tied dethrone candidate(s) around "
+        "top UID %s; applying earliest commit_block tiebreak",
+        len(component),
+        seed_uid,
+    )
+    for uid_i, uid_j, tied, stats in pairwise_log:
+        if uid_i not in component and uid_j not in component:
+            continue
+        logger.info(
+            "single-eval: candidate pair UID %s vs UID %s: n=%s p_two=%s "
+            "mean_delta=%s -> %s",
+            uid_i,
+            uid_j,
+            stats.get("n"),
+            stats.get("p_two"),
+            stats.get("mean_delta"),
+            "TIED" if tied else "DISTINCT",
+        )
+    for cand in component_candidates:
+        row = cand[6]
+        marker = " <- WINNER" if row is winner else ""
+        logger.info(
+            "single-eval: tied candidate UID %s commit_block=%s KL=%s%s",
+            row.get("uid"),
+            row.get("commit_block"),
+            row.get("kl"),
+            marker,
+        )
+    return winner
+
+
 def _select_round_winner_with_kl_and_composite(h2h_results, king_uid, incumbent_record=None):
     """Return a challenger only when both production gates agree.
 
@@ -221,8 +357,7 @@ def _select_round_winner_with_kl_and_composite(h2h_results, king_uid, incumbent_
         candidates.append((quality, weighted, worst, mean_delta, -kl, uid_rank, row))
     if not candidates:
         return None
-    candidates.sort(reverse=True)
-    winner = candidates[0][6]
+    winner = _resolve_round_winner_with_commit_tiebreak(candidates)
     winner["selection_gate"]["reason"] = "paired_kl_and_quality_winner"
     return winner
 
@@ -1317,6 +1452,8 @@ def post_round(
     challengers, epoch_count, disqualified, epoch_start,
     uid_to_hotkey, state_dir,
 ):
+    for row in h2h_results or []:
+        row.pop("_selection_per_prompt", None)
     update_h2h_state(
         state, h2h_results, king_uid, winner_uid, king_h2h_kl, king_kl,
         king_per_prompt, current_block, n_prompts, is_full_eval,
