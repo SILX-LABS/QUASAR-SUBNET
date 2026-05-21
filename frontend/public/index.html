@@ -1579,15 +1579,25 @@ function buildEvalRows(d) {
     return rows;
 }
 
+function isScoredEvalRow(r) {
+    return ["accepted", "scored"].indexOf(r.status) >= 0 && r.score != null;
+}
+
+function isPendingEvalRow(r) {
+    return ["valid", "scheduled", "pending", "evaluated"].indexOf(r.status) >= 0 && r.score == null;
+}
+
 function renderEvaluations(d) {
     var rows=buildEvalRows(d);
     var allCount=rows.length;
-    var scoredCount=rows.filter(function(r){return r.status!=="dq";}).length;
+    var scoredCount=rows.filter(isScoredEvalRow).length;
+    var pendingCount=rows.filter(isPendingEvalRow).length;
     var dqCount=rows.filter(function(r){return r.status==="dq";}).length;
 
     var filtersHtml='';
     filtersHtml+='<button class="filter-pill'+(_evalFilter==="all"?" active":"")+'" data-filter="all">All <span class="count">'+allCount+'</span></button>';
     filtersHtml+='<button class="filter-pill'+(_evalFilter==="scored"?" active":"")+'" data-filter="scored">Scored <span class="count">'+scoredCount+'</span></button>';
+    filtersHtml+='<button class="filter-pill'+(_evalFilter==="pending"?" active":"")+'" data-filter="pending">Pending <span class="count">'+pendingCount+'</span></button>';
     filtersHtml+='<button class="filter-pill'+(_evalFilter==="dq"?" active":"")+'" data-filter="dq">Disqualified <span class="count">'+dqCount+'</span></button>';
     document.getElementById("eval-filters").innerHTML=filtersHtml;
 
@@ -1599,7 +1609,8 @@ function renderEvaluations(d) {
     });
 
     var filtered=rows;
-    if(_evalFilter==="scored") filtered=rows.filter(function(r){return r.status!=="dq";});
+    if(_evalFilter==="scored") filtered=rows.filter(isScoredEvalRow);
+    if(_evalFilter==="pending") filtered=rows.filter(isPendingEvalRow);
     if(_evalFilter==="dq") filtered=rows.filter(function(r){return r.status==="dq";});
 
     filtered.sort(function(a,b){

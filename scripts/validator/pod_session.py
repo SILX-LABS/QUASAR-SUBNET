@@ -133,7 +133,12 @@ def run_eval_on_pod(pod: PodManager, models_to_eval: dict, king_uid, n_prompts: 
                 "else echo MISSING; fi",
                 timeout=30,
             )
-            pid_status = (pid_probe.get("stdout") or "").strip()
+            pid_stdout = pid_probe.get("stdout") or ""
+            pid_lines = [line.strip() for line in pid_stdout.splitlines() if line.strip()]
+            pid_status = next(
+                (line for line in reversed(pid_lines) if line in ("ALIVE", "DONE", "MISSING")),
+                pid_stdout.strip(),
+            )
         except Exception as exc:
             logger.warning("Resume probe failed: %s — falling back to fresh run", exc)
             return run_eval_on_pod(pod, models_to_eval, king_uid, n_prompts, prompt_texts, state, is_full_eval, use_vllm, eval_script, block_seed=block_seed, resume_pod_eval=None)

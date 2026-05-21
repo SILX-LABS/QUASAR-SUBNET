@@ -556,6 +556,49 @@ def _safe_set_weights(subtensor, wallet, netuid, n_uids, weights, winner_uid, st
         return False
 
 
+def _coerce_valid_uid(value, n_uids):
+    try:
+        uid = int(value)
+        total = int(n_uids)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if 0 <= uid < total:
+        return uid
+    return None
+
+
+def _resolve_no_winner_weight_target(
+    subtensor, netuid, n_uids, king_uid, validator_uid, state_dir,
+):
+    """Pick the UID to refresh when the round has no crownable winner.
+
+    A no-winner round should not crown a disqualified challenger, but it also
+    should not skip weights entirely because that lets validator trust drift.
+    Prefer the incumbent king when we have one; otherwise preserve the
+    validator's current revealed target from chain.
+    """
+    incumbent_uid = _coerce_valid_uid(king_uid, n_uids)
+    if incumbent_uid is not None:
+        return incumbent_uid, "incumbent king"
+
+    validator_uid = _coerce_valid_uid(validator_uid, n_uids)
+    if validator_uid is None:
+        return None, "missing validator UID"
+
+    try:
+        current_uid = get_validator_weight_target(subtensor, netuid, validator_uid)
+    except Exception as exc:
+        msg = f"No valid miners and failed to read current validator weight target: {exc}"
+        logger.warning(msg)
+        log_event(msg[:240], level="warn", state_dir=state_dir)
+        return None, "current target read failed"
+
+    current_uid = _coerce_valid_uid(current_uid, n_uids)
+    if current_uid is None:
+        return None, "invalid current target"
+    return current_uid, "current validator target"
+
+
 def _weight_refresh_blocks(subtensor, netuid: int) -> int:
     configured = os.environ.get("QUASAR_WEIGHT_REFRESH_BLOCKS")
     if configured:
@@ -908,6 +951,9 @@ def _run_resumed_round(subtensor, wallet, netuid, state, pod, resume_round,
     commitments = chain_commitments
     write_api_commitments_cache(chain_commitments, state_dir)
     state.uid_hotkey_map = {str(uid): hotkey for uid, hotkey in uid_to_hotkey.items()}
+    validator_uid = next(
+        (uid for uid, hk in uid_to_hotkey.items() if hk == wallet.hotkey.ss58_address), None,
+    )
     coord_round = coordination_round_from_dict(
         cr.get("coordination") if isinstance(cr.get("coordination"), dict) else None
     )
@@ -1019,6 +1065,7 @@ def _run_resumed_round(subtensor, wallet, netuid, state, pod, resume_round,
                 n_prompts, current_block, result_block_hash,
                 epoch_count, is_full_eval, epoch_start, state_dir,
                 activation_block=coord_meta.get("activation_block"),
+                validator_uid=validator_uid,
             )
         )
         post_round(
@@ -1248,6 +1295,7 @@ def apply_results_and_weights(
     epoch_count, is_full_eval, epoch_start, state_dir,
     uid_to_coldkey=None,
     activation_block=None,
+    validator_uid=None,
 ):
     """Run process_results -> set weights -> persist H2H state."""
     # Coordination barrier: evaluation may finish before other validators
@@ -1440,7 +1488,32 @@ def apply_results_and_weights(
             winner_uid, state_dir,
         )
     else:
-        logger.info("No valid miners — skipping weight setting")
+        fallback_uid, fallback_source = _resolve_no_winner_weight_target(
+            subtensor, netuid, n_uids, king_uid, validator_uid, state_dir,
+        )
+        if fallback_uid is not None:
+            msg = (
+                "No valid miners; refreshing weights to "
+                f"{fallback_source} UID {fallback_uid} instead of skipping"
+            )
+            logger.warning(msg)
+            log_event(msg, level="warn", state_dir=state_dir)
+            telemetry_event(
+                msg,
+                level="warning",
+                stage="no_winner_weight_refresh",
+                fallback_uid=fallback_uid,
+                fallback_source=fallback_source,
+            )
+            weights_set = _safe_set_weights(
+                subtensor, wallet, netuid, n_uids,
+                build_winner_take_all_weights(n_uids, fallback_uid),
+                fallback_uid, state_dir,
+            )
+        else:
+            msg = f"No valid miners and no fallback weight target ({fallback_source}); skipping weight setting"
+            logger.warning(msg)
+            log_event(msg, level="warn", state_dir=state_dir)
     state.save()
     return winner_uid, winner_kl, h2h_results, king_h2h_kl, king_per_prompt, uid_to_model, weights_set
 
@@ -1677,6 +1750,31 @@ def run_validator(network, netuid, wallet_name, hotkey_name, wallet_path,
                 # history aligned across validators in the same round.
                 current_block = coord_round.eval_seed_block
                 current_block_hash = coord_hash
+            validator_uid = next(
+                (uid for uid, hk in uid_to_hotkey.items() if hk == wallet.hotkey.ss58_address), None,
+            )
+            min_commit_block_raw = os.environ.get("QUASAR_MIN_COMMIT_BLOCK", "").strip()
+            if min_commit_block_raw:
+                try:
+                    min_commit_block = int(min_commit_block_raw)
+                except ValueError:
+                    logger.warning("Invalid QUASAR_MIN_COMMIT_BLOCK=%r; ignoring", min_commit_block_raw)
+                else:
+                    before = len(commitments)
+                    commitments = {
+                        uid: info for uid, info in commitments.items()
+                        if int((info or {}).get("block") or 0) >= min_commit_block
+                    }
+                    uid_to_hotkey = {uid: hk for uid, hk in uid_to_hotkey.items() if uid in commitments}
+                    uid_to_coldkey = {uid: ck for uid, ck in uid_to_coldkey.items() if uid in commitments}
+                    removed = before - len(commitments)
+                    if removed:
+                        msg = (
+                            f"Filtered {removed} commitment(s) older than block "
+                            f"{min_commit_block}; {len(commitments)} remain"
+                        )
+                        logger.warning(msg)
+                        log_event(msg, level="warn", state_dir=state_dir)
             if not commitments:
                 state.save_progress({
                     "active": False,
@@ -1775,9 +1873,6 @@ def run_validator(network, netuid, wallet_name, hotkey_name, wallet_path,
                 "king_source": king_source,
                 "king_kl": king_kl if king_kl != float("inf") else None,
             })
-            validator_uid = next(
-                (uid for uid, hk in uid_to_hotkey.items() if hk == wallet.hotkey.ss58_address), None,
-            )
             # Coordinated rounds must not depend on local top4 state. A reset
             # validator defaults to initial_eval while an older validator may
             # still be in maintenance; letting that choose the prompt count
@@ -1998,6 +2093,7 @@ def run_validator(network, netuid, wallet_name, hotkey_name, wallet_path,
                         state.current_round.get("coordination", {}).get("activation_block")
                         if isinstance(state.current_round, dict) else None
                     ),
+                    validator_uid=validator_uid,
                 )
             )
             telemetry_log({
