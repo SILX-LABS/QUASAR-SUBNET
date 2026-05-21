@@ -120,8 +120,14 @@ a:hover { color: var(--accent-hover); }
     color: var(--ink);
 }
 .nav-brand:hover { color: var(--ink); }
-.nav-brand img { width: 26px; height: 26px; }
-[data-theme="dark"] .nav-brand img { filter: invert(1) brightness(1.2); }
+.brand-mark {
+    width: 28px;
+    height: 28px;
+    flex: 0 0 auto;
+    color: var(--accent);
+    display: block;
+}
+.brand-mark .brand-mark-q { fill: var(--ink-inv); }
 .nav-brand span {
     font-family: var(--font-display);
     font-size: 19px;
@@ -995,11 +1001,13 @@ td.mono { font-family: var(--font-mono); font-size: 12px; }
 .footer-brand {
     display: flex;
     align-items: center;
-    gap: 6px;
+    gap: 8px;
     font-weight: 500;
 }
-.footer-brand img { width: 16px; height: 16px; opacity: 0.4; }
-[data-theme="dark"] .footer-brand img { filter: invert(1); opacity: 0.4; }
+.footer-brand .brand-mark {
+    width: 16px;
+    height: 16px;
+}
 .footer-links { display: flex; gap: 20px; }
 .footer-links a {
     color: var(--ink-muted);
@@ -1050,7 +1058,10 @@ td.mono { font-family: var(--font-mono); font-size: 12px; }
 
 <nav class="nav">
     <a class="nav-brand" href="#">
-        <img src="favicon.svg" alt="Q">
+        <svg class="brand-mark" viewBox="0 0 64 64" aria-hidden="true" focusable="false">
+            <rect width="64" height="64" rx="14" fill="currentColor"></rect>
+            <path class="brand-mark-q" d="M32 10c-12.2 0-22 9.8-22 22s9.8 22 22 22c4.6 0 8.9-1.4 12.4-3.8l5.4 5.4 5.8-5.8-5.2-5.2C52.7 41.1 54 36.7 54 32c0-12.2-9.8-22-22-22Zm0 8c7.7 0 14 6.3 14 14 0 2.5-.7 4.9-1.8 6.9l-5.1-5.1-5.8 5.8 5 5C36.4 45.5 34.3 46 32 46c-7.7 0-14-6.3-14-14s6.3-14 14-14Z"></path>
+        </svg>
         <span>Quasar</span>
     </a>
     <div class="nav-right">
@@ -1152,7 +1163,10 @@ td.mono { font-family: var(--font-mono); font-size: 12px; }
 <footer class="footer">
     <div class="footer-inner">
         <div class="footer-brand">
-            <img src="favicon.svg" alt="">
+            <svg class="brand-mark" viewBox="0 0 64 64" aria-hidden="true" focusable="false">
+                <rect width="64" height="64" rx="14" fill="currentColor"></rect>
+                <path class="brand-mark-q" d="M32 10c-12.2 0-22 9.8-22 22s9.8 22 22 22c4.6 0 8.9-1.4 12.4-3.8l5.4 5.4 5.8-5.8-5.2-5.2C52.7 41.1 54 36.7 54 32c0-12.2-9.8-22-22-22Zm0 8c7.7 0 14 6.3 14 14 0 2.5-.7 4.9-1.8 6.9l-5.1-5.1-5.8 5.8 5 5C36.4 45.5 34.3 46 32 46c-7.7 0-14-6.3-14-14s6.3-14 14-14Z"></path>
+            </svg>
             <span>Quasar Subnet &middot; SN24</span>
         </div>
         <div class="footer-links">
