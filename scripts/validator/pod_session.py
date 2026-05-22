@@ -128,17 +128,23 @@ def run_eval_on_pod(pod: PodManager, models_to_eval: dict, king_uid, n_prompts: 
     if is_resuming:
         try:
             pid_probe = pod.exec(
-                f"if [ -f {shlex.quote(done_marker_remote)} ]; then echo DONE; "
-                f"elif [ -f {shlex.quote(pid_remote)} ] && kill -0 \"$(cat {shlex.quote(pid_remote)})\" 2>/dev/null; then echo ALIVE; "
-                "else echo MISSING; fi",
+                f"if [ -f {shlex.quote(done_marker_remote)} ]; then echo QUASAR_RESUME_STATUS:DONE; "
+                f"elif [ -f {shlex.quote(pid_remote)} ] && kill -0 \"$(cat {shlex.quote(pid_remote)})\" 2>/dev/null; then echo QUASAR_RESUME_STATUS:ALIVE; "
+                "else echo QUASAR_RESUME_STATUS:MISSING; fi",
                 timeout=30,
             )
             pid_stdout = pid_probe.get("stdout") or ""
-            pid_lines = [line.strip() for line in pid_stdout.splitlines() if line.strip()]
-            pid_status = next(
-                (line for line in reversed(pid_lines) if line in ("ALIVE", "DONE", "MISSING")),
-                pid_stdout.strip(),
-            )
+            pid_status = None
+            for candidate in ("ALIVE", "DONE", "MISSING"):
+                if f"QUASAR_RESUME_STATUS:{candidate}" in pid_stdout:
+                    pid_status = candidate
+                    break
+            if pid_status is None:
+                pid_lines = [line.strip() for line in pid_stdout.splitlines() if line.strip()]
+                pid_status = next(
+                    (line for line in reversed(pid_lines) if line in ("ALIVE", "DONE", "MISSING")),
+                    pid_stdout.strip(),
+                )
         except Exception as exc:
             logger.warning("Resume probe failed: %s — falling back to fresh run", exc)
             return run_eval_on_pod(pod, models_to_eval, king_uid, n_prompts, prompt_texts, state, is_full_eval, use_vllm, eval_script, block_seed=block_seed, resume_pod_eval=None)

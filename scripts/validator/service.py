@@ -599,6 +599,42 @@ def _resolve_no_winner_weight_target(
     return current_uid, "current validator target"
 
 
+def _refresh_round_weight_target(
+    subtensor, wallet, netuid, n_uids, king_uid, validator_uid, state_dir,
+):
+    """Refresh the incumbent/current target for every coordinated round.
+
+    This keeps validator trust fresh while the round waits for the coordinated
+    activation block. If the round later produces a new winner, the validator
+    sets that new winner after activation.
+    """
+    target_uid, target_source = _resolve_no_winner_weight_target(
+        subtensor, netuid, n_uids, king_uid, validator_uid, state_dir,
+    )
+    if target_uid is None:
+        msg = f"Round weight refresh skipped: no target ({target_source})"
+        logger.warning(msg)
+        log_event(msg, level="warn", state_dir=state_dir)
+        return None, target_source, False
+
+    msg = f"Refreshing round weights to {target_source} UID {target_uid}"
+    logger.warning(msg)
+    log_event(msg, level="warn", state_dir=state_dir)
+    telemetry_event(
+        msg,
+        level="warning",
+        stage="round_weight_refresh",
+        fallback_uid=target_uid,
+        fallback_source=target_source,
+    )
+    ok = _safe_set_weights(
+        subtensor, wallet, netuid, n_uids,
+        build_winner_take_all_weights(n_uids, target_uid),
+        target_uid, state_dir,
+    )
+    return target_uid, target_source, ok
+
+
 def _weight_refresh_blocks(subtensor, netuid: int) -> int:
     configured = os.environ.get("QUASAR_WEIGHT_REFRESH_BLOCKS")
     if configured:
@@ -808,13 +844,18 @@ def _detect_resumable_round(state, pod):
         pid_remote = pe.get("pid_remote") or f"{run_dir}/pod_eval.pid"
         done_remote = pe.get("done_marker_remote") or f"{run_dir}/eval_done.marker"
         cmd = (
-            f"if [ -f {_shlex.quote(done_remote)} ]; then echo done; "
-            f"elif [ ! -f {_shlex.quote(pid_remote)} ]; then echo missing; "
-            f"elif kill -0 \"$(cat {_shlex.quote(pid_remote)} 2>/dev/null)\" 2>/dev/null; then echo running; "
-            "else echo dead; fi"
+            f"if [ -f {_shlex.quote(done_remote)} ]; then echo QUASAR_RESUME_STATUS:done; "
+            f"elif [ ! -f {_shlex.quote(pid_remote)} ]; then echo QUASAR_RESUME_STATUS:missing; "
+            f"elif kill -0 \"$(cat {_shlex.quote(pid_remote)} 2>/dev/null)\" 2>/dev/null; then echo QUASAR_RESUME_STATUS:running; "
+            "else echo QUASAR_RESUME_STATUS:dead; fi"
         )
         res = pod.exec(f"bash -lc {_shlex.quote(cmd)}", timeout=30)
-        status = ((res.get("stdout") or "").strip() or "missing").splitlines()[-1].strip()
+        out = res.get("stdout") or ""
+        status = "missing"
+        for candidate in ("running", "done", "missing", "dead"):
+            if f"QUASAR_RESUME_STATUS:{candidate}" in out:
+                status = candidate
+                break
         if status in ("running", "done"):
             cur = dict(cur)
             cur["_resume_status"] = status
@@ -1298,6 +1339,17 @@ def apply_results_and_weights(
     validator_uid=None,
 ):
     """Run process_results -> set weights -> persist H2H state."""
+    pre_activation_weight_uid = None
+    pre_activation_weights_set = False
+    if activation_block is not None:
+        (
+            pre_activation_weight_uid,
+            _pre_activation_weight_source,
+            pre_activation_weights_set,
+        ) = _refresh_round_weight_target(
+            subtensor, wallet, netuid, n_uids, king_uid, validator_uid, state_dir,
+        )
+
     # Coordination barrier: evaluation may finish before other validators
     # complete the same frozen round. Wait before processing results so DQs,
     # composite_scores, h2h_latest, announcements, and weights all move at
@@ -1480,40 +1532,55 @@ def apply_results_and_weights(
                     winner_kl = float(weighted)
                 elif worst is not None:
                     winner_kl = float(worst)
-    weights_set = False
+    weights_set = bool(pre_activation_weights_set)
     if winner_uid is not None:
-        weights_set = _safe_set_weights(
-            subtensor, wallet, netuid, n_uids,
-            build_winner_take_all_weights(n_uids, winner_uid),
-            winner_uid, state_dir,
-        )
-    else:
-        fallback_uid, fallback_source = _resolve_no_winner_weight_target(
-            subtensor, netuid, n_uids, king_uid, validator_uid, state_dir,
-        )
-        if fallback_uid is not None:
-            msg = (
-                "No valid miners; refreshing weights to "
-                f"{fallback_source} UID {fallback_uid} instead of skipping"
+        winner_uid_i = _coerce_valid_uid(winner_uid, n_uids)
+        if pre_activation_weights_set and winner_uid_i == pre_activation_weight_uid:
+            logger.info(
+                "Weights already refreshed for UID %s before activation; skipping duplicate set",
+                winner_uid_i,
             )
-            logger.warning(msg)
-            log_event(msg, level="warn", state_dir=state_dir)
-            telemetry_event(
-                msg,
-                level="warning",
-                stage="no_winner_weight_refresh",
-                fallback_uid=fallback_uid,
-                fallback_source=fallback_source,
-            )
+            weights_set = True
+        else:
             weights_set = _safe_set_weights(
                 subtensor, wallet, netuid, n_uids,
-                build_winner_take_all_weights(n_uids, fallback_uid),
-                fallback_uid, state_dir,
+                build_winner_take_all_weights(n_uids, winner_uid),
+                winner_uid, state_dir,
             )
+    else:
+        if pre_activation_weights_set:
+            logger.warning(
+                "No valid miners; weights already refreshed before activation to UID %s",
+                pre_activation_weight_uid,
+            )
+            weights_set = True
         else:
-            msg = f"No valid miners and no fallback weight target ({fallback_source}); skipping weight setting"
-            logger.warning(msg)
-            log_event(msg, level="warn", state_dir=state_dir)
+            fallback_uid, fallback_source = _resolve_no_winner_weight_target(
+                subtensor, netuid, n_uids, king_uid, validator_uid, state_dir,
+            )
+            if fallback_uid is not None:
+                msg = (
+                    "No valid miners; refreshing weights to "
+                    f"{fallback_source} UID {fallback_uid} instead of skipping"
+                )
+                logger.warning(msg)
+                log_event(msg, level="warn", state_dir=state_dir)
+                telemetry_event(
+                    msg,
+                    level="warning",
+                    stage="no_winner_weight_refresh",
+                    fallback_uid=fallback_uid,
+                    fallback_source=fallback_source,
+                )
+                weights_set = _safe_set_weights(
+                    subtensor, wallet, netuid, n_uids,
+                    build_winner_take_all_weights(n_uids, fallback_uid),
+                    fallback_uid, state_dir,
+                )
+            else:
+                msg = f"No valid miners and no fallback weight target ({fallback_source}); skipping weight setting"
+                logger.warning(msg)
+                log_event(msg, level="warn", state_dir=state_dir)
     state.save()
     return winner_uid, winner_kl, h2h_results, king_h2h_kl, king_per_prompt, uid_to_model, weights_set
 
