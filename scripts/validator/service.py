@@ -635,6 +635,63 @@ def _refresh_round_weight_target(
     return target_uid, target_source, ok
 
 
+def _refresh_round_weight_target_if_stale(
+    subtensor, wallet, netuid, n_uids, king_uid, validator_uid, state_dir,
+):
+    """Refresh the current/king target while waiting for activation.
+
+    Coordinated rounds can finish evaluation hundreds of blocks before their
+    activation block. A single pre-wait refresh leaves validator trust aging
+    during that wait, so poll last_update and refresh again once the chain's
+    weight rate limit has passed.
+    """
+    target_uid, target_source = _resolve_no_winner_weight_target(
+        subtensor, netuid, n_uids, king_uid, validator_uid, state_dir,
+    )
+    if target_uid is None:
+        return False
+
+    refresh_blocks = _weight_refresh_blocks(subtensor, netuid)
+    age_info = _validator_update_age(subtensor, netuid, validator_uid)
+    if age_info is None:
+        return False
+    age, last_update, current_block = age_info
+    if age <= refresh_blocks:
+        return False
+
+    try:
+        current_weight_target = get_validator_weight_target(
+            subtensor, netuid, validator_uid
+        )
+    except Exception as exc:
+        current_weight_target = None
+        logger.warning(f"Could not read current validator weights: {exc}")
+
+    hotkey_ss58 = getattr(getattr(wallet, "hotkey", None), "ss58_address", None)
+    if (
+        current_weight_target != target_uid
+        and _has_pending_weight_commit(subtensor, netuid, hotkey_ss58)
+    ):
+        logger.info(
+            "Activation wait: validator weights still reveal UID %s, "
+            "but a pending commit exists; waiting",
+            current_weight_target,
+        )
+        return False
+
+    msg = (
+        f"Activation wait: refreshing weights to {target_source} UID {target_uid} "
+        f"(last_update age {age} blocks since {last_update}; current={current_block})"
+    )
+    logger.warning(msg)
+    log_event(msg, level="warn", state_dir=state_dir)
+    return _safe_set_weights(
+        subtensor, wallet, netuid, n_uids,
+        build_winner_take_all_weights(n_uids, target_uid),
+        target_uid, state_dir,
+    )
+
+
 def _weight_refresh_blocks(subtensor, netuid: int) -> int:
     configured = os.environ.get("QUASAR_WEIGHT_REFRESH_BLOCKS")
     if configured:
@@ -1357,6 +1414,9 @@ def apply_results_and_weights(
     # state/dashboard sync.
     wait_until_activation_block(
         subtensor, activation_block, state, state_dir,
+        on_wait=lambda *_args: _refresh_round_weight_target_if_stale(
+            subtensor, wallet, netuid, n_uids, king_uid, validator_uid, state_dir,
+        ),
     )
     uid_to_model = _persist_preliminary_results(
         results, models_to_eval, king_uid, state,
@@ -1973,6 +2033,13 @@ def run_validator(network, netuid, wallet_name, hotkey_name, wallet_path,
                     state,
                     state_dir,
                     winner_uid=king_uid,
+                    on_wait=(
+                        (lambda *_args: _refresh_round_weight_target_if_stale(
+                            subtensor, wallet, netuid, n_uids,
+                            king_uid, validator_uid, state_dir,
+                        ))
+                        if coord_round is not None else None
+                    ),
                 )
                 weights_set = False
                 if coord_round is not None and king_source == "chain_consensus":

@@ -477,6 +477,7 @@ def wait_until_activation_block(
     state_dir: str,
     *,
     winner_uid: int | None = None,
+    on_wait=None,
 ) -> int | None:
     """Block until the coordination activation block is reached.
 
@@ -539,6 +540,13 @@ def wait_until_activation_block(
             f"{activation_block} ({remaining} blocks remaining)",
             state_dir=state_dir,
         )
+        if on_wait is not None:
+            try:
+                on_wait(current, remaining, activation_block)
+            except Exception as exc:
+                logger.warning(
+                    "coordination: activation wait callback failed: %s", exc
+                )
         try:
             prior_progress = getattr(state, "eval_progress", {}) or {}
             current_round = getattr(state, "current_round", {}) or {}
