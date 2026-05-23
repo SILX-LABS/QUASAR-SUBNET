@@ -239,12 +239,18 @@ a:hover { color: var(--accent-hover); }
     transition: left 0.3s cubic-bezier(0.4, 0, 0.2, 1), width 0.3s cubic-bezier(0.4, 0, 0.2, 1);
 }
 
-/* ── Views ── */
-.view { display: none; }
-.view.active { display: block; }
-@keyframes viewIn {
-    from { opacity: 0; transform: translateY(6px); }
-    to { opacity: 1; transform: translateY(0); }
+/* ── Sections ── */
+.view { display: block; margin-bottom: 32px; }
+.section-label {
+    font-family: var(--font-display);
+    font-size: 11px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--ink-muted);
+    padding: 18px 0 10px;
+    border-top: 1px solid var(--border);
+    margin-top: 8px;
 }
 
 /* ── Cards ── */
@@ -1514,9 +1520,16 @@ function buildEvalRows(d) {
     var q=d.queue||[];
     var rows=[];
     var seen={};
+    var currentByUid={};
+
+    for(var qi=0;qi<q.length;qi++){
+        if(q[qi].uid!=null) currentByUid[q[qi].uid]=q[qi];
+    }
 
     for(var i=0;i<hist.length;i++){
         var h=hist[i];
+        var current=h.uid!=null?currentByUid[h.uid]:null;
+        if(current&&current.hf_repo&&current.hf_repo!==h.challenger_repo) continue;
         var isDq=h.verdict==="error"||!!h.error_code;
         var isAccepted=!!h.accepted;
         var st=isDq?"dq":(isAccepted?"accepted":"scored");
