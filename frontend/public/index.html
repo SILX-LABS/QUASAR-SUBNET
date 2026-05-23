@@ -239,18 +239,12 @@ a:hover { color: var(--accent-hover); }
     transition: left 0.3s cubic-bezier(0.4, 0, 0.2, 1), width 0.3s cubic-bezier(0.4, 0, 0.2, 1);
 }
 
-/* ── Sections ── */
-.view { display: block; margin-bottom: 32px; }
-.section-label {
-    font-family: var(--font-display);
-    font-size: 11px;
-    font-weight: 700;
-    text-transform: uppercase;
-    letter-spacing: 0.04em;
-    color: var(--ink-muted);
-    padding: 18px 0 10px;
-    border-top: 1px solid var(--border);
-    margin-top: 8px;
+/* ── Views ── */
+.view { display: none; }
+.view.active { display: block; }
+@keyframes viewIn {
+    from { opacity: 0; transform: translateY(6px); }
+    to { opacity: 1; transform: translateY(0); }
 }
 
 /* ── Cards ── */
