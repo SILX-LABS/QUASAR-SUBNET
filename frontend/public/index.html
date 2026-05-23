@@ -1273,6 +1273,21 @@ function formatLoss(v) {
     var n = numberOrNull(v);
     return n != null && n > 0 ? n.toFixed(4) : "--";
 }
+function currentEvalMetricText(ev) {
+    var metric = ev && ev.metric_text ? String(ev.metric_text) : "";
+    var phase = String((ev && (ev.phase || ev.phase_label)) || "").toLowerCase();
+    var isKlScoring = phase.indexOf("scoring") >= 0 || phase.indexOf("kl") >= 0;
+    if (isKlScoring) {
+        var kl = numberOrNull(ev.avg_challenger_loss);
+        if (kl == null) kl = numberOrNull(ev.mu_hat);
+        if (kl != null) return "KL: " + kl.toFixed(6);
+        if (/^mu:/i.test(metric)) return metric.replace(/^mu:/i, "KL:");
+    }
+    if (metric) return metric;
+    if (ev && ev.loading) return ev.phase_label || ev.phase || "--";
+    var mu = numberOrNull(ev && ev.mu_hat);
+    return mu != null ? "μ̂: " + mu.toFixed(6) : "--";
+}
 function eventKind(e) {
     var raw = String(e.event_type || e.type || e.level || "status").toLowerCase();
     var msg = String(e.msg || e.message || "").toLowerCase();
@@ -1412,7 +1427,7 @@ function renderPulse(d) {
         metaEl.textContent="UID "+ev.uid;
         barEl.style.width=(ev.total>0||ev.progress_percent!=null)?progressPct+"%":(ev.loading?"12%":"0%");
         statusEl.textContent=ev.status_text||(ev.loading?(ev.phase_label||"Loading model")+" …":ev.progress+" / "+ev.total+"  ("+progressPct+"%)");
-        detailEl.textContent=ev.metric_text||(ev.loading?(ev.phase_label||ev.phase||"--"):"μ̂: "+Number(ev.mu_hat||0).toFixed(6));
+        detailEl.textContent=currentEvalMetricText(ev);
     } else {
         ec.classList.add("eval-idle");
         titleEl.textContent=status.label||"Idle";
