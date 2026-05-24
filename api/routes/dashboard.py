@@ -241,6 +241,15 @@ def _history_rows(rounds, commitments):
             if res.get("is_king") or res.get("is_reference"):
                 continue
             uid = res.get("uid")
+            if (
+                uid == rnd.get("king_uid")
+                and not rnd.get("king_changed")
+                and rnd.get("new_king_uid") in (None, uid)
+            ):
+                # Older validator records sometimes wrote the retained/self
+                # winner as a normal challenger row. Showing that row as
+                # "HELD" makes an uncrowned or DQ'd stale model look alive.
+                continue
             commit = commitments.get(uid, {})
             repo = res.get("model") or _repo(commit)
             tt = res.get("t_test") or {}
@@ -1060,18 +1069,17 @@ def _dashboard_status(progress, current_eval, latest, consensus_king, submission
     state_king_uid = latest.get("king_uid")
     chain_king_uid = (consensus_king or {}).get("uid")
     progress_winner_uid = progress.get("winner_uid")
+    expected_weight_uid = progress_winner_uid if progress_winner_uid is not None else state_king_uid
     if active and phase == "waiting_for_coordination_activation":
         winner_uid = progress_winner_uid
     elif active:
-        winner_uid = progress_winner_uid or chain_king_uid or state_king_uid
+        winner_uid = progress_winner_uid or state_king_uid
     else:
-        winner_uid = chain_king_uid or state_king_uid
+        winner_uid = state_king_uid
     reveal_pending = (
-        active
-        and phase == "waiting_for_coordination_activation"
-        and progress_winner_uid is not None
+        expected_weight_uid is not None
         and chain_king_uid is not None
-        and int(progress_winner_uid) != int(chain_king_uid)
+        and int(expected_weight_uid) != int(chain_king_uid)
     )
     status = {
         "active": active,
@@ -1100,7 +1108,7 @@ def _dashboard_status(progress, current_eval, latest, consensus_king, submission
             detail = f"UID {progress_winner_uid} will activate at the coordination block."
         else:
             label = "Round result ready; waiting for activation"
-            detail = "No eval winner UID is recorded for this round; chain king remains separate."
+            detail = "No model winner is recorded for this round; chain weights are separate from the crown."
         status.update({
             "mode": "activation_wait",
             "label": label,
@@ -1232,8 +1240,8 @@ def get_dashboard_json():
     consensus_king = _consensus_king(commitments)
     round_state = current_round() or {}
     state_king_uid = latest.get("king_uid")
-    king_uid = (consensus_king or {}).get("uid") if consensus_king else state_king_uid
-    king_commit = commitments.get(king_uid, {})
+    king_uid = state_king_uid
+    king_commit = commitments.get(king_uid, {}) if king_uid is not None else {}
     progress = normalize_eval_progress(eval_progress() or {})
     progress = _augment_progress_with_pod(progress, round_state)
     current_eval = _current_eval(progress, commitments)
@@ -1249,13 +1257,15 @@ def get_dashboard_json():
         (row for row in hist_rows if row.get("accepted") and row.get("uid") == king_uid),
         None,
     )
-    if consensus_king:
-        king_repo = consensus_king.get("hf_repo") or _repo(king_commit)
-    else:
-        king_repo = latest.get("king_model") or _repo(king_commit)
-    king_revision = (consensus_king or {}).get("revision") if consensus_king else None
-    if not king_revision:
-        king_revision = king_commit.get("revision")
+    consensus_matches_state = False
+    if state_king_uid is not None and (consensus_king or {}).get("uid") is not None:
+        try:
+            consensus_matches_state = int(state_king_uid) == int(consensus_king.get("uid"))
+        except (TypeError, ValueError):
+            consensus_matches_state = False
+    king_chain = consensus_king if consensus_matches_state else {}
+    king_repo = latest.get("king_model") or _repo(king_commit)
+    king_revision = king_chain.get("revision") or king_commit.get("revision")
     latest_matches_king = (
         state_king_uid is not None
         and king_uid is not None
@@ -1270,9 +1280,9 @@ def get_dashboard_json():
             "king_revision": king_revision,
             "reign_number": sum(1 for rnd in history if rnd.get("king_changed")),
             "crowned_at": crowned.get("timestamp") if crowned else (_iso(latest.get("timestamp")) if latest_matches_king else None),
-            "source": "chain_weights" if consensus_king else ("validator_state" if state_king_uid is not None else None),
-            "support_stake": (consensus_king or {}).get("support_stake"),
-            "support_fraction": (consensus_king or {}).get("support_fraction"),
+            "source": "validator_state" if state_king_uid is not None else None,
+            "support_stake": king_chain.get("support_stake"),
+            "support_fraction": king_chain.get("support_fraction"),
             "weights_block": (consensus_king or {}).get("block"),
         },
         "consensus_king": consensus_king,

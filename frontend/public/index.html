@@ -1197,7 +1197,7 @@ var URLS = DEMO
     ? ["/demo-dashboard.json"]
     : (IS_LOCAL_STATIC
         ? ["https://s3.hippius.com/quasar/dashboard.json", "/demo-dashboard.json"]
-        : ["/api/dashboard.json", "https://s3.hippius.com/quasar/dashboard.json"]);
+        : ["https://s3.hippius.com/quasar/dashboard.json", "/api/dashboard.json"]);
 var POLL = 10000;
 var _data = null;
 var _payloadSig = "";
