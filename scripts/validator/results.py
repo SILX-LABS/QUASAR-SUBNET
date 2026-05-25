@@ -1011,11 +1011,17 @@ def process_results(results, models_to_eval, king_uid, state: ValidatorState, ui
         h2h_candidates.sort(key=_rank_key, reverse=True)
         best_uid, best_kl = h2h_candidates[0]
         if is_single_eval_mode():
-            winner_uid = king_uid if king_uid is not None else best_uid
-            winner_kl = state.scores.get(str(winner_uid), best_kl) if winner_uid is not None else best_kl
+            winner_uid = king_uid
+            winner_kl = (
+                state.scores.get(str(winner_uid), king_kl)
+                if winner_uid is not None
+                else float("inf")
+            )
             logger.info(
                 "single-eval: provisional result rows built; final winner "
-                "will be selected by composite in service.apply_results_and_weights"
+                "will be selected by composite in service.apply_results_and_weights "
+                "(best local row UID %s is telemetry only)",
+                best_uid,
             )
         elif king_uid is not None and best_uid != king_uid and epsilon_dethroned_by is None:
             winner_uid = king_uid

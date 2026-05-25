@@ -193,8 +193,21 @@ of git. Use a private environment file or your process manager's secret store.
 
 For validator rollout updates, use the 2026-05-18 local-state reset block in
 [`VALIDATOR.md`](VALIDATOR.md). The current production settings are
-`QUASAR_EVAL_PROMPTS_H2H=150`, `QUASAR_VLLM_CONCURRENCY=8`, isolated
+`QUASAR_EVAL_PROMPTS_H2H=300`, `QUASAR_VLLM_CONCURRENCY=8`, isolated
 `.venv-vllm`, and a two-epoch chain coordination window.
+
+Single-eval crown policy defaults are built into the validator. Operators do
+not need extra environment variables for the normal rollout. If a coordinated
+scoring-policy migration needs explicit overrides, use:
+
+```bash
+SINGLE_EVAL_MIN_CROWN_QUALITY=0.20
+SINGLE_EVAL_MIN_CROWN_QUALITY_AXES=4
+QUASAR_RESCORING_REVALIDATE_KING=1
+# Optional, only when coordinated:
+# QUASAR_RESCORING_FALLBACK_UID=<uid>
+# QUASAR_NO_WINNER_FALLBACK_TO_VALIDATOR_UID=0
+```
 
 ## Disqualification
 

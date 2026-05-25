@@ -47,3 +47,9 @@ REWRITE_PLAN.md
 .python-version
 REVISION
 ops/akash/README.md
+miner/train_hippius_distill.py
+
+# Local experiment / remote scratch artifacts
+*.remote
+train_quasar3b_*.py
+scripts/local_eval_vllm_concurrent.py

@@ -393,9 +393,50 @@ def precheck_all_models(commitments, uid_to_hotkey, uid_to_coldkey, state: Valid
                 continue
         uid_str = str(uid)
         _needs_full_check = False
+        stale_tracking_reset = False
+
+        if uid_str in state.evaluated_uids:
+            stored_hotkey_any = state.model_hashes.get(f"{uid}_hotkey")
+            stored_block_any = state.model_hashes.get(f"{uid}_block")
+            hotkey_changed_any = stored_hotkey_any is not None and stored_hotkey_any != hotkey
+            block_changed_any = (
+                this_commit_block
+                and stored_block_any
+                and this_commit_block != stored_block_any
+            )
+            legacy_no_block_any = (
+                state.model_hashes.get(str(uid)) is not None
+                and stored_block_any is None
+                and this_commit_block
+            )
+            if hotkey_changed_any or block_changed_any or legacy_no_block_any:
+                reason = (
+                    "hotkey changed (UID recycled)" if hotkey_changed_any
+                    else "new commitment" if block_changed_any
+                    else "legacy hash (no block stored)"
+                )
+                logger.info(
+                    f"UID {uid}: evaluated marker stale: {reason} at block "
+                    f"{this_commit_block} (was {stored_block_any}), resetting"
+                )
+                state.model_hashes.pop(str(uid), None)
+                state.model_hashes.pop(f"{uid}_block", None)
+                state.model_hashes.pop(f"{uid}_hotkey", None)
+                for dq_hk in [hotkey, stored_hotkey_any] if stored_hotkey_any else [hotkey]:
+                    for dq_key in [f"{dq_hk}:{stored_block_any}", dq_hk]:
+                        if dq_key and dq_key in state.dq_reasons:
+                            logger.info(f"UID {uid}: Clearing stale DQ: {dq_key}")
+                            del state.dq_reasons[dq_key]
+                state.evaluated_uids.discard(uid_str)
+                state.scores.pop(uid_str, None)
+                state.composite_scores.pop(uid_str, None)
+                reset_failures(uid, state.failures)
+                _needs_full_check = True
+                stale_tracking_reset = True
+
         has_existing_score = uid_str in state.scores and state.scores[uid_str] <= MAX_KL_THRESHOLD
         has_composite_score = single_eval_mode and uid_str in state.composite_scores
-        if uid_str in state.evaluated_uids and (has_existing_score or has_composite_score):
+        if not stale_tracking_reset and uid_str in state.evaluated_uids and (has_existing_score or has_composite_score):
             expected_hash = state.model_hashes.get(str(uid))
             stored_hotkey_quick = state.model_hashes.get(f"{uid}_hotkey")
             stored_block_quick = state.model_hashes.get(f"{uid}_block")

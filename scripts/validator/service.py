@@ -34,7 +34,6 @@ from scripts.validator.challengers import (
     check_models_exist,
     select_challengers,
 )
-from scripts.validator.composite import active_composite_axis_weights
 from scripts.validator.config import (
     EVAL_PROMPTS_FULL,
     EVAL_PROMPTS_H2H,
@@ -65,9 +64,15 @@ from scripts.validator.results import (
 )
 from scripts.validator.side_effects import sync_king_runtime
 from scripts.validator.single_eval import (
+    CROWN_QUALITY_EXCLUDED_AXES,
     SINGLE_EVAL_DETHRONE_MARGIN,
+    SINGLE_EVAL_MIN_CROWN_QUALITY,
+    SINGLE_EVAL_MIN_CROWN_QUALITY_AXES,
     bootstrap_composite_from_h2h,
+    composite_crown_quality_detail,
+    composite_crown_quality_score,
     is_single_eval_mode,
+    rescore_latest_king,
     select_king_by_composite,
 )
 from scripts.validator.state_manager import (
@@ -88,7 +93,7 @@ logger = logging.getLogger("quasar.validator")
 
 # ── helpers ──────────────────────────────────────────────────────────────
 
-_RELATIVE_SELECTION_AXES = {"kl", "on_policy_rkl"}
+_RELATIVE_SELECTION_AXES = CROWN_QUALITY_EXCLUDED_AXES
 
 
 def _as_float(value, default=None):
@@ -113,26 +118,7 @@ def _composite_quality_score(record: dict | None) -> float | None:
     we compare the non-relative quality axes: capability, length discipline,
     judge/chat probes, and benchmark pass fractions.
     """
-    if not isinstance(record, dict):
-        return None
-    axes = record.get("axes") or {}
-    if not isinstance(axes, dict):
-        return None
-    broken = set(record.get("broken_axes") or [])
-    weights = active_composite_axis_weights()
-    total_weight = 0.0
-    weighted_sum = 0.0
-    for axis, weight in weights.items():
-        if axis in _RELATIVE_SELECTION_AXES or axis in broken:
-            continue
-        val = _as_float(axes.get(axis))
-        if val is None:
-            continue
-        total_weight += float(weight)
-        weighted_sum += float(weight) * val
-    if total_weight <= 0:
-        return None
-    return weighted_sum / total_weight
+    return composite_crown_quality_score(record)
 
 
 def _paired_kl_win(row: dict) -> bool:
@@ -156,18 +142,27 @@ def _composite_quality_allows_dethrone(
         "challenger_quality": ch_quality,
         "incumbent_quality": inc_quality,
         "margin": margin,
+        "absolute_floor": SINGLE_EVAL_MIN_CROWN_QUALITY,
         "relative_axes_excluded": sorted(_RELATIVE_SELECTION_AXES),
     }
     if ch_quality is None:
         detail["reason"] = "missing_challenger_quality"
         return False, detail
+    if ch_quality + 1e-12 < SINGLE_EVAL_MIN_CROWN_QUALITY:
+        detail["reason"] = "challenger_quality_floor"
+        detail["threshold"] = SINGLE_EVAL_MIN_CROWN_QUALITY
+        return False, detail
     if inc_quality is None:
-        detail["reason"] = "no_incumbent_quality"
+        detail["reason"] = "no_incumbent_quality_floor_passed"
         return True, detail
     if inc_quality <= 0:
         detail["reason"] = "incumbent_quality_floor"
-        return ch_quality >= 0, detail
-    threshold = inc_quality * (1.0 - max(0.0, float(margin)))
+        detail["threshold"] = SINGLE_EVAL_MIN_CROWN_QUALITY
+        return True, detail
+    threshold = max(
+        SINGLE_EVAL_MIN_CROWN_QUALITY,
+        inc_quality * (1.0 - max(0.0, float(margin))),
+    )
     detail["threshold"] = threshold
     if ch_quality + 1e-12 >= threshold:
         detail["reason"] = "quality_gate_passed"
@@ -362,11 +357,27 @@ def _select_round_winner_with_kl_and_composite(h2h_results, king_uid, incumbent_
     return winner
 
 
-def _incumbent_can_hold(h2h_results, king_uid) -> bool:
+def _incumbent_can_hold(h2h_results, king_uid, incumbent_record=None) -> bool:
     if king_uid is None:
         return False
     king_row = next((row for row in (h2h_results or []) if row.get("uid") == king_uid), None)
     if king_row and king_row.get("disqualified"):
+        return False
+    comp = (king_row or {}).get("composite") or incumbent_record or {}
+    quality, quality_axes = composite_crown_quality_detail(comp)
+    if (
+        quality is None
+        or quality_axes < SINGLE_EVAL_MIN_CROWN_QUALITY_AXES
+        or quality + 1e-12 < SINGLE_EVAL_MIN_CROWN_QUALITY
+    ):
+        logger.info(
+            "single-eval: incumbent UID %s cannot hold crown "
+            "(quality=%s axes=%s floor=%.3f)",
+            king_uid,
+            quality,
+            quality_axes,
+            SINGLE_EVAL_MIN_CROWN_QUALITY,
+        )
         return False
     return True
 
@@ -431,16 +442,11 @@ def _resolve_king(valid_models, state):
                 f"UID {composite_king_uid} (stored KL={king_kl})"
             )
             return composite_king_uid, king_kl, "composite"
-        # Last-resort fallback for bootstraps where no composite row exists.
         if state.h2h_latest:
-            persisted_king = state.h2h_latest.get("king_uid")
-            if persisted_king is not None and persisted_king in valid_models:
-                king_kl = state.scores.get(str(persisted_king), float("inf"))
-                logger.info(
-                    f"single-eval: no composite king; falling back to "
-                    f"h2h_latest UID {persisted_king} (KL={king_kl})"
-                )
-                return persisted_king, king_kl, "composite"
+            logger.info(
+                "single-eval: no composite king cleared the crown quality "
+                "floor; not falling back to h2h_latest"
+            )
         # Cold start: no composite king yet. Start a challenger round without
         # selecting a KL fallback king; the first crown must come from
         # composite rows produced by evaluation.
@@ -503,6 +509,27 @@ def _resolve_coordinated_king(
         raise RuntimeError(msg) from exc
 
     if chain_king_uid is not None and chain_king_uid in valid_models:
+        if is_single_eval_mode():
+            chain_record = (
+                (getattr(state, "composite_scores", {}) or {}).get(str(chain_king_uid))
+            )
+            if chain_record:
+                chain_quality, chain_quality_axes = composite_crown_quality_detail(chain_record)
+                if (
+                    chain_quality is None
+                    or chain_quality_axes < SINGLE_EVAL_MIN_CROWN_QUALITY_AXES
+                    or chain_quality + 1e-12 < SINGLE_EVAL_MIN_CROWN_QUALITY
+                ):
+                    msg = (
+                        f"coordination: chain weight consensus UID {chain_king_uid} "
+                        f"fails current crown quality floor "
+                        f"(quality={chain_quality}, axes={chain_quality_axes}, "
+                        f"floor={SINGLE_EVAL_MIN_CROWN_QUALITY:.3f}); "
+                        "planning without incumbent"
+                    )
+                    logger.warning(msg)
+                    log_event(msg, level="warn", state_dir=state_dir)
+                    return None, float("inf"), "chain_consensus"
         king_kl = state.scores.get(str(chain_king_uid), float("inf"))
         logger.info(
             "coordination: king from on-chain weight consensus at block %s: UID %s",
@@ -574,16 +601,18 @@ def _resolve_no_winner_weight_target(
 
     A no-winner round should not crown a disqualified challenger, but it also
     should not skip weights entirely because that lets validator trust drift.
-    Prefer the incumbent king when we have one; otherwise preserve the
-    validator's current revealed target from chain.
+    Prefer the incumbent king when we have one; otherwise prefer the local
+    validator UID so a policy migration can explicitly withdraw support from a
+    stale king. Operators can disable that fallback to preserve the current
+    revealed chain target.
     """
     incumbent_uid = _coerce_valid_uid(king_uid, n_uids)
     if incumbent_uid is not None:
         return incumbent_uid, "incumbent king"
 
     validator_uid = _coerce_valid_uid(validator_uid, n_uids)
-    if validator_uid is None:
-        return None, "missing validator UID"
+    if validator_uid is not None and os.environ.get("QUASAR_NO_WINNER_FALLBACK_TO_VALIDATOR_UID", "1") != "0":
+        return validator_uid, "validator UID"
 
     try:
         current_uid = get_validator_weight_target(subtensor, netuid, validator_uid)
@@ -597,6 +626,238 @@ def _resolve_no_winner_weight_target(
     if current_uid is None:
         return None, "invalid current target"
     return current_uid, "current validator target"
+
+
+def _resolve_rescore_fallback_uid(subtensor, netuid, n_uids, validator_uid, state_dir):
+    """Pick the safe target when a scoring migration uncrowns every model."""
+    configured = os.environ.get("QUASAR_RESCORING_FALLBACK_UID")
+    if configured:
+        fallback_uid = _coerce_valid_uid(configured, n_uids)
+        if fallback_uid is not None:
+            return fallback_uid, "configured fallback"
+        logger.warning("Invalid QUASAR_RESCORING_FALLBACK_UID=%r", configured)
+
+    validator_uid_i = _coerce_valid_uid(validator_uid, n_uids)
+    if validator_uid_i is not None:
+        return validator_uid_i, "validator UID"
+
+    try:
+        current_uid = get_validator_weight_target(subtensor, netuid, validator_uid)
+    except Exception as exc:
+        msg = f"King rescore fallback failed to read current validator target: {exc}"
+        logger.warning(msg)
+        log_event(msg[:240], level="warn", state_dir=state_dir)
+        return None, "missing fallback"
+    current_uid = _coerce_valid_uid(current_uid, n_uids)
+    if current_uid is not None:
+        return current_uid, "current validator target"
+    return None, "missing fallback"
+
+
+def _current_validator_target(subtensor, netuid, validator_uid):
+    try:
+        return get_validator_weight_target(subtensor, netuid, validator_uid)
+    except Exception:
+        return None
+
+
+def _stamp_h2h_latest_crown_rescore(
+    state,
+    decision: dict,
+    valid_models: dict,
+    fallback_uid,
+    fallback_source,
+    weights_set: bool,
+):
+    latest = dict(getattr(state, "h2h_latest", {}) or {})
+    previous_uid = decision.get("previous_king_uid")
+    selected_uid = decision.get("selected_king_uid")
+    meta = {
+        "ts": time.time(),
+        "reason": decision.get("reason"),
+        "previous_king_uid": previous_uid,
+        "selected_king_uid": selected_uid,
+        "previous_quality": decision.get("previous_quality"),
+        "previous_quality_axes": decision.get("previous_quality_axes"),
+        "selected_quality": decision.get("selected_quality"),
+        "selected_quality_axes": decision.get("selected_quality_axes"),
+        "quality_floor": decision.get("quality_floor"),
+        "min_quality_axes": decision.get("min_quality_axes"),
+        "schema_version": decision.get("schema_version"),
+        "fallback_uid": fallback_uid,
+        "fallback_source": fallback_source,
+        "weights_set": bool(weights_set),
+    }
+    latest["crown_rescore"] = meta
+    results = latest.get("results")
+    if isinstance(results, list) and previous_uid is not None:
+        for row in results:
+            try:
+                row_uid = int(row.get("uid"))
+            except (TypeError, ValueError):
+                continue
+            if row_uid != previous_uid:
+                continue
+            row["crown_rescore"] = meta
+            if selected_uid is None:
+                row["composite_veto"] = {
+                    "reason": "rescored_crown_quality_floor",
+                    "quality": decision.get("previous_quality"),
+                    "quality_axes": decision.get("previous_quality_axes"),
+                    "floor": decision.get("quality_floor"),
+                }
+
+    if selected_uid is None:
+        latest["prev_king_uid"] = previous_uid
+        latest["king_uid"] = None
+        latest["king_model"] = ""
+        latest["king_kl"] = None
+        latest["king_h2h_kl"] = None
+        latest["new_king_uid"] = None
+        latest["king_changed"] = False
+        latest["king_retained_reason"] = (
+            f"Stored king UID {previous_uid} rejected by current scoring "
+            f"policy; fallback weights target is UID {fallback_uid}"
+        )
+    else:
+        selected_record = decision.get("selected_record") or {}
+        info = valid_models.get(selected_uid, {}) or {}
+        latest["prev_king_uid"] = previous_uid
+        latest["king_uid"] = selected_uid
+        latest["king_model"] = info.get("model") or selected_record.get("model") or ""
+        selected_kl = state.scores.get(str(selected_uid))
+        if selected_kl is not None and selected_kl > 0:
+            latest["king_kl"] = round(float(selected_kl), 6)
+            latest["king_h2h_kl"] = round(float(selected_kl), 6)
+        latest["new_king_uid"] = (
+            selected_uid if previous_uid is not None and selected_uid != previous_uid else None
+        )
+        latest["king_changed"] = bool(
+            previous_uid is not None and selected_uid != previous_uid
+        )
+        latest["king_retained_reason"] = None
+    state.h2h_latest = latest
+    state.save_h2h()
+    state.save()
+
+
+def rescore_persisted_king_after_scoring_change(
+    subtensor,
+    wallet,
+    netuid,
+    n_uids,
+    state,
+    valid_models,
+    uid_to_hotkey,
+    commitments,
+    validator_uid,
+    state_dir,
+) -> dict:
+    """Revalidate the persisted king under the current scoring code.
+
+    Use this after changing composite weights, floors, or schema gates. It
+    does not wipe history or scores. If no model still clears the crown gates,
+    it marks the crown as empty and submits fallback weights to the local
+    validator UID unless overridden.
+    """
+    if not is_single_eval_mode() or os.environ.get("QUASAR_RESCORING_REVALIDATE_KING", "1") == "0":
+        return {"changed": False, "reason": "disabled"}
+
+    decision = rescore_latest_king(
+        state, valid_models, uid_to_hotkey=uid_to_hotkey,
+        commitments=commitments,
+    )
+    if not decision.get("changed"):
+        return decision
+
+    previous_uid = decision.get("previous_king_uid")
+    selected_uid = decision.get("selected_king_uid")
+    fallback_uid = None
+    fallback_source = None
+    weights_set = False
+    if selected_uid is None:
+        fallback_uid, fallback_source = _resolve_rescore_fallback_uid(
+            subtensor, netuid, n_uids, validator_uid, state_dir,
+        )
+        if fallback_uid is not None:
+            current_target = _current_validator_target(subtensor, netuid, validator_uid)
+            if _coerce_valid_uid(current_target, n_uids) == fallback_uid:
+                weights_set = True
+                logger.warning(
+                    "single-eval: scoring rescore uncrowned UID %s; "
+                    "validator weights already target %s UID %s",
+                    previous_uid,
+                    fallback_source,
+                    fallback_uid,
+                )
+            else:
+                logger.warning(
+                    "single-eval: scoring rescore uncrowned UID %s; "
+                    "setting fallback weights to %s UID %s",
+                    previous_uid,
+                    fallback_source,
+                    fallback_uid,
+                )
+                weights_set = _safe_set_weights(
+                    subtensor, wallet, netuid, n_uids,
+                    build_winner_take_all_weights(n_uids, fallback_uid),
+                    fallback_uid, state_dir,
+                )
+            sync_king_runtime(False, "", None)
+    else:
+        fallback_uid = selected_uid
+        fallback_source = "rescored king"
+        current_target = _current_validator_target(subtensor, netuid, validator_uid)
+        if _coerce_valid_uid(current_target, n_uids) == selected_uid:
+            weights_set = True
+        else:
+            logger.warning(
+                "single-eval: scoring rescore changed king UID %s -> UID %s; "
+                "setting weights to rescored king",
+                previous_uid,
+                selected_uid,
+            )
+            weights_set = _safe_set_weights(
+                subtensor, wallet, netuid, n_uids,
+                build_winner_take_all_weights(n_uids, selected_uid),
+                selected_uid, state_dir,
+            )
+        selected_model = (valid_models.get(selected_uid, {}) or {}).get("model", "")
+        sync_king_runtime(True, selected_model, selected_uid)
+
+    _stamp_h2h_latest_crown_rescore(
+        state, decision, valid_models, fallback_uid, fallback_source, weights_set,
+    )
+    msg = (
+        f"single-eval crown rescored: previous UID {previous_uid} -> "
+        f"{selected_uid if selected_uid is not None else 'no model winner'}; "
+        f"fallback_uid={fallback_uid}; reason={decision.get('reason')}"
+    )
+    logger.warning(msg)
+    log_event(msg, level="warning", state_dir=state_dir)
+    telemetry_event(
+        msg,
+        level="warning",
+        stage="king_rescored_after_scoring_change",
+        previous_king_uid=previous_uid,
+        selected_king_uid=selected_uid,
+        fallback_uid=fallback_uid,
+        weights_set=weights_set,
+        reason=decision.get("reason"),
+    )
+    state.save_progress({
+        "active": False,
+        "stage": "king_rescored_after_scoring_change",
+        "previous_king_uid": previous_uid,
+        "model_winner_uid": selected_uid,
+        "winner_uid": selected_uid if selected_uid is not None else fallback_uid,
+        "fallback_uid": fallback_uid,
+        "fallback_source": fallback_source,
+        "weights_set": weights_set,
+        "reason": decision.get("reason"),
+        "updated_at": time.time(),
+    })
+    return decision
 
 
 def _refresh_round_weight_target(
@@ -1553,7 +1814,9 @@ def apply_results_and_weights(
             if (
                 king_uid is not None
                 and composite_king_uid != king_uid
-                and _incumbent_can_hold(h2h_results, king_uid)
+                and _incumbent_can_hold(
+                    h2h_results, king_uid, incumbent_composite_record
+                )
             ):
                 logger.info(
                     "single-eval: composite preferred UID %s, but no "
@@ -1592,6 +1855,38 @@ def apply_results_and_weights(
                     winner_kl = float(weighted)
                 elif worst is not None:
                     winner_kl = float(worst)
+        else:
+            if king_uid is None:
+                logger.warning(
+                    "single-eval: no paired-KL winner and no UID cleared "
+                    "the composite crown quality floor; leaving round "
+                    "kingless so weights refresh to the validator fallback"
+                )
+                winner_uid = None
+                winner_kl = float("inf")
+            else:
+                if _incumbent_can_hold(
+                    h2h_results, king_uid, incumbent_composite_record
+                ):
+                    if winner_uid != king_uid:
+                        logger.info(
+                            "single-eval: no challenger cleared paired KL + "
+                            "quality and no composite replacement passed; "
+                            "preserving incumbent UID %s",
+                            king_uid,
+                        )
+                    winner_uid = king_uid
+                    winner_kl = state.scores.get(str(king_uid), king_kl)
+                else:
+                    logger.info(
+                        "single-eval: no challenger cleared paired KL + "
+                        "quality, and incumbent UID %s failed current "
+                        "hold gates; leaving round kingless so weights "
+                        "refresh to validator fallback",
+                        king_uid,
+                    )
+                    winner_uid = None
+                    winner_kl = float("inf")
     weights_set = bool(pre_activation_weights_set)
     if winner_uid is not None:
         winner_uid_i = _coerce_valid_uid(winner_uid, n_uids)
@@ -1608,16 +1903,29 @@ def apply_results_and_weights(
                 winner_uid, state_dir,
             )
     else:
-        if pre_activation_weights_set:
+        fallback_king_uid = king_uid
+        if (
+            is_single_eval_mode()
+            and king_uid is not None
+            and not _incumbent_can_hold(
+                h2h_results, king_uid, incumbent_composite_record
+            )
+        ):
+            fallback_king_uid = None
+        fallback_uid, fallback_source = _resolve_no_winner_weight_target(
+            subtensor, netuid, n_uids, fallback_king_uid, validator_uid, state_dir,
+        )
+        if (
+            pre_activation_weights_set
+            and fallback_uid is not None
+            and _coerce_valid_uid(pre_activation_weight_uid, n_uids) == fallback_uid
+        ):
             logger.warning(
                 "No valid miners; weights already refreshed before activation to UID %s",
                 pre_activation_weight_uid,
             )
             weights_set = True
         else:
-            fallback_uid, fallback_source = _resolve_no_winner_weight_target(
-                subtensor, netuid, n_uids, king_uid, validator_uid, state_dir,
-            )
             if fallback_uid is not None:
                 msg = (
                     "No valid miners; refreshing weights to "
@@ -1972,6 +2280,20 @@ def run_validator(network, netuid, wallet_name, hotkey_name, wallet_path,
                     break
                 time.sleep(tempo)
                 continue
+
+            rescore_decision = rescore_persisted_king_after_scoring_change(
+                subtensor, wallet, netuid, n_uids,
+                state, valid_models, uid_to_hotkey, commitments,
+                validator_uid, state_dir,
+            )
+            if rescore_decision.get("changed"):
+                telemetry_log({
+                    "stage": "king_rescore_applied",
+                    "epoch": epoch_count,
+                    "previous_king_uid": rescore_decision.get("previous_king_uid"),
+                    "selected_king_uid": rescore_decision.get("selected_king_uid"),
+                    "reason": rescore_decision.get("reason"),
+                })
 
             if coordination_enabled():
                 try:

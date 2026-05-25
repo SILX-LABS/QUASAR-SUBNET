@@ -129,8 +129,17 @@ QUASAR_EVAL_BACKEND=lium
 QUASAR_LIUM_POD_NAME=quasar-eval
 LIUM_API_KEY=...
 SINGLE_EVAL_MODE=1
+SINGLE_EVAL_MIN_CROWN_QUALITY=0.20
+SINGLE_EVAL_MIN_CROWN_QUALITY_AXES=4
+QUASAR_RESCORING_REVALIDATE_KING=1
 USE_VLLM=1
 ```
+
+The crown-policy variables above are defaults in code. Validators should leave
+them unset unless a coordinated rollout asks operators to pin them explicitly.
+`QUASAR_RESCORING_FALLBACK_UID` and
+`QUASAR_NO_WINNER_FALLBACK_TO_VALIDATOR_UID` are recovery overrides, not normal
+setup requirements.
 
 Production dependency pins currently include:
 
@@ -229,6 +238,11 @@ state/composite_scores.json
 ```
 
 In single-eval mode, king selection is based on stored composite records and dethronement rules. The default single-eval dethrone margin is `3%`.
+Kingship also requires a non-relative crown-quality floor. This quality score
+excludes `kl` and `on_policy_rkl`, then averages the remaining active composite
+axes with the production axis weights. Defaults are
+`SINGLE_EVAL_MIN_CROWN_QUALITY=0.20` and
+`SINGLE_EVAL_MIN_CROWN_QUALITY_AXES=4`.
 
 ## Weight Setting
 

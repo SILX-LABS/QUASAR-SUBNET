@@ -94,9 +94,10 @@ def _vllm_generate(prompt, idx, block_seed, tokenizer, token_to_id):
 
 def _hf_generate(prompt, idx, block_seed, teacher, tokenizer):
     inp = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=1024).to(DEVICE)
-    gen = torch.Generator(device=DEVICE).manual_seed(block_seed + idx)
+    seed = block_seed + idx
+    gen = torch.Generator(device=DEVICE).manual_seed(seed)
     with torch.inference_mode():
-        out = teacher.generate(
+        gen_kwargs = dict(
             **inp,
             max_new_tokens=MAX_TOK,
             do_sample=True,
@@ -105,6 +106,16 @@ def _hf_generate(prompt, idx, block_seed, teacher, tokenizer):
             pad_token_id=tokenizer.eos_token_id,
             generator=gen,
         )
+        try:
+            out = teacher.generate(**gen_kwargs)
+        except ValueError as exc:
+            if "generator" not in str(exc):
+                raise
+            torch.manual_seed(seed)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(seed)
+            gen_kwargs.pop("generator", None)
+            out = teacher.generate(**gen_kwargs)
         logits = teacher(input_ids=out).logits
     cont_logits = logits[:, inp.input_ids.shape[1] - 1 : -1, :]
     return out.cpu(), inp.input_ids.shape[1], dense_to_sparse_topk(cont_logits, k=LOGPROBS_K)

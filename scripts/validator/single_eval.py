@@ -29,7 +29,10 @@ import os
 import time
 from typing import Any
 
-from scripts.validator.composite import COMPOSITE_SHADOW_VERSION
+from scripts.validator.composite import (
+    COMPOSITE_SHADOW_VERSION,
+    active_composite_axis_weights,
+)
 
 logger = logging.getLogger("quasar.validator")
 
@@ -73,6 +76,127 @@ SINGLE_EVAL_MAX_PER_ROUND = 10
 SINGLE_EVAL_WORST_FLOOR_EPSILON = float(
     os.environ.get("SINGLE_EVAL_WORST_FLOOR_EPSILON", "0.005")
 )
+
+# Absolute, non-relative quality floor for any UID that wants to hold the
+# crown. KL/RKL can be optimized while generation quality collapses, so the
+# bootstrap/fallback selector must require real capability/judge/bench signal.
+SINGLE_EVAL_MIN_CROWN_QUALITY = float(
+    os.environ.get("SINGLE_EVAL_MIN_CROWN_QUALITY", "0.20")
+)
+SINGLE_EVAL_MIN_CROWN_QUALITY_AXES = int(
+    os.environ.get("SINGLE_EVAL_MIN_CROWN_QUALITY_AXES", "4")
+)
+CROWN_QUALITY_EXCLUDED_AXES = {"kl", "on_policy_rkl"}
+
+
+def _as_float(value, default=None):
+    try:
+        if value is None:
+            return default
+        out = float(value)
+    except (TypeError, ValueError):
+        return default
+    if math.isnan(out) or math.isinf(out):
+        return default
+    return out
+
+
+def composite_crown_quality_detail(record: dict | None) -> tuple[float | None, int]:
+    """Return the non-relative quality score used for kingship gates.
+
+    Stored ``composite.weighted`` still includes KL and on-policy RKL. Those
+    are useful telemetry, but a model must also clear an absolute quality floor
+    on generation/capability/judge/bench axes before it can become king.
+    """
+    if not isinstance(record, dict):
+        return None, 0
+    axes = record.get("axes") or {}
+    if not isinstance(axes, dict):
+        return None, 0
+    broken = set(record.get("broken_axes") or [])
+    weights = active_composite_axis_weights()
+    total_weight = 0.0
+    weighted_sum = 0.0
+    present = 0
+    for axis, weight in weights.items():
+        if axis in CROWN_QUALITY_EXCLUDED_AXES or axis in broken:
+            continue
+        val = _as_float(axes.get(axis))
+        if val is None:
+            continue
+        total_weight += float(weight)
+        weighted_sum += float(weight) * val
+        present += 1
+    if total_weight <= 0:
+        return None, present
+    return weighted_sum / total_weight, present
+
+
+def composite_crown_quality_score(record: dict | None) -> float | None:
+    score, _present = composite_crown_quality_detail(record)
+    return score
+
+
+def rescore_latest_king(
+    state,
+    valid_models: dict,
+    uid_to_hotkey: dict | None = None,
+    commitments: dict | None = None,
+) -> dict:
+    """Re-run the persisted crown through the current single-eval policy.
+
+    This is the explicit migration hook for scoring-policy changes. It does
+    not delete historical rows or composite telemetry; it only tells the
+    caller whether the current ``h2h_latest.king_uid`` still clears the
+    current crown gates.
+    """
+    latest = getattr(state, "h2h_latest", None) or {}
+    previous_uid = None
+    try:
+        if latest.get("king_uid") is not None:
+            previous_uid = int(latest.get("king_uid"))
+    except (TypeError, ValueError):
+        previous_uid = None
+
+    composite_scores = getattr(state, "composite_scores", {}) or {}
+    previous_record = (
+        composite_scores.get(str(previous_uid))
+        if previous_uid is not None
+        else None
+    )
+    previous_quality, previous_quality_axes = composite_crown_quality_detail(
+        previous_record
+    )
+    selected_uid, selected_record = select_king_by_composite(
+        state, valid_models, uid_to_hotkey=uid_to_hotkey,
+        commitments=commitments,
+    )
+    selected_quality, selected_quality_axes = composite_crown_quality_detail(
+        selected_record
+    )
+    changed = selected_uid != previous_uid
+    if selected_uid is None:
+        reason = "no_crownable_uid"
+    elif previous_uid is None:
+        reason = "selected_crown_after_rescore"
+    elif changed:
+        reason = "rescored_king_changed"
+    else:
+        reason = "persisted_king_still_valid"
+    return {
+        "changed": changed,
+        "reason": reason,
+        "previous_king_uid": previous_uid,
+        "selected_king_uid": selected_uid,
+        "previous_quality": previous_quality,
+        "previous_quality_axes": previous_quality_axes,
+        "selected_quality": selected_quality,
+        "selected_quality_axes": selected_quality_axes,
+        "quality_floor": SINGLE_EVAL_MIN_CROWN_QUALITY,
+        "min_quality_axes": SINGLE_EVAL_MIN_CROWN_QUALITY_AXES,
+        "schema_version": COMPOSITE_SHADOW_VERSION,
+        "selected_record": selected_record,
+    }
 
 
 def _commit_signature(info: dict | None) -> tuple:
@@ -547,12 +671,13 @@ def select_king_by_composite(
        - Tier 2: ``n_axes >= _KING_SELECTION_MIN_AXES`` (any version) —
          bridges the transition window after a schema bump.
        - Tier 3: any record with a ``worst`` score — bootstrap.
-    2. Sort candidates by ``(worst desc, weighted desc, prior_bonus desc,
+    2. Require an absolute non-relative quality floor, then sort candidates
+       by ``(worst desc, quality desc, weighted desc, prior_bonus desc,
        uid desc)``. The prior-king bonus is a tiebreaker that activates
        only on exact ties — it never overrides a measurably-better
-       challenger. ``weighted`` before ``prior_bonus`` so the ~45% of
-       UIDs sitting at saturated worst=0.0 still rank by how good they
-       are on the other axes.
+       challenger. ``quality`` before ``weighted`` keeps low-KL/RKL models
+       from winning saturated-floor ties unless their generation/capability
+       axes are also credible.
     3. Best candidate = candidates[0]. If best is the prior king, return.
     4. If best is a different UID, run ``resolve_dethrone`` against the
        prior king with the same margin the apply-path dethrone gate
@@ -578,8 +703,8 @@ def select_king_by_composite(
     def _build_candidates(
         min_axes: int,
         min_version: int | None = None,
-    ) -> list[tuple[float, int, float, int]]:
-        out: list[tuple[float, int, float, int]] = []
+    ) -> list[tuple[float, float, float, int, int]]:
+        out: list[tuple[float, float, float, int, int]] = []
         for uid_str, rec in composite_scores.items():
             try:
                 uid = int(uid_str)
@@ -614,6 +739,22 @@ def select_king_by_composite(
                 continue
             if math.isnan(worst_f) or math.isinf(worst_f):
                 continue
+            quality_f, quality_axes = composite_crown_quality_detail(rec)
+            if (
+                quality_f is None
+                or quality_axes < SINGLE_EVAL_MIN_CROWN_QUALITY_AXES
+                or quality_f + 1e-12 < SINGLE_EVAL_MIN_CROWN_QUALITY
+            ):
+                logger.debug(
+                    "single-eval: UID %s filtered from crown selection "
+                    "(quality=%s axes=%s floor=%.3f min_axes=%s)",
+                    uid,
+                    quality_f,
+                    quality_axes,
+                    SINGLE_EVAL_MIN_CROWN_QUALITY,
+                    SINGLE_EVAL_MIN_CROWN_QUALITY_AXES,
+                )
+                continue
             weighted = rec.get("weighted")
             try:
                 weighted_f = float(weighted) if weighted is not None else 0.0
@@ -621,17 +762,17 @@ def select_king_by_composite(
                 weighted_f = 0.0
             prior_bonus = 1 if uid == prior_king_uid else 0
             # Sort tuple ordering matters here:
-            #   (worst desc, weighted desc, prior_bonus desc, uid desc)
+            #   (worst desc, quality desc, weighted desc, prior_bonus desc, uid desc)
             # Why weighted before prior_bonus: in the current state ~45% of
             # composite records have worst=0.0 (any axis at 0.0 floors the
             # min). With prior_bonus higher in the tuple than weighted, the
             # prior king *always* wins among the worst=0.0 group regardless
             # of how poorly they rank on the 19 other axes — even if a
             # never-king UID has weighted=0.78 vs the prior king's 0.50.
-            # Putting weighted first means prior_bonus only matters when two
-            # UIDs are *also* tied on weighted (essentially a coin flip
-            # stabilizer, not a sticky-king bias).
-            out.append((worst_f, weighted_f, prior_bonus, uid))
+            # Putting quality/weighted first means prior_bonus only matters
+            # when two UIDs are *also* tied on measured quality (essentially
+            # a coin flip stabilizer, not a sticky-king bias).
+            out.append((worst_f, quality_f, weighted_f, prior_bonus, uid))
         return out
 
     # Tier 1 — schema-current AND grader-current records. These were graded
@@ -650,9 +791,15 @@ def select_king_by_composite(
         # Tier 3 — any record with a worst score. Bootstrap fallback.
         candidates = _build_candidates(0)
     if not candidates:
+        logger.info(
+            "single-eval: no eligible UID cleared crown quality floor "
+            "(floor=%.3f, min_quality_axes=%s)",
+            SINGLE_EVAL_MIN_CROWN_QUALITY,
+            SINGLE_EVAL_MIN_CROWN_QUALITY_AXES,
+        )
         return None, None
     candidates.sort(reverse=True)
-    _, _, _, top_uid = candidates[0]
+    _, _, _, _, top_uid = candidates[0]
     top_record = composite_scores.get(str(top_uid))
 
     # Stability bias: dethrone gate. A challenger must beat the prior king
@@ -723,13 +870,16 @@ def resolve_dethrone(
     ch_worst = (challenger_record or {}).get("worst")
     if ch_worst is None:
         return False
+    ch_quality = composite_crown_quality_score(challenger_record)
+    if ch_quality is None or ch_quality + 1e-12 < SINGLE_EVAL_MIN_CROWN_QUALITY:
+        return False
     if incumbent_uid is None or not incumbent_record:
-        return float(ch_worst) > 0.0
+        return True
     if challenger_uid == incumbent_uid:
         return True
     inc_worst = incumbent_record.get("worst")
     if inc_worst is None:
-        return float(ch_worst) > 0.0
+        return True
     inc_worst_f = float(inc_worst)
     ch_worst_f = float(ch_worst)
     rel_margin = max(0.0, float(margin))
@@ -751,7 +901,17 @@ def resolve_dethrone(
         if ch_worst_f < regress_threshold:
             return False
     # Tied region (within ±margin of inc_worst, or both saturated).
-    # Fall back to weighted with the same relative margin.
+    # Prefer the non-relative quality score with the same relative margin;
+    # fall back to stored weighted only if old records lack quality axes.
+    inc_quality = composite_crown_quality_score(incumbent_record)
+    if inc_quality is not None:
+        if inc_quality <= 0.0:
+            return ch_quality >= SINGLE_EVAL_MIN_CROWN_QUALITY
+        quality_threshold = max(
+            SINGLE_EVAL_MIN_CROWN_QUALITY,
+            inc_quality * (1.0 + rel_margin),
+        )
+        return ch_quality > quality_threshold
     ch_w = (challenger_record or {}).get("weighted")
     inc_w = incumbent_record.get("weighted")
     if ch_w is None or inc_w is None:
