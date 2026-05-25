@@ -132,14 +132,14 @@ SINGLE_EVAL_MODE=1
 SINGLE_EVAL_MIN_CROWN_QUALITY=0.20
 SINGLE_EVAL_MIN_CROWN_QUALITY_AXES=4
 QUASAR_RESCORING_REVALIDATE_KING=1
+QUASAR_NO_WINNER_FALLBACK_TO_VALIDATOR_UID=0
 USE_VLLM=1
 ```
 
-The crown-policy variables above are defaults in code. Validators should leave
-them unset unless a coordinated rollout asks operators to pin them explicitly.
-`QUASAR_RESCORING_FALLBACK_UID` and
-`QUASAR_NO_WINNER_FALLBACK_TO_VALIDATOR_UID` are recovery overrides, not normal
-setup requirements.
+Validators should pin the crown-policy variables above during this rollout so
+all operators run the same gates and no-winner behavior.
+`QUASAR_RESCORING_FALLBACK_UID` is a recovery override only and should stay
+unset unless a specific fallback target is announced.
 
 Production dependency pins currently include:
 

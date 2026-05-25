@@ -79,30 +79,29 @@ QUASAR_VLLM_CONCURRENCY=8
 
 ### Single-Eval Crown Policy
 
-These defaults are embedded in the validator and normally do not need to be set
-in operator env files:
+For coordinated rollouts, pin these in operator env files so every validator
+uses the same crown gates and no-winner behavior:
 
 ```env
 SINGLE_EVAL_MIN_CROWN_QUALITY=0.20
 SINGLE_EVAL_MIN_CROWN_QUALITY_AXES=4
 QUASAR_RESCORING_REVALIDATE_KING=1
+QUASAR_NO_WINNER_FALLBACK_TO_VALIDATOR_UID=0
 ```
 
 The crown-quality score excludes relative KL axes (`kl` and `on_policy_rkl`) so
 a model cannot become or remain king purely by minimizing token-distribution
 loss while failing capability, judge, chat, or benchmark axes.
 
-Only set these during a coordinated rollout or explicit operator recovery:
+Only set this during explicit operator recovery:
 
 ```env
 QUASAR_RESCORING_FALLBACK_UID=<uid>
-QUASAR_NO_WINNER_FALLBACK_TO_VALIDATOR_UID=0
 ```
 
 `QUASAR_RESCORING_FALLBACK_UID` forces the fallback weight target if a scoring
-policy migration uncrowns every model. By default, the validator falls back to
-its own UID; setting `QUASAR_NO_WINNER_FALLBACK_TO_VALIDATOR_UID=0` instead
-preserves the current revealed chain target when no incumbent is crownable.
+policy migration uncrowns every model. Leave it unset unless a specific
+fallback target is announced.
 
 ### Wallet Settings
 
