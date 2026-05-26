@@ -704,6 +704,7 @@ tbody tr.eval-clickable:focus {
 }
 th:last-child, td:last-child { text-align: right; }
 td.mono { font-family: var(--font-mono); font-size: 12px; }
+.submetric { color: var(--ink-muted); margin-left: 6px; }
 .delta-good { color: var(--success); }
 .delta-bad { color: var(--danger); }
 .delta-flat { color: var(--ink-muted); }
@@ -1045,7 +1046,7 @@ td.mono { font-family: var(--font-mono); font-size: 12px; }
     .leader-card { padding: 20px; }
     .leader-metrics { grid-template-columns: 1fr 1fr; }
     .filter-bar { flex-wrap: wrap; }
-    .table-wrap table { min-width: 600px; }
+    .table-wrap table { min-width: 760px; }
     .event-row { grid-template-columns: 70px 80px 1fr; }
     .detail-grid { grid-template-columns: 1fr; }
     .footer-inner { flex-direction: column; gap: 10px; }
@@ -1272,6 +1273,25 @@ function rowDelta(row) {
 function formatLoss(v) {
     var n = numberOrNull(v);
     return n != null && n > 0 ? n.toFixed(4) : "--";
+}
+function formatComposite(v) {
+    var n = numberOrNull(v);
+    return n != null ? n.toFixed(3) : "--";
+}
+function compositeCell(row) {
+    if (row.composite_weighted == null && row.composite_worst == null) return "--";
+    return '<span>'+formatComposite(row.composite_weighted)+'</span><span class="submetric">min '+formatComposite(row.composite_worst)+'</span>';
+}
+function compactAxes(comp) {
+    var axes = comp && comp.axes ? comp.axes : null;
+    if (!axes) return "";
+    var names = ["capability","on_policy_rkl","length","ifeval_bench","math_bench","code_bench","reasoning_bench","tool_use_bench","long_context_bench","robustness_bench"];
+    var parts = [];
+    for (var i=0;i<names.length;i++) {
+        var v = numberOrNull(axes[names[i]]);
+        if (v != null) parts.push(names[i]+": "+v.toFixed(3));
+    }
+    return parts.join(" · ");
 }
 function currentEvalMetricText(ev) {
     var metric = ev && ev.metric_text ? String(ev.metric_text) : "";
@@ -1545,11 +1565,17 @@ function buildEvalRows(d) {
         var score = numberOrNull(h.avg_challenger_loss);
         if (score != null && score <= 0) score = null;
         var delta = rowDelta(h);
+        var comp = h.composite || {};
         rows.push({
             uid:h.uid,
             hotkey:h.hotkey,
             repo:h.challenger_repo,
             score:score,
+            composite:comp,
+            composite_weighted:numberOrNull(h.composite_weighted != null ? h.composite_weighted : comp.weighted),
+            composite_worst:numberOrNull(h.composite_worst != null ? h.composite_worst : comp.worst),
+            composite_present_count:numberOrNull(h.composite_present_count != null ? h.composite_present_count : comp.present_count),
+            composite_version:h.composite_version != null ? h.composite_version : comp.version,
             delta:delta,
             mu_hat:numberOrNull(h.mu_hat),
             lcb:numberOrNull(h.lcb),
@@ -1575,11 +1601,19 @@ function buildEvalRows(d) {
         if(qst==="disqualified") qst="dq";
         else if(qst==="king") qst="accepted";
         else if(["scored","evaluated","scheduled","valid"].indexOf(qst)===-1) qst="pending";
+        var qScore = numberOrNull(e.score);
+        if(qst==="valid" && qScore != null) qst="scored";
+        var qComp = e.composite || {};
         rows.push({
             uid:e.uid,
             hotkey:e.hotkey,
             repo:e.hf_repo,
-            score:null,
+            score:qScore,
+            composite:qComp,
+            composite_weighted:numberOrNull(e.composite_weighted != null ? e.composite_weighted : qComp.weighted),
+            composite_worst:numberOrNull(e.composite_worst != null ? e.composite_worst : qComp.worst),
+            composite_present_count:numberOrNull(e.composite_present_count != null ? e.composite_present_count : qComp.present_count),
+            composite_version:e.composite_version != null ? e.composite_version : qComp.version,
             delta:null,
             mu_hat:null,
             lcb:null,
@@ -1638,6 +1672,7 @@ function renderEvaluations(d) {
     filtered.sort(function(a,b){
         var va,vb;
         if(_evalSort.col==="score"){va=a.score;vb=b.score;}
+        else if(_evalSort.col==="composite"){va=a.composite_weighted;vb=b.composite_weighted;}
         else if(_evalSort.col==="delta"){va=a.delta;vb=b.delta;}
         else if(_evalSort.col==="uid"){va=a.uid||0;vb=b.uid||0;}
         else {va=a.score;vb=b.score;}
@@ -1652,6 +1687,7 @@ function renderEvaluations(d) {
         {key:"hotkey",label:"Hotkey",w:"140px"},
         {key:"repo",label:"Repo",w:"1fr"},
         {key:"score",label:"KL",w:"100px",sort:true},
+        {key:"composite",label:"Composite",w:"130px",sort:true},
         {key:"delta",label:"Δ vs King",w:"110px",sort:true},
         {key:"time",label:"Time",w:"80px"},
         {key:"status",label:"Status",w:"100px"}
@@ -1677,7 +1713,7 @@ function renderEvaluations(d) {
     });
 
     if(!filtered.length){
-        document.getElementById("eval-tbody").innerHTML='<tr><td colspan="7" class="empty">No evaluations found</td></tr>';
+        document.getElementById("eval-tbody").innerHTML='<tr><td colspan="8" class="empty">No evaluations found</td></tr>';
         return;
     }
 
@@ -1693,6 +1729,7 @@ function renderEvaluations(d) {
         tbHtml+='<td class="mono">'+hkLink(r.hotkey)+'</td>';
         tbHtml+='<td>'+repoLink(r.repo)+'</td>';
         tbHtml+='<td class="mono"'+scoreColor+'>'+(r.score!=null?Number(r.score).toFixed(4):"--")+'</td>';
+        tbHtml+='<td class="mono">'+compositeCell(r)+'</td>';
         tbHtml+='<td class="mono '+deltaClass(delta)+'">'+formatSigned(delta,4)+'</td>';
         tbHtml+='<td class="mono">'+(r.time!=null?Math.round(r.time)+"s":"--")+'</td>';
         tbHtml+='<td><span class="badge '+badgeClass+'"><span class="reason-hint"><span class="reason-dot"></span>'+badgeLabel+'</span></span></td>';
@@ -1729,6 +1766,9 @@ function openEvalDrawer(row) {
     html+='<div class="drawer-repo">'+repoLink(row.repo)+'</div>';
     html+='<div class="detail-grid">';
     html+=detailCell("KL", formatLoss(row.score));
+    html+=detailCell("Composite", compositeCell(row));
+    html+=detailCell("Worst Axis", formatComposite(row.composite_worst));
+    html+=detailCell("Composite Axes", row.composite_present_count!=null?esc(row.composite_present_count):"--");
     html+=detailCell("Delta", '<span class="'+deltaClass(delta)+'">'+formatSigned(delta,4)+'</span>');
     html+=detailCell("King KL", formatLoss(row.king_loss));
     html+=detailCell("Model KL", formatLoss(row.challenger_loss));
@@ -1748,6 +1788,10 @@ function openEvalDrawer(row) {
     }
     if(row.selection || row.gate){
         html+='<div class="reason-box"><strong>Decision detail</strong>'+esc(row.selection || row.gate)+'</div>';
+    }
+    var axesText = compactAxes(row.composite);
+    if(axesText){
+        html+='<div class="reason-box"><strong>Composite axes</strong>'+esc(axesText)+'</div>';
     }
     body.innerHTML=html;
     drawer.classList.add("open");

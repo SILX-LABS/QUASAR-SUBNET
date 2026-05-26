@@ -209,6 +209,20 @@ def _completed_uids_from_pod(round_state, pod_progress):
     return completed
 
 
+def _composite_summary(comp):
+    if not isinstance(comp, dict):
+        return None
+    return {
+        "worst": comp.get("worst"),
+        "weighted": comp.get("weighted"),
+        "axes": comp.get("axes", {}),
+        "present_count": comp.get("present_count") or comp.get("n_axes"),
+        "version": comp.get("version"),
+        "disqualified": comp.get("disqualified"),
+        "dq_reason": comp.get("dq_reason"),
+    }
+
+
 def _augment_progress_with_pod(progress, round_state):
     pod_progress = _read_current_pod_progress(round_state)
     if not pod_progress:
@@ -283,6 +297,7 @@ def _history_rows(rounds, commitments):
             else:
                 verdict = "held"
                 verdict_label = "HELD"
+            comp = _composite_summary(res.get("composite"))
             out.append({
                 "uid": uid,
                 "challenger_repo": repo,
@@ -306,6 +321,11 @@ def _history_rows(rounds, commitments):
                 "se": tt.get("se"),
                 "avg_king_loss": king_loss,
                 "avg_challenger_loss": res.get("kl"),
+                "composite": comp,
+                "composite_weighted": comp.get("weighted") if comp else None,
+                "composite_worst": comp.get("worst") if comp else None,
+                "composite_present_count": comp.get("present_count") if comp else None,
+                "composite_version": comp.get("version") if comp else None,
                 "wall_time_s": rnd.get("elapsed_seconds"),
                 "timestamp": _iso(rnd.get("timestamp")),
             })
@@ -996,7 +1016,8 @@ def _queue(commitments, history_rows):
 
 def _submission_rows(commitments, history_rows, king_uid, progress):
     composites = composite_scores() or {}
-    scored = {str(k) for k in scores().keys()}
+    score_map = scores() or {}
+    scored = {str(k) for k in score_map.keys()}
     tested = rounds_tested_against_king() or {}
     recent = {row.get("uid") for row in history_rows[:50]}
     dq = disqualified()
@@ -1020,7 +1041,8 @@ def _submission_rows(commitments, history_rows, king_uid, progress):
         hotkey = commit.get("hotkey")
         reason = _canonical_dq_reason(uid, commit, hotkey, dq, commitments)
         uid_str = str(uid)
-        has_composite = uid_str in composites
+        comp = _composite_summary(composites.get(uid_str))
+        has_composite = bool(comp)
         has_legacy_score = uid_str in scored
         was_tested = uid_str in tested or uid in recent
         seen = has_composite or has_legacy_score or was_tested
@@ -1058,6 +1080,12 @@ def _submission_rows(commitments, history_rows, king_uid, progress):
             "status": status,
             "status_label": label,
             "status_detail": detail,
+            "score": score_map.get(uid_str),
+            "composite": comp,
+            "composite_weighted": comp.get("weighted") if comp else None,
+            "composite_worst": comp.get("worst") if comp else None,
+            "composite_present_count": comp.get("present_count") if comp else None,
+            "composite_version": comp.get("version") if comp else None,
         })
     return rows
 
