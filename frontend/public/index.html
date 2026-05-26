@@ -1197,8 +1197,8 @@ var IS_LOCAL_STATIC = /^(localhost|127\.0\.0\.1)$/.test(location.hostname) && lo
 var URLS = DEMO
     ? ["/demo-dashboard.json"]
     : (IS_LOCAL_STATIC
-        ? ["https://s3.hippius.com/quasar/dashboard.json", "/demo-dashboard.json"]
-        : ["https://s3.hippius.com/quasar/dashboard.json", "/api/dashboard.json"]);
+        ? ["https://api.quasarcopilot.com/api/dashboard.json", "https://s3.hippius.com/quasar/dashboard.json", "/demo-dashboard.json"]
+        : ["https://api.quasarcopilot.com/api/dashboard.json", "/api/dashboard.json", "https://s3.hippius.com/quasar/dashboard.json"]);
 var POLL = 10000;
 var _data = null;
 var _payloadSig = "";

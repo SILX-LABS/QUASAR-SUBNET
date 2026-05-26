@@ -3,17 +3,11 @@ import { NextRequest, NextResponse } from "next/server";
 export const dynamic = "force-dynamic";
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || process.env.API_URL || "http://localhost:8000";
-const DASHBOARD_JSON_URL = "https://s3.hippius.com/quasar/dashboard.json";
 
 async function proxy(request: NextRequest, context: { params: Promise<{ path: string[] }> }) {
   const { path } = await context.params;
   const apiPath = path.join("/");
-  const upstream = new URL(
-    request.method === "GET" && apiPath === "dashboard.json"
-      ? DASHBOARD_JSON_URL
-      : `/api/${apiPath}`,
-    API_BASE,
-  );
+  const upstream = new URL(`/api/${apiPath}`, API_BASE);
   upstream.search = request.nextUrl.search;
 
   const headers = new Headers();
