@@ -705,6 +705,36 @@ tbody tr.eval-clickable:focus {
 th:last-child, td:last-child { text-align: right; }
 td.mono { font-family: var(--font-mono); font-size: 12px; }
 .submetric { color: var(--ink-muted); margin-left: 6px; }
+.gate-cell,
+.weighted-cell {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    min-width: 0;
+}
+.gate-pill {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 38px;
+    padding: 2px 5px;
+    border-radius: var(--radius-xs);
+    font-size: 9px;
+    font-weight: 800;
+    text-transform: uppercase;
+}
+.gate-pass {
+    background: var(--success-soft);
+    color: var(--success);
+}
+.gate-fail {
+    background: var(--danger-soft);
+    color: var(--danger);
+}
+.gate-muted {
+    background: rgba(156,163,175,0.1);
+    color: var(--ink-muted);
+}
 .delta-good { color: var(--success); }
 .delta-bad { color: var(--danger); }
 .delta-flat { color: var(--ink-muted); }
@@ -735,6 +765,7 @@ td.mono { font-family: var(--font-mono); font-size: 12px; }
 .badge-king { background: var(--accent-soft); color: var(--accent); }
 .badge-pending { background: rgba(156,163,175,0.1); color: var(--ink-muted); }
 .badge-accepted { background: var(--success-soft); color: var(--success); }
+.badge-gate { background: var(--danger-soft); color: var(--danger); }
 .badge-rejected { background: var(--danger-soft); color: var(--danger); }
 .badge-error { background: var(--warning-soft); color: var(--warning); }
 
@@ -950,6 +981,11 @@ td.mono { font-family: var(--font-mono); font-size: 12px; }
     text-transform: uppercase;
     margin-bottom: 6px;
 }
+.reason-box.info-box {
+    border-color: var(--border);
+    background: var(--surface-raised);
+}
+.reason-box.info-box strong { color: var(--accent); }
 .drawer-repo {
     margin-bottom: 14px;
     font-family: var(--font-mono);
@@ -1046,7 +1082,7 @@ td.mono { font-family: var(--font-mono); font-size: 12px; }
     .leader-card { padding: 20px; }
     .leader-metrics { grid-template-columns: 1fr 1fr; }
     .filter-bar { flex-wrap: wrap; }
-    .table-wrap table { min-width: 760px; }
+    .table-wrap table { min-width: 920px; }
     .event-row { grid-template-columns: 70px 80px 1fr; }
     .detail-grid { grid-template-columns: 1fr; }
     .footer-inner { flex-direction: column; gap: 10px; }
@@ -1206,7 +1242,7 @@ var _lastRenderAt = 0;
 var _isPolling = false;
 var _tab = "pulse";
 var _evalFilter = "all";
-var _evalSort = { col: "delta", dir: "desc" };
+var _evalSort = { col: "crown_quality", dir: "desc" };
 var _roundsShown = 10;
 var _expanded = {};
 var _visibleEvalRows = [];
@@ -1278,18 +1314,56 @@ function formatComposite(v) {
     var n = numberOrNull(v);
     return n != null ? n.toFixed(3) : "--";
 }
-function compositeCell(row) {
-    if (row.composite_weighted == null && row.composite_worst == null) return "--";
-    return '<span>'+formatComposite(row.composite_weighted)+'</span><span class="submetric">min '+formatComposite(row.composite_worst)+'</span>';
+function crownQualityPass(row) {
+    if (typeof row.crown_quality_pass === "boolean") return row.crown_quality_pass;
+    var q = numberOrNull(row.crown_quality);
+    if (q == null) return null;
+    var floor = numberOrNull(row.crown_quality_floor);
+    var axes = numberOrNull(row.crown_quality_axes);
+    var minAxes = numberOrNull(row.crown_quality_min_axes);
+    if (floor == null) floor = 0.2;
+    if (minAxes == null) minAxes = 4;
+    return q + 1e-12 >= floor && (axes == null || axes >= minAxes);
 }
-function compactAxes(comp) {
+function isGateFail(row) {
+    return row.status !== "dq" && row.status !== "accepted" && crownQualityPass(row) === false;
+}
+function crownGateCell(row) {
+    var q = numberOrNull(row.crown_quality);
+    if (q == null) return "--";
+    var floor = numberOrNull(row.crown_quality_floor);
+    var pass = crownQualityPass(row);
+    var cls = pass === true ? "gate-pass" : pass === false ? "gate-fail" : "gate-muted";
+    var label = pass === true ? "PASS" : pass === false ? "FAIL" : "CHECK";
+    return '<span class="gate-cell"><span class="gate-pill '+cls+'">'+label+'</span><span>'+formatComposite(q)+'</span>'+(floor!=null?'<span class="submetric">/ '+formatComposite(floor)+'</span>':'')+'</span>';
+}
+function weightedCompositeCell(row) {
+    if (row.composite_weighted == null && row.composite_worst == null) return "--";
+    return '<span class="weighted-cell"><span>'+formatComposite(row.composite_weighted)+'</span><span class="submetric">worst '+formatComposite(row.composite_worst)+'</span></span>';
+}
+function excludedAxes(row) {
+    var axes = row.crown_quality_excluded_axes || (row.composite && row.composite.crown_quality_excluded_axes) || ["kl", "on_policy_rkl"];
+    return Array.isArray(axes) ? axes : [];
+}
+function axisLabel(name) {
+    return String(name || "").replace(/_/g, " ");
+}
+function compactAxes(comp, row) {
     var axes = comp && comp.axes ? comp.axes : null;
     if (!axes) return "";
-    var names = ["capability","on_policy_rkl","length","ifeval_bench","math_bench","code_bench","reasoning_bench","tool_use_bench","long_context_bench","robustness_bench"];
+    var excluded = {};
+    var ex = excludedAxes(row || {});
+    for (var i=0;i<ex.length;i++) excluded[ex[i]] = true;
+    var names = ["capability","judge_probe","chat_turns_probe","length","ifeval_bench","math_bench","aime_bench","code_bench","mbpp_bench","reasoning_bench","reasoning_density","tool_use_bench","long_context_bench","robustness_bench","on_policy_rkl"];
+    Object.keys(axes).sort().forEach(function(name){
+        if (names.indexOf(name) === -1) names.push(name);
+    });
     var parts = [];
     for (var i=0;i<names.length;i++) {
         var v = numberOrNull(axes[names[i]]);
-        if (v != null) parts.push(names[i]+": "+v.toFixed(3));
+        if (v != null) {
+            parts.push(axisLabel(names[i])+": "+v.toFixed(3)+(excluded[names[i]] ? " (weighted only)" : ""));
+        }
     }
     return parts.join(" · ");
 }
@@ -1576,6 +1650,12 @@ function buildEvalRows(d) {
             composite_worst:numberOrNull(h.composite_worst != null ? h.composite_worst : comp.worst),
             composite_present_count:numberOrNull(h.composite_present_count != null ? h.composite_present_count : comp.present_count),
             composite_version:h.composite_version != null ? h.composite_version : comp.version,
+            crown_quality:numberOrNull(h.crown_quality != null ? h.crown_quality : comp.crown_quality),
+            crown_quality_axes:numberOrNull(h.crown_quality_axes != null ? h.crown_quality_axes : comp.crown_quality_axes),
+            crown_quality_floor:numberOrNull(h.crown_quality_floor != null ? h.crown_quality_floor : comp.crown_quality_floor),
+            crown_quality_min_axes:numberOrNull(h.crown_quality_min_axes != null ? h.crown_quality_min_axes : comp.crown_quality_min_axes),
+            crown_quality_pass:h.crown_quality_pass != null ? !!h.crown_quality_pass : (comp.crown_quality_pass != null ? !!comp.crown_quality_pass : null),
+            crown_quality_excluded_axes:h.crown_quality_excluded_axes || comp.crown_quality_excluded_axes || ["kl","on_policy_rkl"],
             delta:delta,
             mu_hat:numberOrNull(h.mu_hat),
             lcb:numberOrNull(h.lcb),
@@ -1614,6 +1694,12 @@ function buildEvalRows(d) {
             composite_worst:numberOrNull(e.composite_worst != null ? e.composite_worst : qComp.worst),
             composite_present_count:numberOrNull(e.composite_present_count != null ? e.composite_present_count : qComp.present_count),
             composite_version:e.composite_version != null ? e.composite_version : qComp.version,
+            crown_quality:numberOrNull(e.crown_quality != null ? e.crown_quality : qComp.crown_quality),
+            crown_quality_axes:numberOrNull(e.crown_quality_axes != null ? e.crown_quality_axes : qComp.crown_quality_axes),
+            crown_quality_floor:numberOrNull(e.crown_quality_floor != null ? e.crown_quality_floor : qComp.crown_quality_floor),
+            crown_quality_min_axes:numberOrNull(e.crown_quality_min_axes != null ? e.crown_quality_min_axes : qComp.crown_quality_min_axes),
+            crown_quality_pass:e.crown_quality_pass != null ? !!e.crown_quality_pass : (qComp.crown_quality_pass != null ? !!qComp.crown_quality_pass : null),
+            crown_quality_excluded_axes:e.crown_quality_excluded_axes || qComp.crown_quality_excluded_axes || ["kl","on_policy_rkl"],
             delta:null,
             mu_hat:null,
             lcb:null,
@@ -1672,7 +1758,8 @@ function renderEvaluations(d) {
     filtered.sort(function(a,b){
         var va,vb;
         if(_evalSort.col==="score"){va=a.score;vb=b.score;}
-        else if(_evalSort.col==="composite"){va=a.composite_weighted;vb=b.composite_weighted;}
+        else if(_evalSort.col==="crown_quality"){va=a.crown_quality;vb=b.crown_quality;}
+        else if(_evalSort.col==="weighted"){va=a.composite_weighted;vb=b.composite_weighted;}
         else if(_evalSort.col==="delta"){va=a.delta;vb=b.delta;}
         else if(_evalSort.col==="uid"){va=a.uid||0;vb=b.uid||0;}
         else {va=a.score;vb=b.score;}
@@ -1687,8 +1774,8 @@ function renderEvaluations(d) {
         {key:"hotkey",label:"Hotkey",w:"140px"},
         {key:"repo",label:"Repo",w:"1fr"},
         {key:"score",label:"KL",w:"100px",sort:true},
-        {key:"composite",label:"Composite",w:"130px",sort:true},
-        {key:"delta",label:"Δ vs King",w:"110px",sort:true},
+        {key:"crown_quality",label:"Crown Gate",w:"150px",sort:true},
+        {key:"weighted",label:"Weighted",w:"120px",sort:true},
         {key:"time",label:"Time",w:"80px"},
         {key:"status",label:"Status",w:"100px"}
     ];
@@ -1707,7 +1794,7 @@ function renderEvaluations(d) {
         th.addEventListener("click",function(){
             var col=th.dataset.sort;
             if(_evalSort.col===col) _evalSort.dir=_evalSort.dir==="desc"?"asc":"desc";
-            else { _evalSort.col=col; _evalSort.dir="desc"; }
+            else { _evalSort.col=col; _evalSort.dir=col==="score"?"asc":"desc"; }
             if(_data) renderEvaluations(_data);
         });
     });
@@ -1720,8 +1807,10 @@ function renderEvaluations(d) {
     var tbHtml='';
     for(var i=0;i<filtered.length;i++){
         var r=filtered[i];
-        var badgeClass=r.status==="dq"?"badge-dq":(r.status==="accepted"?"badge-accepted":(["scored","evaluated"].indexOf(r.status)>=0?"badge-scored":"badge-pending"));
-        var badgeLabel=r.verdict||(r.status==="dq"?"DQ":r.status==="accepted"?"KING":r.status==="scored"?"SCORED":r.status==="evaluated"?"WAITING":r.status==="scheduled"?"SCHEDULED":r.status==="valid"?"VALID":"PENDING");
+        var gateFail=isGateFail(r);
+        var badgeClass=r.status==="dq"?"badge-dq":(r.status==="accepted"?"badge-accepted":(gateFail?"badge-gate":(["scored","evaluated"].indexOf(r.status)>=0?"badge-scored":"badge-pending")));
+        var rowVerdict=r.verdict&&String(r.verdict).toLowerCase()!=="ok"?r.verdict:"";
+        var badgeLabel=gateFail?"GATE FAIL":(r.status==="dq"?"DQ":r.status==="accepted"?"CROWNED":(rowVerdict||(r.status==="scored"?"SCORED":r.status==="evaluated"?"WAITING":r.status==="scheduled"?"SCHEDULED":r.status==="valid"?"VALID":"PENDING")));
         var scoreColor=r.score!=null&&r.status!=="dq"?' style="color:var(--accent)"':'';
         var delta=r.delta;
         tbHtml+='<tr class="stagger eval-clickable" tabindex="0" data-eval-idx="'+i+'" title="Open details">';
@@ -1729,8 +1818,8 @@ function renderEvaluations(d) {
         tbHtml+='<td class="mono">'+hkLink(r.hotkey)+'</td>';
         tbHtml+='<td>'+repoLink(r.repo)+'</td>';
         tbHtml+='<td class="mono"'+scoreColor+'>'+(r.score!=null?Number(r.score).toFixed(4):"--")+'</td>';
-        tbHtml+='<td class="mono">'+compositeCell(r)+'</td>';
-        tbHtml+='<td class="mono '+deltaClass(delta)+'">'+formatSigned(delta,4)+'</td>';
+        tbHtml+='<td class="mono">'+crownGateCell(r)+'</td>';
+        tbHtml+='<td class="mono">'+weightedCompositeCell(r)+'</td>';
         tbHtml+='<td class="mono">'+(r.time!=null?Math.round(r.time)+"s":"--")+'</td>';
         tbHtml+='<td><span class="badge '+badgeClass+'"><span class="reason-hint"><span class="reason-dot"></span>'+badgeLabel+'</span></span></td>';
         tbHtml+='</tr>';
@@ -1758,17 +1847,20 @@ function openEvalDrawer(row) {
     var title=document.getElementById("drawer-title");
     var subtitle=document.getElementById("drawer-subtitle");
     var body=document.getElementById("drawer-body");
-    var status=row.status==="dq"?"Disqualified":row.status==="accepted"?"Current / crowned":"Evaluation";
+    var status=row.status==="dq"?"Disqualified":row.status==="accepted"?"Current / crowned":(isGateFail(row)?"Crown gate failed":"Evaluation");
     title.textContent=status+" · UID "+(row.uid!=null?row.uid:"--");
-    subtitle.textContent=row.verdict||row.status||"--";
+    subtitle.textContent=isGateFail(row)?"GATE FAIL":(row.status==="accepted"?"CROWNED":(row.verdict||row.status||"--"));
     var delta=row.delta;
+    var exAxes=excludedAxes(row);
     var html='';
     html+='<div class="drawer-repo">'+repoLink(row.repo)+'</div>';
     html+='<div class="detail-grid">';
+    html+=detailCell("Crown Quality", crownGateCell(row));
+    html+=detailCell("Crown Axes", (row.crown_quality_axes!=null?esc(row.crown_quality_axes):"--")+(row.crown_quality_min_axes!=null?'<span class="submetric">min '+esc(row.crown_quality_min_axes)+'</span>':""));
     html+=detailCell("KL", formatLoss(row.score));
-    html+=detailCell("Composite", compositeCell(row));
+    html+=detailCell("Weighted Composite", weightedCompositeCell(row));
     html+=detailCell("Worst Axis", formatComposite(row.composite_worst));
-    html+=detailCell("Composite Axes", row.composite_present_count!=null?esc(row.composite_present_count):"--");
+    html+=detailCell("Weighted Axes", row.composite_present_count!=null?esc(row.composite_present_count):"--");
     html+=detailCell("Delta", '<span class="'+deltaClass(delta)+'">'+formatSigned(delta,4)+'</span>');
     html+=detailCell("King KL", formatLoss(row.king_loss));
     html+=detailCell("Model KL", formatLoss(row.challenger_loss));
@@ -1789,9 +1881,10 @@ function openEvalDrawer(row) {
     if(row.selection || row.gate){
         html+='<div class="reason-box"><strong>Decision detail</strong>'+esc(row.selection || row.gate)+'</div>';
     }
-    var axesText = compactAxes(row.composite);
+    html+='<div class="reason-box info-box"><strong>Score rule</strong>Crown Quality must clear '+esc(formatComposite(row.crown_quality_floor!=null?row.crown_quality_floor:0.2))+' on non-relative quality axes. Weighted Composite is telemetry and still includes '+esc(exAxes.join(", ") || "kl, on_policy_rkl")+'.</div>';
+    var axesText = compactAxes(row.composite, row);
     if(axesText){
-        html+='<div class="reason-box"><strong>Composite axes</strong>'+esc(axesText)+'</div>';
+        html+='<div class="reason-box info-box"><strong>Axis scores</strong>'+esc(axesText)+'</div>';
     }
     body.innerHTML=html;
     drawer.classList.add("open");

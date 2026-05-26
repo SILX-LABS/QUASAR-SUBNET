@@ -13,6 +13,12 @@ from config import STATE_DIR
 from external import get_commitments, get_metagraph, get_price, get_weights
 from helpers.cache import _get_stale
 from helpers.sanitize import _sanitize_floats
+from scripts.validator.single_eval import (
+    CROWN_QUALITY_EXCLUDED_AXES,
+    SINGLE_EVAL_MIN_CROWN_QUALITY,
+    SINGLE_EVAL_MIN_CROWN_QUALITY_AXES,
+    composite_crown_quality_detail,
+)
 from state_store import (
     composite_scores,
     current_round,
@@ -212,6 +218,12 @@ def _completed_uids_from_pod(round_state, pod_progress):
 def _composite_summary(comp):
     if not isinstance(comp, dict):
         return None
+    crown_quality, crown_quality_axes = composite_crown_quality_detail(comp)
+    crown_quality_pass = (
+        crown_quality is not None
+        and crown_quality_axes >= SINGLE_EVAL_MIN_CROWN_QUALITY_AXES
+        and crown_quality + 1e-12 >= SINGLE_EVAL_MIN_CROWN_QUALITY
+    )
     return {
         "worst": comp.get("worst"),
         "weighted": comp.get("weighted"),
@@ -220,6 +232,12 @@ def _composite_summary(comp):
         "version": comp.get("version"),
         "disqualified": comp.get("disqualified"),
         "dq_reason": comp.get("dq_reason"),
+        "crown_quality": crown_quality,
+        "crown_quality_axes": crown_quality_axes,
+        "crown_quality_floor": SINGLE_EVAL_MIN_CROWN_QUALITY,
+        "crown_quality_min_axes": SINGLE_EVAL_MIN_CROWN_QUALITY_AXES,
+        "crown_quality_pass": crown_quality_pass,
+        "crown_quality_excluded_axes": sorted(CROWN_QUALITY_EXCLUDED_AXES),
     }
 
 
@@ -326,6 +344,12 @@ def _history_rows(rounds, commitments):
                 "composite_worst": comp.get("worst") if comp else None,
                 "composite_present_count": comp.get("present_count") if comp else None,
                 "composite_version": comp.get("version") if comp else None,
+                "crown_quality": comp.get("crown_quality") if comp else None,
+                "crown_quality_axes": comp.get("crown_quality_axes") if comp else None,
+                "crown_quality_floor": comp.get("crown_quality_floor") if comp else None,
+                "crown_quality_min_axes": comp.get("crown_quality_min_axes") if comp else None,
+                "crown_quality_pass": comp.get("crown_quality_pass") if comp else None,
+                "crown_quality_excluded_axes": comp.get("crown_quality_excluded_axes") if comp else None,
                 "wall_time_s": rnd.get("elapsed_seconds"),
                 "timestamp": _iso(rnd.get("timestamp")),
             })
@@ -1086,6 +1110,12 @@ def _submission_rows(commitments, history_rows, king_uid, progress):
             "composite_worst": comp.get("worst") if comp else None,
             "composite_present_count": comp.get("present_count") if comp else None,
             "composite_version": comp.get("version") if comp else None,
+            "crown_quality": comp.get("crown_quality") if comp else None,
+            "crown_quality_axes": comp.get("crown_quality_axes") if comp else None,
+            "crown_quality_floor": comp.get("crown_quality_floor") if comp else None,
+            "crown_quality_min_axes": comp.get("crown_quality_min_axes") if comp else None,
+            "crown_quality_pass": comp.get("crown_quality_pass") if comp else None,
+            "crown_quality_excluded_axes": comp.get("crown_quality_excluded_axes") if comp else None,
         })
     return rows
 
