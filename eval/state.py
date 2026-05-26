@@ -324,7 +324,7 @@ class ValidatorState:
         self,
         uid_to_hotkey: dict,
         commitments: dict,
-        max_kl_threshold: float = 2.0,
+        max_kl_threshold: float = 2.1,
     ) -> list[str]:
         """Pre-flight state validation. Catches inconsistencies BEFORE they waste GPU time.
 

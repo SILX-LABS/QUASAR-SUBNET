@@ -15,7 +15,7 @@ from pathlib import Path
 logger = logging.getLogger("quasar.scoring")
 
 STATE_DIR = Path("state")
-DEFAULT_MAX_KL = 2.0
+DEFAULT_MAX_KL = 2.1
 
 
 def _load_json(path: Path) -> dict:

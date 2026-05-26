@@ -214,7 +214,7 @@ Current runtime config:
 - `evalPromptsFull`: `60`
 - `evalPromptsH2h`: `300`
 - `vllmConcurrency`: `32`
-- `maxKlThreshold`: `2.0`
+- `maxKlThreshold`: `2.1`
 
 Prompt sampling is block-seeded so miners cannot know the exact evaluation prompts before the relevant block is available.
 

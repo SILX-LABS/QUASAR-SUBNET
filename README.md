@@ -88,7 +88,7 @@ A valid model must:
 - Avoid quantized formats such as GPTQ, AWQ, GGUF, and FP8.
 - Use unique weights that are not identical to an earlier committed model.
 - Keep evaluation KL at or below the validator max KL threshold. The default is
-  `2.0`, configurable by validators with `QUASAR_MAX_KL_THRESHOLD`; models
+  `2.1`, configurable by validators with `QUASAR_MAX_KL_THRESHOLD`; models
   above the threshold are disqualified for quality.
 
 ## Mining Guide
