@@ -1082,7 +1082,7 @@ td.mono { font-family: var(--font-mono); font-size: 12px; }
     .leader-card { padding: 20px; }
     .leader-metrics { grid-template-columns: 1fr 1fr; }
     .filter-bar { flex-wrap: wrap; }
-    .table-wrap table { min-width: 920px; }
+    .table-wrap table { min-width: 760px; }
     .event-row { grid-template-columns: 70px 80px 1fr; }
     .detail-grid { grid-template-columns: 1fr; }
     .footer-inner { flex-direction: column; gap: 10px; }
@@ -1336,6 +1336,14 @@ function crownGateCell(row) {
     var cls = pass === true ? "gate-pass" : pass === false ? "gate-fail" : "gate-muted";
     var label = pass === true ? "PASS" : pass === false ? "FAIL" : "CHECK";
     return '<span class="gate-cell"><span class="gate-pill '+cls+'">'+label+'</span><span>'+formatComposite(q)+'</span>'+(floor!=null?'<span class="submetric">/ '+formatComposite(floor)+'</span>':'')+'</span>';
+}
+function crownQualityTableCell(row) {
+    var q = numberOrNull(row.crown_quality);
+    if (q == null || row.status === "dq") return "--";
+    var floor = numberOrNull(row.crown_quality_floor);
+    var pass = crownQualityPass(row);
+    var cls = pass === true ? "delta-good" : pass === false ? "delta-bad" : "delta-flat";
+    return '<span class="'+cls+'">'+formatComposite(q)+'</span>'+(floor!=null?'<span class="submetric">/ '+formatComposite(floor)+'</span>':'');
 }
 function weightedCompositeCell(row) {
     if (row.composite_weighted == null && row.composite_worst == null) return "--";
@@ -1774,8 +1782,7 @@ function renderEvaluations(d) {
         {key:"hotkey",label:"Hotkey",w:"140px"},
         {key:"repo",label:"Repo",w:"1fr"},
         {key:"score",label:"KL",w:"100px",sort:true},
-        {key:"crown_quality",label:"Crown Gate",w:"150px",sort:true},
-        {key:"weighted",label:"Weighted",w:"120px",sort:true},
+        {key:"crown_quality",label:"Crown Quality",w:"125px",sort:true},
         {key:"time",label:"Time",w:"80px"},
         {key:"status",label:"Status",w:"100px"}
     ];
@@ -1800,7 +1807,7 @@ function renderEvaluations(d) {
     });
 
     if(!filtered.length){
-        document.getElementById("eval-tbody").innerHTML='<tr><td colspan="8" class="empty">No evaluations found</td></tr>';
+        document.getElementById("eval-tbody").innerHTML='<tr><td colspan="7" class="empty">No evaluations found</td></tr>';
         return;
     }
 
@@ -1818,8 +1825,7 @@ function renderEvaluations(d) {
         tbHtml+='<td class="mono">'+hkLink(r.hotkey)+'</td>';
         tbHtml+='<td>'+repoLink(r.repo)+'</td>';
         tbHtml+='<td class="mono"'+scoreColor+'>'+(r.score!=null?Number(r.score).toFixed(4):"--")+'</td>';
-        tbHtml+='<td class="mono">'+crownGateCell(r)+'</td>';
-        tbHtml+='<td class="mono">'+weightedCompositeCell(r)+'</td>';
+        tbHtml+='<td class="mono">'+crownQualityTableCell(r)+'</td>';
         tbHtml+='<td class="mono">'+(r.time!=null?Math.round(r.time)+"s":"--")+'</td>';
         tbHtml+='<td><span class="badge '+badgeClass+'"><span class="reason-hint"><span class="reason-dot"></span>'+badgeLabel+'</span></span></td>';
         tbHtml+='</tr>';
