@@ -14,6 +14,8 @@ import logging
 import time
 from pathlib import Path
 
+from eval.scoring import DEFAULT_MAX_KL
+
 logger = logging.getLogger("quasar.state")
 
 
@@ -324,7 +326,7 @@ class ValidatorState:
         self,
         uid_to_hotkey: dict,
         commitments: dict,
-        max_kl_threshold: float = 2.1,
+        max_kl_threshold: float = DEFAULT_MAX_KL,
     ) -> list[str]:
         """Pre-flight state validation. Catches inconsistencies BEFORE they waste GPU time.
 

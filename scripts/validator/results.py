@@ -16,6 +16,7 @@ from scripts.validator.composite import (
     compute_composite,
 )
 from scripts.validator.config import ACTIVATION_COPY_THRESHOLD, EPSILON, MAX_KL_THRESHOLD, PAIRED_TEST_ALPHA
+from scripts.validator.policy import COMPOSITE_DETHRONE_FLOOR_DEFAULT
 from scripts.validator.precheck import check_activation_fingerprint
 from scripts.validator.single_eval import (
     is_single_eval_mode,
@@ -42,20 +43,17 @@ MIN_PROMPTS_FOR_SCORE_UPDATE = 150
 # must pass the paired-KL test and the composite quality gate. Raw KL and
 # composite alone are both insufficient crown gates.
 #
-# Floor choice: 0.20 is the "catastrophic failure" threshold for any axis
-# we care about. Concrete interpretation per axis:
-#
-#   * length   (penalty < 0.20 ⇒ student > 5x teacher tokens; clear ramble)
-#   * on_policy_rkl (score < 0.20 ⇒ on-policy RKL > 5x king; diverged)
-#   * capability (score < 0.20 ⇒ < 20% of teacher pass rate on verifiables)
-#   * degeneracy (score < 0.20 ⇒ half-plus of think prompts degenerate)
-#   * kl       (not applicable to dethroners: by construction their kl
-#              axis is ~1.0 since they beat the king on KL)
+# Floor choice: 0.06 is the temporary tail-KL rollout quality floor. It is
+# deliberately lower than the historical 0.20 quality floor so miners can keep
+# competing while tail-bucket KL replaces conditional top-k KL as the binding
+# distribution metric.
+# This is below the old per-axis catastrophic floor. Treat it as a launch
+# calibration value, not as a claim that every quality axis is healthy.
 #
 # If the composite isn't populated on enough axes (e.g. chat_probe and
 # think_probe both errored) the gate fails open — we don't want an
 # eval-side outage to freeze the crown.
-COMPOSITE_DETHRONE_FLOOR = 0.20
+COMPOSITE_DETHRONE_FLOOR = COMPOSITE_DETHRONE_FLOOR_DEFAULT
 COMPOSITE_DETHRONE_MIN_AXES = 3
 
 

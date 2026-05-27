@@ -80,7 +80,7 @@
     "configVocabSize": 248320
   },
   "validator": {
-    "maxKlThreshold": 2.1,
+    "maxKlThreshold": 6.3,
     "maxNewTokens": 1024,
     "maxPromptTokens": 1024,
     "evalPromptsFull": 60,

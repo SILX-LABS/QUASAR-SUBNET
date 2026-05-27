@@ -5,14 +5,12 @@
 Covers:
   * Session 2 bench axes (math/code/reasoning/knowledge/ifeval) promoted
     to production ranking.
-  * Session 3 shadow axes (aime/mbpp/tool_use/self_consistency) — present
-    in compute_axes but excluded from composite unless the gate flips.
+  * Session 3 production axes plus muted zero-weight telemetry axes.
   * JUDGE_AXIS_IN_COMPOSITE / BENCH_AXES_IN_COMPOSITE / ARENA_V3_AXES_IN_COMPOSITE
-    default values (v2 prod, v3 shadow).
+    default values.
   * Pareto majority dominance: wins/losses/ties, margin, insufficient-axes
     fail-open, and the soft-Pareto decision (majority win AND net wins ≥ 0).
-  * Teacher sanity gate correctly includes v2 axes and excludes v3 axes
-    unless the v3 gate is flipped.
+  * Teacher sanity gate correctly includes the promoted composite axes.
 
 Usage:
     pytest tests/test_arena_v3_composite.py -v
@@ -147,7 +145,7 @@ class TestSession2Promoted(unittest.TestCase):
 
 
 class TestSession3Shadow(unittest.TestCase):
-    """Session 3 axes only enter composite when ARENA_V3_AXES_IN_COMPOSITE=1."""
+    """Session 3 production and muted-axis behavior."""
 
     def test_v3_gate_promoted(self):
         import scripts.validator.composite as _c
@@ -191,50 +189,53 @@ class TestSession3Shadow(unittest.TestCase):
         self.assertEqual(axes["self_consistency_bench"], 0.6)
         self.assertEqual(axes["arc_bench"], 0.72)
 
-    def test_arc_bench_is_v3_shadow(self):
-        """arc_bench is in ARENA_V3_AXIS_WEIGHTS but not in composite when shadow."""
+    def test_arc_bench_is_muted_by_default(self):
+        """arc_bench is reported but has zero weight in the v28 composite."""
         import scripts.validator.composite as _c
         self.assertIn("arc_bench", _c.ARENA_V3_AXIS_WEIGHTS)
         self.assertIn("arc_bench", _c.BENCH_MIN_VALID)
-        # default: shadow
-        self.assertFalse(_c.ARENA_V3_AXES_IN_COMPOSITE)
+        self.assertTrue(_c.ARENA_V3_AXES_IN_COMPOSITE)
+        self.assertEqual(_c.ARENA_V3_AXIS_WEIGHTS["arc_bench"], 0.0)
         student = _make_student(bench={
             "math_bench": 0.8, "code_bench": 0.8, "reasoning_bench": 0.8,
             "knowledge_bench": 0.8, "ifeval_bench": 0.8,
-            "arc_bench": 0.05,  # would destroy worst if included
+            "arc_bench": 0.05,  # telemetry only at default weight
         })
         comp = _c.compute_composite(student, king_kl=0.3, king_rkl=0.1)
         self.assertGreater(comp["worst"], 0.10,
-                           "arc_bench=0.05 must NOT pull worst down in shadow mode")
+                           "arc_bench=0.05 must NOT pull worst down while muted")
         self.assertEqual(comp["axes"]["arc_bench"], 0.05)
 
-    def test_truthful_bench_is_v3_shadow(self):
-        """truthful_bench (Session 3.4) follows ARC's shadow semantics."""
+    def test_truthful_bench_is_muted_by_default(self):
+        """truthful_bench is reported but has zero weight in the v28 composite."""
         import scripts.validator.composite as _c
         self.assertIn("truthful_bench", _c.ARENA_V3_AXIS_WEIGHTS)
         self.assertIn("truthful_bench", _c.BENCH_MIN_VALID)
         self.assertIn("truthful_bench", _c.REASONING_DENSITY_TARGET_TOKENS)
-        self.assertFalse(_c.ARENA_V3_AXES_IN_COMPOSITE)
+        self.assertTrue(_c.ARENA_V3_AXES_IN_COMPOSITE)
+        self.assertEqual(_c.ARENA_V3_AXIS_WEIGHTS["truthful_bench"], 0.0)
         student = _make_student(bench={
             "math_bench": 0.8, "code_bench": 0.8, "reasoning_bench": 0.8,
             "knowledge_bench": 0.8, "ifeval_bench": 0.8,
-            "truthful_bench": 0.05,  # a hallucinator — shadow, so ignored
+            "truthful_bench": 0.05,  # telemetry only at default weight
         })
         comp = _c.compute_composite(student, king_kl=0.3, king_rkl=0.1)
         self.assertGreater(
             comp["worst"], 0.10,
-            "truthful_bench=0.05 must NOT pull worst down in shadow mode",
+            "truthful_bench=0.05 must NOT pull worst down while muted",
         )
         self.assertEqual(comp["axes"]["truthful_bench"], 0.05)
 
-    def test_truthful_bench_gates_worst_when_promoted(self):
-        """truthful_bench is in the worst-axis rule when Arena v3 is promoted."""
+    def test_truthful_bench_gates_worst_when_weighted(self):
+        """truthful_bench can join the worst-axis rule when assigned weight."""
         import scripts.validator.composite as _c
         saved_v3 = _c.ARENA_V3_AXES_IN_COMPOSITE
         saved_bench = _c.BENCH_AXES_IN_COMPOSITE
+        saved_weight = _c.ARENA_V3_AXIS_WEIGHTS["truthful_bench"]
         try:
             _c.ARENA_V3_AXES_IN_COMPOSITE = True
             _c.BENCH_AXES_IN_COMPOSITE = True
+            _c.ARENA_V3_AXIS_WEIGHTS["truthful_bench"] = 0.03
             student = _make_student(bench={
                 "math_bench": 0.8, "code_bench": 0.8, "reasoning_bench": 0.8,
                 "knowledge_bench": 0.8, "ifeval_bench": 0.8,
@@ -251,23 +252,25 @@ class TestSession3Shadow(unittest.TestCase):
         finally:
             _c.ARENA_V3_AXES_IN_COMPOSITE = saved_v3
             _c.BENCH_AXES_IN_COMPOSITE = saved_bench
+            _c.ARENA_V3_AXIS_WEIGHTS["truthful_bench"] = saved_weight
 
-    def test_long_context_bench_is_v3_shadow(self):
-        """long_context_bench (Session 3.5) follows ARC's shadow semantics."""
+    def test_long_context_bench_is_weighted_by_default(self):
+        """long_context_bench is a live v28 composite axis."""
         import scripts.validator.composite as _c
         self.assertIn("long_context_bench", _c.ARENA_V3_AXIS_WEIGHTS)
         self.assertIn("long_context_bench", _c.BENCH_MIN_VALID)
         self.assertIn("long_context_bench", _c.REASONING_DENSITY_TARGET_TOKENS)
-        self.assertFalse(_c.ARENA_V3_AXES_IN_COMPOSITE)
+        self.assertTrue(_c.ARENA_V3_AXES_IN_COMPOSITE)
+        self.assertGreater(_c.ARENA_V3_AXIS_WEIGHTS["long_context_bench"], 0.0)
         student = _make_student(bench={
             "math_bench": 0.8, "code_bench": 0.8, "reasoning_bench": 0.8,
             "knowledge_bench": 0.8, "ifeval_bench": 0.8,
-            "long_context_bench": 0.05,  # a hallucinator — shadow, so ignored
+            "long_context_bench": 0.05,
         })
         comp = _c.compute_composite(student, king_kl=0.3, king_rkl=0.1)
-        self.assertGreater(
+        self.assertLessEqual(
             comp["worst"], 0.10,
-            "long_context_bench=0.05 must NOT pull worst down in shadow mode",
+            "long_context_bench=0.05 must pull worst down while weighted",
         )
         self.assertEqual(comp["axes"]["long_context_bench"], 0.05)
 
@@ -401,8 +404,9 @@ class TestBenchExtractor(unittest.TestCase):
     def test_v3_uses_smaller_floor(self):
         from scripts.validator.composite import _axis_bench_pass_frac, BENCH_MIN_VALID
         self.assertLess(BENCH_MIN_VALID["aime_bench"], BENCH_MIN_VALID["math_bench"])
-        student = {"aime_bench": {"n": 2, "correct": 0, "pass_frac": 0.0}}
-        # aime floor is 2, so n=2 is enough.
+        n = BENCH_MIN_VALID["aime_bench"]
+        student = {"aime_bench": {"n": n, "correct": 0, "pass_frac": 0.0}}
+        # AIME has a lower floor than math, so its own min-valid count is enough.
         self.assertEqual(_axis_bench_pass_frac(student, "aime_bench"), 0.0)
 
 
@@ -703,7 +707,7 @@ class TestChatTurnsProbe(unittest.TestCase):
         s.pop("chat_turns_probe", None)
         self.assertIsNone(_axis_chat_turns_probe(s))
 
-    def test_shadow_excluded_from_worst_by_default(self):
+    def test_live_chat_turns_gates_worst_by_default(self):
         from scripts.validator.composite import compute_composite
         s = self._student_with_chat_turns(normalized=0.1, n_valid=5)
         s.update(_make_student(bench={
@@ -718,9 +722,9 @@ class TestChatTurnsProbe(unittest.TestCase):
         }
         comp = compute_composite(s, king_kl=0.3, king_rkl=0.1)
         self.assertIsNotNone(comp["axes"]["chat_turns_probe"])
-        self.assertFalse(comp["chat_turns_in_composite"])
-        self.assertGreater(comp["worst"], 0.5,
-            "chat_turns_probe=0.1 must NOT drag worst when in shadow")
+        self.assertTrue(comp["chat_turns_in_composite"])
+        self.assertLessEqual(comp["worst"], 0.1,
+            "chat_turns_probe=0.1 must drag worst in production")
 
     def test_promoted_chat_turns_gates_worst(self):
         import scripts.validator.composite as _c

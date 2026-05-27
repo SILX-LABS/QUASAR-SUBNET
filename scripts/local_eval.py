@@ -171,7 +171,11 @@ def main():
         with torch.inference_mode():
             s_out = student(input_ids=full_ids.to(DEVICE)).logits
         s_cont = s_out[:, plen - 1 : -1, :]
-        kl_per_pos = compute_kl_from_sparse(sparse["indices"], sparse["values"], s_cont, values_are_logprobs=(TEACHER_BACKEND == "vllm"))
+        kl_per_pos = compute_kl_from_sparse(
+            sparse["indices"], sparse["values"], s_cont,
+            values_are_logprobs=(TEACHER_BACKEND == "vllm"),
+            teacher_logsumexp=sparse.get("logsumexp"),
+        )
         kl = float(kl_per_pos.mean().item())
         per_prompt_kl.append(kl)
         if (i + 1) % 20 == 0:

@@ -33,6 +33,10 @@ from scripts.validator.composite import (
     COMPOSITE_SHADOW_VERSION,
     active_composite_axis_weights,
 )
+from scripts.validator.policy import (
+    CROWN_QUALITY_FLOOR_DEFAULT,
+    CROWN_QUALITY_MIN_AXES_DEFAULT,
+)
 
 logger = logging.getLogger("quasar.validator")
 
@@ -81,10 +85,10 @@ SINGLE_EVAL_WORST_FLOOR_EPSILON = float(
 # crown. KL/RKL can be optimized while generation quality collapses, so the
 # bootstrap/fallback selector must require real capability/judge/bench signal.
 SINGLE_EVAL_MIN_CROWN_QUALITY = float(
-    os.environ.get("SINGLE_EVAL_MIN_CROWN_QUALITY", "0.20")
+    os.environ.get("SINGLE_EVAL_MIN_CROWN_QUALITY", str(CROWN_QUALITY_FLOOR_DEFAULT))
 )
 SINGLE_EVAL_MIN_CROWN_QUALITY_AXES = int(
-    os.environ.get("SINGLE_EVAL_MIN_CROWN_QUALITY_AXES", "4")
+    os.environ.get("SINGLE_EVAL_MIN_CROWN_QUALITY_AXES", str(CROWN_QUALITY_MIN_AXES_DEFAULT))
 )
 CROWN_QUALITY_EXCLUDED_AXES = {"kl", "on_policy_rkl"}
 

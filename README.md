@@ -88,7 +88,7 @@ A valid model must:
 - Avoid quantized formats such as GPTQ, AWQ, GGUF, and FP8.
 - Use unique weights that are not identical to an earlier committed model.
 - Keep evaluation KL at or below the validator max KL threshold. The default is
-  `2.1`, configurable by validators with `QUASAR_MAX_KL_THRESHOLD`; models
+  `6.3` for tail-bucket KL, configurable by validators with `QUASAR_MAX_KL_THRESHOLD`; models
   above the threshold are disqualified for quality.
 
 ## Mining Guide
@@ -200,7 +200,7 @@ For this rollout, pin the crown policy in each validator env file so all
 operators run the same gates and no-winner behavior:
 
 ```bash
-SINGLE_EVAL_MIN_CROWN_QUALITY=0.20
+SINGLE_EVAL_MIN_CROWN_QUALITY=0.06
 SINGLE_EVAL_MIN_CROWN_QUALITY_AXES=4
 QUASAR_RESCORING_REVALIDATE_KING=1
 QUASAR_NO_WINNER_FALLBACK_TO_VALIDATOR_UID=0

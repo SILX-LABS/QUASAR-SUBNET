@@ -129,7 +129,7 @@ QUASAR_EVAL_BACKEND=lium
 QUASAR_LIUM_POD_NAME=quasar-eval
 LIUM_API_KEY=...
 SINGLE_EVAL_MODE=1
-SINGLE_EVAL_MIN_CROWN_QUALITY=0.20
+SINGLE_EVAL_MIN_CROWN_QUALITY=0.06
 SINGLE_EVAL_MIN_CROWN_QUALITY_AXES=4
 QUASAR_RESCORING_REVALIDATE_KING=1
 QUASAR_NO_WINNER_FALLBACK_TO_VALIDATOR_UID=0
@@ -214,7 +214,7 @@ Current runtime config:
 - `evalPromptsFull`: `60`
 - `evalPromptsH2h`: `300`
 - `vllmConcurrency`: `32`
-- `maxKlThreshold`: `2.1`
+- `maxKlThreshold`: `6.3` for tail-bucket KL
 
 Prompt sampling is block-seeded so miners cannot know the exact evaluation prompts before the relevant block is available.
 
@@ -241,7 +241,7 @@ In single-eval mode, king selection is based on stored composite records and det
 Kingship also requires a non-relative crown-quality floor. This quality score
 excludes `kl` and `on_policy_rkl`, then averages the remaining active composite
 axes with the production axis weights. Defaults are
-`SINGLE_EVAL_MIN_CROWN_QUALITY=0.20` and
+`SINGLE_EVAL_MIN_CROWN_QUALITY=0.06` and
 `SINGLE_EVAL_MIN_CROWN_QUALITY_AXES=4`.
 
 ## Weight Setting

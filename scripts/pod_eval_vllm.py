@@ -82,6 +82,8 @@ MIN_COMPLETION_TOKENS = 10  # Skip prompts producing fewer continuation tokens
 # Chunked over positions to reduce peak memory (~4x less for 512-pos sequences).
 # Credit: caseus (github.com/winglian) for the optimization.
 KL_CHUNK_SIZE = 128
+SPARSE_KL_MODE = os.environ.get("SPARSE_KL_MODE", "tail_bucket").strip().lower()
+SPARSE_KL_EPS = float(os.environ.get("SPARSE_KL_EPS", "1e-12"))
 
 # -- Activation fingerprinting (functional copy detection) --
 ACTIVATION_FP_SEED = 42
@@ -9264,70 +9266,149 @@ def dense_to_sparse_topk(logits, k=128):
         k: number of top logits to keep.
 
     Returns:
-        dict with 'indices' [1, seq_len, k] and 'values' [1, seq_len, k]
-        where values are raw logits (not log-softmax).
+        dict with 'indices' [1, seq_len, k], 'values' [1, seq_len, k],
+        and 'logsumexp' [1, seq_len]. Values are raw logits; logsumexp lets
+        sparse KL recover the teacher's true top-k probability mass instead
+        of renormalizing the top-k slice as if the tail did not exist.
     """
     if logits.dim() == 2:
         logits = logits.unsqueeze(0)
-    topk_values, topk_indices = logits.float().topk(k, dim=-1)
-    return {"indices": topk_indices.cpu(), "values": topk_values.cpu()}
+    logits_f = logits.float()
+    topk_values, topk_indices = logits_f.topk(k, dim=-1)
+    return {
+        "indices": topk_indices.cpu(),
+        "values": topk_values.cpu(),
+        "logsumexp": logits_f.logsumexp(dim=-1).cpu(),
+    }
+
+
+def _log_tail_mass_from_topk_log_mass(log_mass, eps=SPARSE_KL_EPS):
+    """Return log(1 - exp(log_mass)) with clamps for numeric edge cases."""
+    mass = log_mass.exp().clamp(min=0.0, max=1.0)
+    tail = (1.0 - mass).clamp_min(eps)
+    return tail.log()
+
+
+def _conditional_sparse_kl(t_log_p_k, s_log_p_k):
+    """Legacy KL on the renormalized teacher top-k support."""
+    t_log_p_cond = t_log_p_k - t_log_p_k.logsumexp(dim=-1, keepdim=True)
+    s_log_p_cond = s_log_p_k - s_log_p_k.logsumexp(dim=-1, keepdim=True)
+    return F.kl_div(
+        s_log_p_cond, t_log_p_cond,
+        log_target=True, reduction="none",
+    ).sum(dim=-1)
 
 
 def compute_kl_from_sparse(teacher_indices, teacher_values, student_logits,
-                           values_are_logprobs=False):
+                           values_are_logprobs=False, teacher_logsumexp=None,
+                           mode=None, return_details=False):
     """KL divergence using sparse top-k teacher logits/logprobs.
 
-    For teacher: renormalize the top-k values into a proper distribution.
-    For student: compute full-vocab log_softmax, gather the same k positions,
-    then renormalize over those k positions.
-    KL = sum_k P_teacher_k * (log P_teacher_k - log Q_student_k)
+    Default mode (``tail_bucket``): approximate full-vocab KL by computing
+    exact probabilities on the teacher top-k tokens and collapsing the rest of
+    the vocabulary into one tail bucket. This preserves the cheap sparse
+    teacher cache while penalizing students that match only the relative
+    top-k shape but put too much/little probability mass outside top-k.
+
+    Legacy mode (``conditional``): renormalize both teacher and student over
+    the top-k support. Kept for shadow audits/back-compat.
 
     Args:
         teacher_indices: [1, seq_len, k] token IDs.
         teacher_values:  [1, seq_len, k] logits or logprobs.
         student_logits:  [1, seq_len, vocab_size] raw student logits.
         values_are_logprobs: if True, teacher_values are already log-probs.
+        teacher_logsumexp: [1, seq_len] logsumexp for raw teacher logits.
+            Required for tail-bucket mode when values_are_logprobs=False.
+        mode: "tail_bucket" (default) or "conditional".
+        return_details: when True, return (kl_per_pos, diagnostics).
 
     Returns:
         KL per position, shape [1, seq_len] or [seq_len].
     """
     device = student_logits.device
+    mode = (mode or SPARSE_KL_MODE or "tail_bucket").strip().lower()
     t_idx = teacher_indices.to(device)
     t_vals = teacher_values.to(device).float()
 
-    # Teacher: renormalized log-probs over top-k tokens
-    if values_are_logprobs:
-        t_log_p = t_vals - t_vals.logsumexp(dim=-1, keepdim=True)
-    else:
-        t_log_p = F.log_softmax(t_vals, dim=-1)
-
-    # Student: full-vocab log_softmax, then gather the k positions
+    # Student: full-vocab log_softmax, then gather the teacher top-k positions.
     s_log_p_full = F.log_softmax(student_logits.float(), dim=-1)
     s_log_p_k = s_log_p_full.gather(-1, t_idx)
-    # Renormalize student over the same k tokens for proper KL
-    s_log_p_k_norm = s_log_p_k - s_log_p_k.logsumexp(dim=-1, keepdim=True)
-
     del s_log_p_full
 
+    # Teacher top-k as full-distribution log-probs when possible.
+    if values_are_logprobs:
+        t_log_p_k = t_vals
+        has_teacher_mass = True
+    elif teacher_logsumexp is not None:
+        t_lse = teacher_logsumexp.to(device).float()
+        if t_lse.dim() == t_vals.dim() - 1:
+            t_lse = t_lse.unsqueeze(-1)
+        t_log_p_k = t_vals - t_lse
+        has_teacher_mass = True
+    else:
+        # Old sparse caches from HF fallback did not store teacher logsumexp.
+        # In that case we cannot know teacher tail mass, so use legacy
+        # conditional KL rather than inventing a false tail distribution.
+        t_log_p_k = F.log_softmax(t_vals, dim=-1)
+        has_teacher_mass = False
+
+    use_tail_bucket = mode in {"tail", "tail_bucket", "topk_tail", "mass"} and has_teacher_mass
+    if mode in {"conditional", "legacy", "topk"} or not use_tail_bucket:
+        kl_full = _conditional_sparse_kl(t_log_p_k, s_log_p_k)
+        details = {
+            "sparse_kl_mode": "conditional" if has_teacher_mass else "conditional_fallback",
+            "has_teacher_mass": bool(has_teacher_mass),
+        }
+    else:
+        # Top-k exact contribution under the full distribution.
+        t_p_k = t_log_p_k.exp()
+        topk_kl = (t_p_k * (t_log_p_k - s_log_p_k)).sum(dim=-1)
+
+        # Collapse all non-top-k tokens into a single tail bucket. This is a
+        # coarse-grained lower-bound to full-vocab KL, but it catches the
+        # important exploit: matching relative top-k probabilities while
+        # leaking probability mass into the long tail.
+        t_log_mass_k = t_log_p_k.logsumexp(dim=-1)
+        s_log_mass_k = s_log_p_k.logsumexp(dim=-1)
+        t_log_tail = _log_tail_mass_from_topk_log_mass(t_log_mass_k)
+        s_log_tail = _log_tail_mass_from_topk_log_mass(s_log_mass_k)
+        t_tail = t_log_tail.exp()
+        tail_kl = t_tail * (t_log_tail - s_log_tail)
+        kl_full = topk_kl + tail_kl
+
+        details = {
+            "sparse_kl_mode": "tail_bucket",
+            "has_teacher_mass": True,
+            "conditional_kl": _conditional_sparse_kl(t_log_p_k, s_log_p_k),
+            "teacher_topk_mass": t_log_mass_k.exp(),
+            "student_topk_mass": s_log_mass_k.exp(),
+            "tail_mass_abs_gap": (t_tail - s_log_tail.exp()).abs(),
+        }
+
+    kl_full = kl_full.clamp_min(0.0)
+
     # Chunked KL over positions for memory efficiency
-    n_pos = t_log_p.shape[1] if t_log_p.dim() >= 3 else t_log_p.shape[0]
-    if t_log_p.dim() >= 3:
-        kl_per_pos = torch.empty(t_log_p.shape[0], n_pos, device=device)
+    n_pos = kl_full.shape[1] if kl_full.dim() >= 2 else kl_full.shape[0]
+    if kl_full.dim() >= 2:
+        kl_per_pos = torch.empty(kl_full.shape[0], n_pos, device=device)
         for i in range(0, n_pos, KL_CHUNK_SIZE):
             j = min(i + KL_CHUNK_SIZE, n_pos)
-            kl_per_pos[:, i:j] = F.kl_div(
-                s_log_p_k_norm[:, i:j, :], t_log_p[:, i:j, :],
-                log_target=True, reduction="none"
-            ).sum(dim=-1)
+            kl_per_pos[:, i:j] = kl_full[:, i:j]
     else:
         kl_per_pos = torch.empty(n_pos, device=device)
         for i in range(0, n_pos, KL_CHUNK_SIZE):
             j = min(i + KL_CHUNK_SIZE, n_pos)
-            kl_per_pos[i:j] = F.kl_div(
-                s_log_p_k_norm[i:j, :], t_log_p[i:j, :],
-                log_target=True, reduction="none"
-            ).sum(dim=-1)
+            kl_per_pos[i:j] = kl_full[i:j]
 
+    if return_details:
+        reduced = {}
+        for key, value in details.items():
+            if torch.is_tensor(value):
+                reduced[key] = value.detach().float().mean().item()
+            else:
+                reduced[key] = value
+        return kl_per_pos, reduced
     return kl_per_pos
 
 
@@ -11401,16 +11482,37 @@ def main():
                             del t_indices, t_values
                         else:
                             s_cont_slice = cont_s[:, :min_len, :]
-                            # Detect if values are logprobs (from vLLM) or raw logits (from HF top-k)
-                            # vLLM logprobs are negative and typically < 0; raw logits can be positive
-                            # Heuristic: if max value > 0, they're logits; if all <= 0, they're logprobs
+                            t_logsumexp = tl_entry.get("logsumexp")
+                            if t_logsumexp is not None:
+                                t_logsumexp = t_logsumexp[:, :min_len]
+                            # Detect if values are logprobs (from vLLM) or raw logits (from HF top-k).
+                            # HF sparse caches now carry logsumexp, which is authoritative even when
+                            # raw logits happen to be all negative.
                             max_val = t_values[:, :min_len, :].max().item()
-                            are_logprobs = (max_val <= 0.0)
-                            kl_per_pos = compute_kl_from_sparse(
+                            are_logprobs = (t_logsumexp is None and max_val <= 0.0)
+                            kl_per_pos, sparse_details = compute_kl_from_sparse(
                                 t_indices[:, :min_len, :], t_values[:, :min_len, :],
-                                s_cont_slice, values_are_logprobs=are_logprobs
-                            ).squeeze(0)
+                                s_cont_slice, values_are_logprobs=are_logprobs,
+                                teacher_logsumexp=t_logsumexp, return_details=True,
+                            )
+                            kl_per_pos = kl_per_pos.squeeze(0)
                             kl_mean = kl_per_pos.mean().item()
+                            k_used = int(t_indices.shape[-1])
+                            if sparse_details.get("sparse_kl_mode") == "tail_bucket":
+                                topk_shadow[f"kl_conditional_top{k_used}"] = round(
+                                    float(sparse_details.get("conditional_kl", 0.0)), 6,
+                                )
+                                topk_shadow[f"teacher_top{k_used}_mass"] = round(
+                                    float(sparse_details.get("teacher_topk_mass", 0.0)), 6,
+                                )
+                                topk_shadow[f"student_top{k_used}_mass"] = round(
+                                    float(sparse_details.get("student_topk_mass", 0.0)), 6,
+                                )
+                                topk_shadow[f"tail_mass_gap_top{k_used}"] = round(
+                                    float(sparse_details.get("tail_mass_abs_gap", 0.0)), 6,
+                                )
+                            else:
+                                topk_shadow["sparse_kl_mode"] = sparse_details.get("sparse_kl_mode")
                             del t_indices, t_values, s_cont_slice, kl_per_pos
                     else:
                         # ── Dense teacher logits path (legacy / full-vocab) ──
@@ -11600,7 +11702,19 @@ def main():
             print(f"  → KL={kl_avg:.6f} ({n_scored}/{len(prompts)} prompts, {status})", flush=True)
 
             topk_aggs = {}
-            for k_label in ("kl_top100", "kl_top1000"):
+            shadow_keys = {
+                key
+                for row in kl_per_prompt
+                for key in row
+                if (
+                    key.startswith("kl_top")
+                    or key.startswith("kl_conditional_top")
+                    or key.startswith("teacher_top")
+                    or key.startswith("student_top")
+                    or key.startswith("tail_mass_gap_top")
+                )
+            }
+            for k_label in sorted(shadow_keys):
                 vals = [d.get(k_label) for d in kl_per_prompt if d.get(k_label) is not None]
                 if vals:
                     topk_aggs[k_label] = round(sum(vals) / len(vals), 6)

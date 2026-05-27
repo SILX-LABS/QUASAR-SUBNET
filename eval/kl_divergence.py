@@ -1,9 +1,11 @@
 """
 KL-divergence computation on GPU tensors.
 
-Prod path (sparse): teacher runs on vLLM with `--max-logprobs 128`, so
-`compute_kl_from_sparse` (in scripts/pod_eval_vllm.py) renormalizes both
-teacher and student over the shared top-128 support.
+Prod path (sparse): teacher runs on vLLM with `--max-logprobs 128`.
+`compute_kl_from_sparse` (in scripts/pod_eval_vllm.py) now uses the teacher
+top-k full-distribution logprobs plus a single tail bucket for all non-top-k
+tokens. That keeps the sparse cache cheap while penalizing models that match
+only the relative top-k ordering and dump probability mass into the long tail.
 
 Dense path (full-vocab) is available here for reference / offline replays
 but is not used in prod for bandwidth reasons (~150GB/round at vocab=248,320).

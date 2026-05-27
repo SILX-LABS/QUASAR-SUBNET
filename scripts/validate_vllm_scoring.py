@@ -155,7 +155,11 @@ def main():
 
         # Compute KL
         if _is_sparse_logits(tl):
-            kl_per_pos = compute_kl_from_sparse(tl["indices"], tl["values"], cont_logits)
+            kl_per_pos = compute_kl_from_sparse(
+                tl["indices"], tl["values"], cont_logits,
+                values_are_logprobs=True,
+                teacher_logsumexp=tl.get("logsumexp"),
+            )
         else:
             t_log_p = F.log_softmax(tl.float(), dim=-1)
             s_log_p = F.log_softmax(cont_logits.float(), dim=-1)

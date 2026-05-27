@@ -15,7 +15,20 @@ from pathlib import Path
 logger = logging.getLogger("quasar.scoring")
 
 STATE_DIR = Path("state")
-DEFAULT_MAX_KL = 2.1
+
+
+def _default_max_kl() -> float:
+    """Load the production KL gate from config, with the rollout value fallback."""
+    config_path = Path(__file__).resolve().parents[1] / "config" / "quasar.json"
+    try:
+        data = json.loads(config_path.read_text())
+        validator = data.get("validator") if isinstance(data, dict) else {}
+        return float((validator or {}).get("maxKlThreshold", 6.3))
+    except Exception:
+        return 6.3
+
+
+DEFAULT_MAX_KL = _default_max_kl()
 
 
 def _load_json(path: Path) -> dict:

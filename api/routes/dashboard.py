@@ -730,6 +730,10 @@ def _current_eval(progress, commitments):
         "waiting_for_coordination_activation",
         "coordination_no_challengers_complete",
         "no_challengers_complete",
+        "precheck",
+        "resume_complete",
+        "round_complete",
+        "complete",
     }:
         return None
     models = progress.get("models") if isinstance(progress.get("models"), dict) else {}
@@ -737,6 +741,15 @@ def _current_eval(progress, commitments):
     pod_current = pod.get("current") if isinstance(pod.get("current"), dict) else {}
     progress_current = progress.get("current") if isinstance(progress.get("current"), dict) else {}
     current = pod_current or progress_current
+    pod_completed = pod.get("completed")
+    pod_students_total = pod.get("students_total")
+    if (
+        not current
+        and isinstance(pod_completed, list)
+        and pod_students_total
+        and len(pod_completed) >= int(pod_students_total)
+    ):
+        return None
     repo = (
         progress.get("current_student")
         or pod_current.get("student_name")
@@ -1024,11 +1037,10 @@ def _dashboard_events(progress, current_eval, submissions, status):
             break
 
     if not events:
-        pending = sum(1 for row in submissions if row.get("status") in {"valid", "scheduled"})
         events.append(_event_row(
             now,
             "info",
-            f"Idle. {pending} pending commitment(s)." if pending else "Idle. No pending commitments.",
+            "No eval is running; waiting for validator round state.",
             "status",
         ))
     return events[:80]
@@ -1184,6 +1196,32 @@ def _dashboard_status(progress, current_eval, latest, consensus_king, submission
             "label": "Waiting for next coordination round",
             "detail": detail,
         })
+    elif phase in {"resume_complete", "round_complete", "complete"}:
+        detail = "Round complete; waiting for next coordination round."
+        next_block = progress.get("next_round_start_block")
+        remaining = progress.get("blocks_remaining")
+        if next_block:
+            detail = f"Next coordination round at block {next_block}"
+            if remaining is not None:
+                detail += f" ({remaining} blocks left)."
+        status.update({
+            "mode": "round_wait",
+            "label": "Waiting for next coordination round",
+            "detail": detail,
+        })
+    elif active and phase == "precheck":
+        next_block = progress.get("next_round_start_block")
+        remaining = progress.get("blocks_remaining")
+        detail = progress.get("status_detail")
+        if not detail and next_block:
+            detail = f"Next coordination round at block {next_block}"
+            if remaining is not None:
+                detail += f" ({remaining} blocks left)."
+        status.update({
+            "mode": "precheck",
+            "label": "Prechecking submissions",
+            "detail": detail or "Checking committed models before scheduling eval.",
+        })
     elif active:
         status.update({
             "mode": "active",
@@ -1191,11 +1229,10 @@ def _dashboard_status(progress, current_eval, latest, consensus_king, submission
             "detail": phase or "Round state is active.",
         })
     else:
-        pending = sum(1 for row in submissions if row.get("status") in {"valid", "scheduled"})
         status.update({
             "mode": "idle",
-            "label": "Idle between rounds",
-            "detail": f"{pending} pending commitment(s)." if pending else "No eval is running.",
+            "label": "No eval running",
+            "detail": "Waiting for validator round state.",
         })
     return status
 

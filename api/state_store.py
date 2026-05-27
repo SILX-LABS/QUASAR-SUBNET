@@ -271,6 +271,7 @@ def normalize_eval_progress(progress):
     if not isinstance(progress, dict):
         return {"active": False}
     normalized = dict(progress)
+    pod = normalized.get("pod") if isinstance(normalized.get("pod"), dict) else {}
     current = normalized.get("current") if isinstance(normalized.get("current"), dict) else {}
     current = dict(current)
     fields = {
@@ -293,6 +294,20 @@ def normalize_eval_progress(progress):
     if normalized.get("students_done") is None:
         completed = normalized.get("completed")
         normalized["students_done"] = len(completed) if isinstance(completed, list) else 0
+    pod_completed = pod.get("completed")
+    pod_students_total = pod.get("students_total")
+    if (
+        normalized.get("active")
+        and not pod.get("current")
+        and isinstance(pod_completed, list)
+        and pod_students_total
+        and len(pod_completed) >= int(pod_students_total)
+    ):
+        normalized["active"] = False
+        normalized["phase"] = "complete"
+        normalized["completed"] = pod_completed
+        normalized["students_done"] = len(pod_completed)
+        normalized["students_total"] = pod_students_total
     phase = normalized.get("phase") or normalized.get("stage")
     active_eval = bool(
         normalized.get("active")
@@ -311,7 +326,12 @@ def normalize_eval_progress(progress):
         elif normalized.get("active") and phase == "waiting_for_coordination_activation":
             normalized["status_mode"] = "activation_wait"
             normalized["status_label"] = "Winner selected; waiting for activation"
-        elif phase == "waiting_for_coordination_round_start":
+        elif phase in {
+            "waiting_for_coordination_round_start",
+            "resume_complete",
+            "round_complete",
+            "complete",
+        }:
             normalized["status_mode"] = "round_wait"
             normalized["status_label"] = "Waiting for next coordination round"
         elif normalized.get("active"):
@@ -319,7 +339,7 @@ def normalize_eval_progress(progress):
             normalized["status_label"] = "Validator round active"
         else:
             normalized["status_mode"] = "idle"
-            normalized["status_label"] = "Idle between rounds"
+            normalized["status_label"] = "No eval running"
     return normalized
 
 

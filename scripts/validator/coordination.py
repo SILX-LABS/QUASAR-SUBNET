@@ -325,10 +325,17 @@ def wait_for_round_start(subtensor: Any, state, state_dir: str) -> int | None:
         try:
             state.save_progress({
                 "active": False,
+                "phase": "waiting_for_coordination_round_start",
                 "stage": "waiting_for_coordination_round_start",
                 "current_block": current,
                 "next_round_start_block": target,
                 "blocks_remaining": remaining,
+                "status_mode": "round_wait",
+                "status_label": "Waiting for next coordination round",
+                "status_detail": (
+                    f"Next coordination round at block {target} "
+                    f"({remaining} blocks left)."
+                ),
                 "updated_at": time.time(),
             })
         except Exception:

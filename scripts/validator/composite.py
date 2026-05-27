@@ -79,6 +79,8 @@ import logging
 import os
 from typing import Any
 
+from scripts.validator.policy import KING_COMPOSITE_FLOOR_DEFAULT
+
 logger = logging.getLogger(__name__)
 
 
@@ -393,7 +395,9 @@ PARETO_DOMINANCE_GATE = os.environ.get("PARETO_DOMINANCE_GATE", "1") != "0"
 # When ``KING_REGRESSION_GATE=1`` and streak ≥ ``KING_REGRESSION_MIN_STREAK``,
 # the king is force-dethroned in favor of the highest-composite challenger
 # in the current round that also passed the structural gates.
-KING_COMPOSITE_FLOOR = float(os.environ.get("KING_COMPOSITE_FLOOR", "0.20"))
+KING_COMPOSITE_FLOOR = float(
+    os.environ.get("KING_COMPOSITE_FLOOR", str(KING_COMPOSITE_FLOOR_DEFAULT))
+)
 KING_REGRESSION_MIN_STREAK = int(os.environ.get("KING_REGRESSION_MIN_STREAK", "3"))
 KING_REGRESSION_GATE = os.environ.get("KING_REGRESSION_GATE", "1") != "0"
 

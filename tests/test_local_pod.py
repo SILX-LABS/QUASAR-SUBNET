@@ -1,11 +1,9 @@
 import shlex
-import sys
-
 from eval.local_pod import LocalPodManager
 
 
 def test_local_pod_exec_upload_download(tmp_path):
-    backend = LocalPodManager(work_dir=tmp_path / "runs", python_bin=sys.executable)
+    backend = LocalPodManager(work_dir=tmp_path / "runs")
     backend.connect()
 
     source = tmp_path / "source.txt"
@@ -15,7 +13,7 @@ def test_local_pod_exec_upload_download(tmp_path):
     backend.upload(str(source), str(remote))
     assert remote.read_text() == "hello local eval"
 
-    result = backend.exec(f"{shlex.quote(sys.executable)} -c 'print(123)'", timeout=10)
+    result = backend.exec(f"{shlex.quote(backend.python_bin)} -c 'print(123)'", timeout=10)
     assert result["success"]
     assert result["stdout"].strip() == "123"
 

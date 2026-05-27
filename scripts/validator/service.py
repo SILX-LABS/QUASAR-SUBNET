@@ -47,9 +47,11 @@ from scripts.validator.coordination import (
     build_coordination_round,
     coordination_round_from_dict,
     coordination_enabled,
+    current_chain_block,
     deferred_uids_from_latest,
     get_block_hash,
     log_round_manifest,
+    next_round_start_block,
     parse_commitments_at_cutoff,
     wait_for_round_start,
     wait_until_activation_block,
@@ -94,6 +96,51 @@ logger = logging.getLogger("quasar.validator")
 # ── helpers ──────────────────────────────────────────────────────────────
 
 _RELATIVE_SELECTION_AXES = CROWN_QUALITY_EXCLUDED_AXES
+
+
+def _save_round_wait_progress(subtensor, state, completed_block=None):
+    """Persist the scheduler's next-round countdown after eval work is done."""
+    if not coordination_enabled() or subtensor is None:
+        state.save_progress({
+            "active": False,
+            "phase": "round_complete",
+            "stage": "round_complete",
+            "completed_block": completed_block,
+            "updated_at": time.time(),
+        })
+        return
+
+    try:
+        current_block = current_chain_block(subtensor)
+        next_block = next_round_start_block(current_block)
+        remaining = max(0, int(next_block) - int(current_block))
+    except Exception as exc:
+        logger.warning(f"Unable to write next-round wait progress: {exc}")
+        state.save_progress({
+            "active": False,
+            "phase": "round_complete",
+            "stage": "round_complete",
+            "completed_block": completed_block,
+            "updated_at": time.time(),
+        })
+        return
+
+    state.save_progress({
+        "active": True,
+        "phase": "waiting_for_coordination_round_start",
+        "stage": "waiting_for_coordination_round_start",
+        "current_block": current_block,
+        "next_round_start_block": next_block,
+        "blocks_remaining": remaining,
+        "completed_block": completed_block,
+        "status_mode": "round_wait",
+        "status_label": "Waiting for next coordination round",
+        "status_detail": (
+            f"Next coordination round at block {next_block} "
+            f"({remaining} blocks left)."
+        ),
+        "updated_at": time.time(),
+    })
 
 
 def _as_float(value, default=None):
@@ -1432,7 +1479,7 @@ def _run_resumed_round(subtensor, wallet, netuid, state, pod, resume_round,
             king_per_prompt, models_to_eval, uid_to_model, valid_models, h2h_results,
             current_block, result_block_hash, n_prompts, is_full_eval,
             challengers, epoch_count, disqualified, epoch_start,
-            uid_to_hotkey, state_dir,
+            uid_to_hotkey, state_dir, subtensor=subtensor,
         )
         log_event(
             f"Resume complete: winner=UID {winner_uid} KL={winner_kl}",
@@ -1451,9 +1498,7 @@ def _run_resumed_round(subtensor, wallet, netuid, state, pod, resume_round,
                 logger.warning(f"Resume: pod run_dir cleanup failed (non-fatal): {exc}")
         state.clear_round()
         state.current_round = {}
-        state.save_progress({"active": False, "stage": "resume_complete",
-                             "completed_block": current_block,
-                             "completed_at": time.time()})
+        _save_round_wait_progress(subtensor, state, completed_block=current_block)
     except Exception as exc:
         logger.error(f"Resume apply-results failed: {exc}")
         log_event(f"Resume apply-results failed: {str(exc)[:200]}",
@@ -1958,7 +2003,7 @@ def post_round(
     king_per_prompt, models_to_eval, uid_to_model, valid_models, h2h_results,
     current_block, current_block_hash, n_prompts, is_full_eval,
     challengers, epoch_count, disqualified, epoch_start,
-    uid_to_hotkey, state_dir,
+    uid_to_hotkey, state_dir, subtensor=None,
 ):
     for row in h2h_results or []:
         row.pop("_selection_per_prompt", None)
@@ -1983,7 +2028,7 @@ def post_round(
         uid_to_model, valid_models, current_block, epoch_count, disqualified,
     )
     state.clear_round()
-    state.save_progress({"active": False})
+    _save_round_wait_progress(subtensor, state, completed_block=current_block)
     telemetry_log({
         "stage": "round_complete",
         "winner_uid": winner_uid,
@@ -2224,6 +2269,16 @@ def run_validator(network, netuid, wallet_name, hotkey_name, wallet_path,
                     break
                 time.sleep(tempo)
                 continue
+
+            state.save_progress({
+                "active": True,
+                "phase": "precheck",
+                "stage": "precheck",
+                "current_block": current_block,
+                "commitments_total": len(commitments),
+                "coordination": coord_round.to_dict() if coord_round else None,
+                "updated_at": time.time(),
+            })
 
             migrate_dq_entries(state, chain_commitments)
             issues = state.validate_consistency(uid_to_hotkey, chain_commitments, MAX_KL_THRESHOLD)
@@ -2567,7 +2622,7 @@ def run_validator(network, netuid, wallet_name, hotkey_name, wallet_path,
                 king_per_prompt, models_to_eval, uid_to_model, valid_models, h2h_results,
                 current_block, current_block_hash, n_prompts, is_full_eval,
                 challengers, epoch_count, disqualified, epoch_start,
-                uid_to_hotkey, state_dir,
+                uid_to_hotkey, state_dir, subtensor=subtensor,
             )
 
             elapsed = time.time() - epoch_start
