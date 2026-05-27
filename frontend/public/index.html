@@ -1628,7 +1628,7 @@ function renderLeader(d) {
 /* ═══════════════════ RENDER: EVALUATIONS ═══════════════════ */
 function buildEvalRows(d) {
     var hist=d.history||[];
-    var q=d.queue||[];
+    var q=d.submissions||d.queue||[];
     var rows=[];
     var seen={};
     var currentByUid={};

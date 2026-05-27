@@ -1050,6 +1050,37 @@ def _queue(commitments, history_rows):
     return _submission_rows(commitments, history_rows, None, {})
 
 
+def _current_round_queue(submissions, progress):
+    """Return only UIDs selected for the current validator round.
+
+    ``submissions`` is the full on-chain commitment table. The public
+    ``queue`` field should not mirror that table or miners see a huge stale
+    pending queue. Keep the complete table in ``submissions`` and reserve
+    ``queue`` for the active/scheduled round roster.
+    """
+    if not isinstance(progress, dict) or not progress.get("active"):
+        return []
+    active_uids = set(_scheduled_uids(progress))
+    for item in progress.get("eval_order") or []:
+        try:
+            active_uids.add(int(item.get("uid")))
+        except (TypeError, ValueError):
+            continue
+    for item in progress.get("completed_uids") or []:
+        try:
+            active_uids.add(int(item))
+        except (TypeError, ValueError):
+            continue
+    if progress.get("king_uid") is not None:
+        try:
+            active_uids.add(int(progress.get("king_uid")))
+        except (TypeError, ValueError):
+            pass
+    if not active_uids:
+        return []
+    return [row for row in submissions if row.get("uid") in active_uids]
+
+
 def _submission_rows(commitments, history_rows, king_uid, progress):
     composites = composite_scores() or {}
     score_map = scores() or {}
@@ -1384,7 +1415,7 @@ def get_dashboard_json():
         "state_king_uid": state_king_uid,
         "status": status,
         "current_eval": current_eval,
-        "queue": submissions,
+        "queue": _current_round_queue(submissions, progress),
         "submissions": submissions,
         "validators": _validators(),
         "history": hist_rows,
