@@ -58,6 +58,7 @@ from scripts.validator.coordination import (
 )
 from scripts.validator.pod_manager import init_local_pod, init_pod
 from scripts.validator.pod_session import run_eval_on_pod
+from scripts.validator.policy import NO_WINNER_FALLBACK_UID_DEFAULT
 from scripts.validator.precheck import precheck_all_models
 from scripts.validator.results import (
     MIN_PROMPTS_DETHRONE,
@@ -641,6 +642,20 @@ def _coerce_valid_uid(value, n_uids):
     return None
 
 
+def _resolve_shared_no_winner_fallback_uid(n_uids, state_dir, *, env_name="QUASAR_NO_WINNER_FALLBACK_UID"):
+    raw = os.environ.get(env_name)
+    source = "configured fallback" if raw not in (None, "") else "shared burn fallback"
+    if raw in (None, ""):
+        raw = str(NO_WINNER_FALLBACK_UID_DEFAULT)
+    fallback_uid = _coerce_valid_uid(raw, n_uids)
+    if fallback_uid is not None:
+        return fallback_uid, source
+    msg = f"Invalid {env_name}={raw!r}; no shared no-winner fallback target available"
+    logger.warning(msg)
+    log_event(msg[:240], level="warn", state_dir=state_dir)
+    return None, "invalid configured fallback"
+
+
 def _resolve_no_winner_weight_target(
     subtensor, netuid, n_uids, king_uid, validator_uid, state_dir,
 ):
@@ -648,17 +663,20 @@ def _resolve_no_winner_weight_target(
 
     A no-winner round should not crown a disqualified challenger, but it also
     should not skip weights entirely because that lets validator trust drift.
-    Prefer the incumbent king when we have one; otherwise prefer the local
-    validator UID so a policy migration can explicitly withdraw support from a
-    stale king. Operators can disable that fallback to preserve the current
-    revealed chain target.
+    Prefer the incumbent king when we have one; otherwise use the shared
+    fallback/burn UID so every validator publishes the same target. This keeps
+    vTrust aligned while withholding emissions from unsafe submissions.
     """
     incumbent_uid = _coerce_valid_uid(king_uid, n_uids)
     if incumbent_uid is not None:
         return incumbent_uid, "incumbent king"
 
     validator_uid = _coerce_valid_uid(validator_uid, n_uids)
-    if validator_uid is not None and os.environ.get("QUASAR_NO_WINNER_FALLBACK_TO_VALIDATOR_UID", "1") != "0":
+    fallback_uid, fallback_source = _resolve_shared_no_winner_fallback_uid(n_uids, state_dir)
+    if fallback_uid is not None:
+        return fallback_uid, fallback_source
+
+    if validator_uid is not None and os.environ.get("QUASAR_NO_WINNER_FALLBACK_TO_VALIDATOR_UID", "0") == "1":
         return validator_uid, "validator UID"
 
     try:
@@ -678,14 +696,18 @@ def _resolve_no_winner_weight_target(
 def _resolve_rescore_fallback_uid(subtensor, netuid, n_uids, validator_uid, state_dir):
     """Pick the safe target when a scoring migration uncrowns every model."""
     configured = os.environ.get("QUASAR_RESCORING_FALLBACK_UID")
-    if configured:
+    if configured not in (None, ""):
         fallback_uid = _coerce_valid_uid(configured, n_uids)
         if fallback_uid is not None:
             return fallback_uid, "configured fallback"
         logger.warning("Invalid QUASAR_RESCORING_FALLBACK_UID=%r", configured)
 
+    fallback_uid, fallback_source = _resolve_shared_no_winner_fallback_uid(n_uids, state_dir)
+    if fallback_uid is not None:
+        return fallback_uid, fallback_source
+
     validator_uid_i = _coerce_valid_uid(validator_uid, n_uids)
-    if validator_uid_i is not None:
+    if validator_uid_i is not None and os.environ.get("QUASAR_NO_WINNER_FALLBACK_TO_VALIDATOR_UID", "0") == "1":
         return validator_uid_i, "validator UID"
 
     try:
@@ -804,8 +826,8 @@ def rescore_persisted_king_after_scoring_change(
 
     Use this after changing composite weights, floors, or schema gates. It
     does not wipe history or scores. If no model still clears the crown gates,
-    it marks the crown as empty and submits fallback weights to the local
-    validator UID unless overridden.
+    it marks the crown as empty and submits fallback weights to the shared
+    no-winner fallback UID unless overridden.
     """
     if not is_single_eval_mode() or os.environ.get("QUASAR_RESCORING_REVALIDATE_KING", "1") == "0":
         return {"changed": False, "reason": "disabled"}

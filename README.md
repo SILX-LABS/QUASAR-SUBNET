@@ -203,11 +203,13 @@ operators run the same gates and no-winner behavior:
 SINGLE_EVAL_MIN_CROWN_QUALITY=0.06
 SINGLE_EVAL_MIN_CROWN_QUALITY_AXES=4
 QUASAR_RESCORING_REVALIDATE_KING=1
+QUASAR_NO_WINNER_FALLBACK_UID=155
 QUASAR_NO_WINNER_FALLBACK_TO_VALIDATOR_UID=0
 ```
 
-Do not set `QUASAR_RESCORING_FALLBACK_UID` unless an explicit recovery target
-is announced.
+All validators should use the same no-winner fallback UID so vTrust stays
+aligned while emissions are withheld from unsafe submissions. Do not set
+`QUASAR_RESCORING_FALLBACK_UID` unless an explicit recovery target is announced.
 
 ## Disqualification
 

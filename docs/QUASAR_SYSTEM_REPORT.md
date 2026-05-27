@@ -132,12 +132,15 @@ SINGLE_EVAL_MODE=1
 SINGLE_EVAL_MIN_CROWN_QUALITY=0.06
 SINGLE_EVAL_MIN_CROWN_QUALITY_AXES=4
 QUASAR_RESCORING_REVALIDATE_KING=1
+QUASAR_NO_WINNER_FALLBACK_UID=155
 QUASAR_NO_WINNER_FALLBACK_TO_VALIDATOR_UID=0
 USE_VLLM=1
 ```
 
 Validators should pin the crown-policy variables above during this rollout so
-all operators run the same gates and no-winner behavior.
+all operators run the same gates and no-winner behavior. The no-winner fallback
+UID must be shared across validators so vTrust does not split when no model
+clears the current gates.
 `QUASAR_RESCORING_FALLBACK_UID` is a recovery override only and should stay
 unset unless a specific fallback target is announced.
 
