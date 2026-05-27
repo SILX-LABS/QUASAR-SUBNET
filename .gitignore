@@ -53,3 +53,4 @@ miner/train_hippius_distill.py
 *.remote
 train_quasar3b_*.py
 scripts/local_eval_vllm_concurrent.py
+scripts/generate_quasar_distill_data.py
