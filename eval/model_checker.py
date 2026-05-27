@@ -372,7 +372,33 @@ def register_content_hash(
     f.write_text(json.dumps(hashes, indent=2))
 
 
-def compute_content_hash(model_repo: str, revision: str = None, sample_tensors: int = 4) -> Optional[str]:
+_CONTENT_HASH_SMALL_TARGETS = (
+    # Quasar training commonly moves these small MoE control tensors even when
+    # base embedding/norm tensors stay byte-identical.
+    "model.all_moe_bias",
+    "model.all_moe_momentum",
+    "model.all_moe_max_vio",
+)
+
+_CONTENT_HASH_LARGE_TARGETS = (
+    "model.layers.0.ffn.down.weight",
+    "model.layers.0.ffn.gate.weight",
+    "model.layers.0.ffn.up.weight",
+    "model.layers.1.ffn.down.weight",
+    "model.layers.1.ffn.gate.weight",
+    "model.layers.1.ffn.up.weight",
+    # Legacy/non-Quasar naming fallback.
+    "model.layers.0.mlp.down_proj.weight",
+)
+
+_CONTENT_HASH_STABLE_TARGETS = (
+    "model.embed_tokens.weight",
+    "model.layers.0.input_layernorm.weight",
+    "model.norm.weight",
+)
+
+
+def compute_content_hash(model_repo: str, revision: str = None, sample_tensors: int = 6) -> Optional[str]:
     """
     Shard-invariant content hash from the raw bytes of a few specific tensors.
 
@@ -381,11 +407,10 @@ def compute_content_hash(model_repo: str, revision: str = None, sample_tensors: 
     This hashes the bytes of a fixed set of named tensors, so it catches
     re-sharded copies that slip past compute_model_hash.
 
-    Samples these tensors when present:
-      - model.embed_tokens.weight
-      - model.layers.0.input_layernorm.weight
-      - model.layers.0.mlp.down_proj.weight
-      - model.norm.weight
+    Samples train-sensitive Quasar tensors first, then stable fallback tensors:
+      - model.all_moe_bias / momentum / max_vio
+      - early model.layers.*.ffn.* weights
+      - embedding / norm fallback tensors
     Returns hex digest or None if unavailable.
     """
     import struct
@@ -397,12 +422,13 @@ def compute_content_hash(model_repo: str, revision: str = None, sample_tensors: 
         )
         if not st_files:
             return None
-        targets = {
-            "model.embed_tokens.weight",
-            "model.layers.0.input_layernorm.weight",
-            "model.layers.0.mlp.down_proj.weight",
-            "model.norm.weight",
-        }
+        sample_tensors = max(1, int(sample_tensors or 1))
+        large_targets = _CONTENT_HASH_LARGE_TARGETS[:sample_tensors]
+        targets = set(
+            _CONTENT_HASH_SMALL_TARGETS
+            + tuple(large_targets)
+            + _CONTENT_HASH_STABLE_TARGETS
+        )
         tensor_hashes = []
         with _requests.Session() as session:
             session.headers.update({'Accept-Encoding': 'identity'})
