@@ -197,10 +197,14 @@ def _round_model_map(round_state):
 
 
 def _completed_uids_from_pod(round_state, pod_progress):
+    return {int(uid) for uid in _completed_by_uid_from_pod(round_state, pod_progress).keys()}
+
+
+def _completed_by_uid_from_pod(round_state, pod_progress):
     if not isinstance(pod_progress, dict):
-        return set()
+        return {}
     repo_to_uid = {repo: uid for uid, repo in _round_model_map(round_state).items()}
-    completed = set()
+    completed = {}
     for item in pod_progress.get("completed") or []:
         if not isinstance(item, dict):
             continue
@@ -209,9 +213,10 @@ def _completed_uids_from_pod(round_state, pod_progress):
         if uid is None:
             continue
         try:
-            completed.add(int(uid))
+            uid_int = int(uid)
         except (TypeError, ValueError):
             continue
+        completed[str(uid_int)] = item
     return completed
 
 
@@ -253,7 +258,9 @@ def _augment_progress_with_pod(progress, round_state):
     if isinstance(completed, list) and completed:
         augmented.setdefault("completed", completed)
         augmented["pod_completed"] = completed
-        augmented["completed_uids"] = sorted(_completed_uids_from_pod(round_state, pod_progress))
+        completed_by_uid = _completed_by_uid_from_pod(round_state, pod_progress)
+        augmented["completed_by_uid"] = completed_by_uid
+        augmented["completed_uids"] = sorted(int(uid) for uid in completed_by_uid.keys())
     if pod_progress.get("students_total") is not None:
         augmented.setdefault("students_total", pod_progress.get("students_total"))
     return augmented
@@ -1095,6 +1102,7 @@ def _submission_rows(commitments, history_rows, king_uid, progress):
             completed_uids.add(int(item))
         except (TypeError, ValueError):
             continue
+    completed_by_uid = progress.get("completed_by_uid") if isinstance(progress.get("completed_by_uid"), dict) else {}
     waiting_activation = (
         bool(progress.get("active"))
         and (progress.get("phase") or progress.get("stage")) == "waiting_for_coordination_activation"
@@ -1113,6 +1121,8 @@ def _submission_rows(commitments, history_rows, king_uid, progress):
         has_legacy_score = uid_str in scored
         was_tested = uid_str in tested or uid in recent
         seen = has_composite or has_legacy_score or was_tested
+        completed_entry = completed_by_uid.get(uid_str)
+        completed_score = completed_entry.get("kl") if isinstance(completed_entry, dict) else None
         if uid == king_uid:
             status = "king"
             label = "KING"
@@ -1121,12 +1131,21 @@ def _submission_rows(commitments, history_rows, king_uid, progress):
             status = "disqualified"
             label = "DQ"
             detail = str(reason)
-        elif uid in completed_uids and waiting_activation:
-            status = "evaluated"
-            label = "WAITING"
-            detail = "Evaluated in the current round; result will apply at activation."
-            if activation_block:
-                detail += f" Activation block: {activation_block}."
+        elif completed_entry or uid in completed_uids:
+            status = "scored" if completed_score is not None else "evaluated"
+            label = "SCORED" if completed_score is not None else "WAITING"
+            detail = "Evaluated in the current round."
+            if completed_score is not None:
+                try:
+                    detail += f" KL={float(completed_score):.6f}."
+                except (TypeError, ValueError):
+                    pass
+            if waiting_activation:
+                detail += " Result will apply at activation."
+                if activation_block:
+                    detail += f" Activation block: {activation_block}."
+            else:
+                detail += " Waiting for the rest of the round."
         elif uid in scheduled:
             status = "scheduled"
             label = "SCHEDULED"
@@ -1147,7 +1166,7 @@ def _submission_rows(commitments, history_rows, king_uid, progress):
             "status": status,
             "status_label": label,
             "status_detail": detail,
-            "score": score_map.get(uid_str),
+            "score": completed_score if completed_score is not None else score_map.get(uid_str),
             "composite": comp,
             "composite_weighted": comp.get("weighted") if comp else None,
             "composite_worst": comp.get("worst") if comp else None,

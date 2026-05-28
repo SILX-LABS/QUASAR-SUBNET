@@ -1273,7 +1273,6 @@ function repoLink(repo) {
 }
 function modelLabel(uid, repo) {
     if (repo) return repo;
-    if (Number(uid)===155) return "Owner validator (not a model)";
     if (uid!=null) return "UID "+uid+" (no public repo)";
     return "--";
 }
@@ -1628,19 +1627,26 @@ function renderLeader(d) {
 /* ═══════════════════ RENDER: EVALUATIONS ═══════════════════ */
 function buildEvalRows(d) {
     var hist=d.history||[];
-    var q=d.submissions||d.queue||[];
+    var roundQ=d.queue||[];
+    var q=d.submissions||roundQ||[];
     var rows=[];
     var seen={};
     var currentByUid={};
+    var currentRoundByUid={};
 
     for(var qi=0;qi<q.length;qi++){
         if(q[qi].uid!=null) currentByUid[q[qi].uid]=q[qi];
+    }
+    for(var ri=0;ri<roundQ.length;ri++){
+        if(roundQ[ri].uid!=null) currentRoundByUid[roundQ[ri].uid]=roundQ[ri];
     }
 
     for(var i=0;i<hist.length;i++){
         var h=hist[i];
         var current=h.uid!=null?currentByUid[h.uid]:null;
         if(current&&current.hf_repo&&current.hf_repo!==h.challenger_repo) continue;
+        var activeRound=h.uid!=null?currentRoundByUid[h.uid]:null;
+        if(activeRound&&activeRound.hf_repo===h.challenger_repo&&["scheduled","scored","evaluated"].indexOf(activeRound.status)>=0) continue;
         var isDq=h.verdict==="error"||!!h.error_code;
         var isAccepted=!!h.accepted;
         var st=isDq?"dq":(isAccepted?"accepted":"scored");
@@ -1684,6 +1690,8 @@ function buildEvalRows(d) {
 
     for(var i=0;i<q.length;i++){
         var e=q[i];
+        var active=e.uid!=null?currentRoundByUid[e.uid]:null;
+        if(active&&active.hf_repo===e.hf_repo) e=Object.assign({},e,active);
         if(e.uid!=null&&seen[e.uid]) continue;
         var qst=e.status||"pending";
         if(qst==="disqualified") qst="dq";

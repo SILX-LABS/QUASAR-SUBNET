@@ -10,6 +10,7 @@ sys.path.insert(0, str(REPO_ROOT))
 sys.path.insert(0, str(REPO_ROOT / "api"))
 
 from api.state_store import normalize_eval_progress
+from api.routes import dashboard as dashboard_route
 from api.routes.dashboard import _current_eval, _current_round_queue, _dashboard_status
 
 
@@ -72,3 +73,40 @@ def test_dashboard_queue_empty_when_no_round_active():
     progress = {"active": False, "eval_order": [{"uid": 2}]}
 
     assert _current_round_queue(submissions, progress) == []
+
+
+def test_completed_current_round_row_shows_live_score(monkeypatch):
+    monkeypatch.setattr(dashboard_route, "composite_scores", lambda: {})
+    monkeypatch.setattr(dashboard_route, "scores", lambda: {})
+    monkeypatch.setattr(dashboard_route, "rounds_tested_against_king", lambda: {})
+    monkeypatch.setattr(dashboard_route, "disqualified", lambda: {})
+
+    rows = dashboard_route._submission_rows(
+        {
+            109: {
+                "model": "weedyweed/quasar-20500",
+                "hotkey": "5EC5",
+                "block": 8276752,
+            }
+        },
+        [],
+        None,
+        {
+            "active": True,
+            "phase": "scoring",
+            "challenger_uids": [109],
+            "completed_uids": [109],
+            "completed_by_uid": {
+                "109": {
+                    "student_name": "weedyweed/quasar-20500",
+                    "status": "scored",
+                    "kl": 3.784015,
+                }
+            },
+        },
+    )
+
+    assert rows[0]["status"] == "scored"
+    assert rows[0]["status_label"] == "SCORED"
+    assert rows[0]["score"] == 3.784015
+    assert "Waiting for the rest of the round" in rows[0]["status_detail"]

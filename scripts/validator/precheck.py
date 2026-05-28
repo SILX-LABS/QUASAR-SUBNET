@@ -1,6 +1,9 @@
 import json
 import logging
 import math
+import multiprocessing as mp
+import os
+import queue
 import re
 import time
 
@@ -28,6 +31,60 @@ from scripts.validator.config import ACTIVATION_COPY_THRESHOLD, MAX_KL_THRESHOLD
 from scripts.validator.single_eval import is_single_eval_mode
 
 logger = logging.getLogger("quasar.validator")
+
+
+class PrecheckCallTimeout(TimeoutError):
+    pass
+
+
+def _precheck_call_worker(module_name: str, function_name: str, args: tuple, out):
+    try:
+        import importlib
+
+        fn = getattr(importlib.import_module(module_name), function_name)
+        out.put(("ok", fn(*args)))
+    except BaseException as exc:
+        out.put(("error", f"{type(exc).__name__}: {exc}"))
+
+
+def _precheck_timeout_seconds() -> int:
+    try:
+        return max(0, int(os.environ.get("QUASAR_PRECHECK_CALL_TIMEOUT", "120")))
+    except (TypeError, ValueError):
+        return 120
+
+
+def _call_precheck_bounded(label: str, fn, *args):
+    timeout_s = _precheck_timeout_seconds()
+    if timeout_s <= 0:
+        return fn(*args)
+
+    ctx = mp.get_context("fork")
+    out = ctx.Queue(maxsize=1)
+    proc = ctx.Process(
+        target=_precheck_call_worker,
+        args=(fn.__module__, fn.__name__, args, out),
+        daemon=True,
+    )
+    proc.start()
+    proc.join(timeout_s)
+    if proc.is_alive():
+        proc.terminate()
+        proc.join(5)
+        if proc.is_alive():
+            proc.kill()
+            proc.join(5)
+        raise PrecheckCallTimeout(f"{label} timed out after {timeout_s}s")
+
+    try:
+        status, payload = out.get_nowait()
+    except queue.Empty:
+        if proc.exitcode == 0:
+            return None
+        raise RuntimeError(f"{label} exited without result (exit={proc.exitcode})")
+    if status == "error":
+        raise RuntimeError(payload)
+    return payload
 
 
 def _commit_sort_key(uid: int, commitments: dict) -> tuple[float, int]:
@@ -475,7 +532,18 @@ def precheck_all_models(commitments, uid_to_hotkey, uid_to_coldkey, state: Valid
                 reset_failures(uid, state.failures)
                 _needs_full_check = True
             if not _needs_full_check:
-                integrity = verify_model_integrity(model_repo, revision, expected_hash)
+                try:
+                    integrity = _call_precheck_bounded(
+                        "integrity check", verify_model_integrity, model_repo, revision, expected_hash
+                    )
+                except PrecheckCallTimeout as exc:
+                    logger.info(f"UID {uid} integrity: TRANSIENT ERROR — {exc}, will retry")
+                    precheck_errors[uid] = f"integrity transient: {exc}"
+                    continue
+                except Exception as exc:
+                    logger.info(f"UID {uid} integrity: TRANSIENT ERROR — {exc}, will retry")
+                    precheck_errors[uid] = f"integrity transient: {exc}"
+                    continue
                 if integrity.get("transient"):
                     logger.info(f"UID {uid} integrity: TRANSIENT ERROR — {integrity['reason']}, will retry")
                     precheck_errors[uid] = f"integrity transient: {integrity['reason']}"
@@ -503,7 +571,18 @@ def precheck_all_models(commitments, uid_to_hotkey, uid_to_coldkey, state: Valid
         flag_reason = is_flagged(coldkey=coldkey, hf_username=hf_user, dq=state.dq_reasons)
         if flag_reason:
             logger.warning(f"UID {uid} FLAGGED: {flag_reason}")
-        check = check_model_architecture(model_repo, revision, max_params_b)
+        try:
+            check = _call_precheck_bounded(
+                "architecture check", check_model_architecture, model_repo, revision, max_params_b
+            )
+        except PrecheckCallTimeout as exc:
+            logger.info(f"UID {uid} ({model_repo}): TRANSIENT ERROR — {exc}, will retry next epoch")
+            precheck_errors[uid] = f"arch transient: {exc}"
+            continue
+        except Exception as exc:
+            logger.info(f"UID {uid} ({model_repo}): TRANSIENT ERROR — {exc}, will retry next epoch")
+            precheck_errors[uid] = f"arch transient: {exc}"
+            continue
         if check.get("transient"):
             logger.info(f"UID {uid} ({model_repo}): TRANSIENT ERROR — {check['reason']}, will retry next epoch")
             precheck_errors[uid] = f"arch transient: {check['reason']}"
@@ -514,7 +593,20 @@ def precheck_all_models(commitments, uid_to_hotkey, uid_to_coldkey, state: Valid
             disqualify(hotkey, f"arch: {check['reason']}", state.dq_reasons, coldkey=coldkey, hf_username=hf_user, commit_block=this_commit_block)
             disqualified.add(uid)
             continue
-        model_hash = compute_model_hash(model_repo, revision)
+        try:
+            model_hash = _call_precheck_bounded(
+                "weight hash", compute_model_hash, model_repo, revision
+            )
+        except PrecheckCallTimeout as exc:
+            reason = f"weight hash transient: {exc}"
+            logger.info(f"UID {uid} ({model_repo}): PRECHECK ERROR — {reason}")
+            precheck_errors[uid] = reason
+            continue
+        except Exception as exc:
+            reason = f"weight hash transient: {exc}"
+            logger.info(f"UID {uid} ({model_repo}): PRECHECK ERROR — {reason}")
+            precheck_errors[uid] = reason
+            continue
         if not model_hash:
             reason = "weight hash unavailable after architecture check"
             logger.info(f"UID {uid} ({model_repo}): PRECHECK ERROR — {reason}")
@@ -541,7 +633,20 @@ def precheck_all_models(commitments, uid_to_hotkey, uid_to_coldkey, state: Valid
             register_model_hash(model_hash, uid, state.state_dir)
         # Shard-invariant content hash — catches re-sharded copies that slip
         # past compute_model_hash (aizaysi's wind77/third ↔ pure-iron-6291 case).
-        content_hash = compute_content_hash(model_repo, revision)
+        try:
+            content_hash = _call_precheck_bounded(
+                "content hash", compute_content_hash, model_repo, revision
+            )
+        except PrecheckCallTimeout as exc:
+            reason = f"content hash transient: {exc}"
+            logger.info(f"UID {uid} ({model_repo}): PRECHECK ERROR — {reason}")
+            precheck_errors[uid] = reason
+            continue
+        except Exception as exc:
+            reason = f"content hash transient: {exc}"
+            logger.info(f"UID {uid} ({model_repo}): PRECHECK ERROR — {reason}")
+            precheck_errors[uid] = reason
+            continue
         if not content_hash:
             reason = "content hash unavailable after architecture check"
             logger.info(f"UID {uid} ({model_repo}): PRECHECK ERROR — {reason}")
@@ -587,7 +692,18 @@ def precheck_all_models(commitments, uid_to_hotkey, uid_to_coldkey, state: Valid
             state.evaluated_uids.discard(str(uid))
             state.scores.pop(str(uid), None)
             reset_failures(uid, state.failures)
-        integrity = verify_model_integrity(model_repo, revision, expected_hash)
+        try:
+            integrity = _call_precheck_bounded(
+                "integrity check", verify_model_integrity, model_repo, revision, expected_hash
+            )
+        except PrecheckCallTimeout as exc:
+            logger.info(f"UID {uid} integrity: TRANSIENT ERROR — {exc}, will retry")
+            precheck_errors[uid] = f"integrity transient: {exc}"
+            continue
+        except Exception as exc:
+            logger.info(f"UID {uid} integrity: TRANSIENT ERROR — {exc}, will retry")
+            precheck_errors[uid] = f"integrity transient: {exc}"
+            continue
         if integrity.get("transient"):
             logger.info(f"UID {uid} integrity: TRANSIENT ERROR — {integrity['reason']}, will retry")
             precheck_errors[uid] = f"integrity transient: {integrity['reason']}"

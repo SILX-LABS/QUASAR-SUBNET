@@ -372,7 +372,7 @@ def register_content_hash(
     f.write_text(json.dumps(hashes, indent=2))
 
 
-_CONTENT_HASH_SMALL_TARGETS = (
+_CONTENT_HASH_CONTROL_TARGETS = (
     # Quasar training commonly moves these small MoE control tensors even when
     # base embedding/norm tensors stay byte-identical.
     "model.all_moe_bias",
@@ -380,25 +380,65 @@ _CONTENT_HASH_SMALL_TARGETS = (
     "model.all_moe_max_vio",
 )
 
-_CONTENT_HASH_LARGE_TARGETS = (
+_CONTENT_HASH_TRAIN_TARGETS = (
+    # Dense early blocks.
     "model.layers.0.ffn.down.weight",
     "model.layers.0.ffn.gate.weight",
     "model.layers.0.ffn.up.weight",
     "model.layers.1.ffn.down.weight",
     "model.layers.1.ffn.gate.weight",
     "model.layers.1.ffn.up.weight",
-    # Legacy/non-Quasar naming fallback.
-    "model.layers.0.mlp.down_proj.weight",
+    # Spread across later MoE blocks so the content hash is not dominated by
+    # early tensors that may stay frozen during continued training.
+    "model.layers.4.ffn.experts_w12",
+    "model.layers.4.ffn.experts_w3",
+    "model.layers.4.ffn.router.router_weights",
+    "model.layers.4.ffn.shared_experts.0.down.weight",
+    "model.layers.4.ffn.w_down_proj.weight",
+    "model.layers.10.ffn.experts_w12",
+    "model.layers.10.ffn.experts_w3",
+    "model.layers.10.ffn.router.router_weights",
+    "model.layers.10.ffn.shared_experts.0.gate.weight",
+    "model.layers.10.ffn.w_up_proj.weight",
+    "model.layers.16.ffn.experts_w12",
+    "model.layers.16.ffn.experts_w3",
+    "model.layers.16.ffn.router.router_weights",
+    "model.layers.16.ffn.shared_experts.0.up.weight",
+    "model.layers.16.ffn.w_down_proj.weight",
+    "model.layers.22.ffn.experts_w12",
+    "model.layers.22.ffn.experts_w3",
+    "model.layers.22.ffn.router.router_weights",
+    "model.layers.22.ffn.w_up_proj.weight",
 )
 
 _CONTENT_HASH_STABLE_TARGETS = (
     "model.embed_tokens.weight",
-    "model.layers.0.input_layernorm.weight",
+    "model.embed_norm.weight",
+    "model.layers.0.ln1.weight",
+    "model.layers.0.ln2.weight",
     "model.norm.weight",
 )
 
+_CONTENT_HASH_MIN_SENSITIVE_TARGETS = 4
 
-def compute_content_hash(model_repo: str, revision: str = None, sample_tensors: int = 6) -> Optional[str]:
+
+def _content_hash_sensitive_targets(sample_tensors: int = 16) -> set[str]:
+    sample_tensors = max(1, int(sample_tensors or 1))
+    return set(
+        _CONTENT_HASH_CONTROL_TARGETS
+        + _CONTENT_HASH_TRAIN_TARGETS[:sample_tensors]
+    )
+
+
+def _content_hash_has_enough_sensitive_targets(
+    found_targets: set[str], sample_tensors: int = 16
+) -> bool:
+    sensitive_targets = _content_hash_sensitive_targets(sample_tensors)
+    min_sensitive = min(_CONTENT_HASH_MIN_SENSITIVE_TARGETS, len(sensitive_targets))
+    return len(set(found_targets) & sensitive_targets) >= min_sensitive
+
+
+def compute_content_hash(model_repo: str, revision: str = None, sample_tensors: int = 16) -> Optional[str]:
     """
     Shard-invariant content hash from the raw bytes of a few specific tensors.
 
@@ -409,8 +449,12 @@ def compute_content_hash(model_repo: str, revision: str = None, sample_tensors: 
 
     Samples train-sensitive Quasar tensors first, then stable fallback tensors:
       - model.all_moe_bias / momentum / max_vio
-      - early model.layers.*.ffn.* weights
+      - dense early ffn tensors and later MoE router/expert tensors
       - embedding / norm fallback tensors
+
+    Stable fallback tensors add entropy but are not enough by themselves. If
+    too few train-sensitive tensors are found, returns None so precheck does
+    not disqualify distinct fine-tunes that merely share frozen base tensors.
     Returns hex digest or None if unavailable.
     """
     import struct
@@ -423,13 +467,15 @@ def compute_content_hash(model_repo: str, revision: str = None, sample_tensors: 
         if not st_files:
             return None
         sample_tensors = max(1, int(sample_tensors or 1))
-        large_targets = _CONTENT_HASH_LARGE_TARGETS[:sample_tensors]
+        train_targets = _CONTENT_HASH_TRAIN_TARGETS[:sample_tensors]
+        sensitive_targets = _content_hash_sensitive_targets(sample_tensors)
         targets = set(
-            _CONTENT_HASH_SMALL_TARGETS
-            + tuple(large_targets)
+            _CONTENT_HASH_CONTROL_TARGETS
+            + tuple(train_targets)
             + _CONTENT_HASH_STABLE_TARGETS
         )
         tensor_hashes = []
+        sensitive_found = set()
         with _requests.Session() as session:
             session.headers.update({'Accept-Encoding': 'identity'})
             for fname in st_files:
@@ -472,8 +518,17 @@ def compute_content_hash(model_repo: str, revision: str = None, sample_tensors: 
                         continue
                     th = hashlib.sha256(data).hexdigest()
                     tensor_hashes.append(f"{tname}:{th}")
+                    if tname in sensitive_targets:
+                        sensitive_found.add(tname)
                     targets.discard(tname)
         if not tensor_hashes:
+            return None
+        if not _content_hash_has_enough_sensitive_targets(sensitive_found, sample_tensors):
+            min_sensitive = min(_CONTENT_HASH_MIN_SENSITIVE_TARGETS, len(sensitive_targets))
+            logger.warning(
+                f"Content hash skipped for {model_repo}: found only "
+                f"{len(sensitive_found)}/{min_sensitive} train-sensitive target tensors"
+            )
             return None
         tensor_hashes.sort()
         return hashlib.sha256("\n".join(tensor_hashes).encode()).hexdigest()

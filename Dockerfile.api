@@ -22,6 +22,7 @@ COPY config ./config
 COPY eval ./eval
 COPY scripts/validator/__init__.py ./scripts/validator/__init__.py
 COPY scripts/validator/composite.py ./scripts/validator/composite.py
+COPY scripts/validator/policy.py ./scripts/validator/policy.py
 COPY scripts/validator/single_eval.py ./scripts/validator/single_eval.py
 
 RUN mkdir -p /app/state

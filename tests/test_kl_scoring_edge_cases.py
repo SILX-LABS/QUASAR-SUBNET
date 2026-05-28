@@ -370,6 +370,33 @@ class TestModelChecker(unittest.TestCase):
         import shutil
         shutil.rmtree(tmpdir, ignore_errors=True)
 
+    def test_content_hash_targets_are_quasar_native(self):
+        """Content hash should use real Quasar tensor names and ignore stable-only matches."""
+        from eval import model_checker
+
+        all_targets = (
+            model_checker._CONTENT_HASH_CONTROL_TARGETS
+            + model_checker._CONTENT_HASH_TRAIN_TARGETS
+            + model_checker._CONTENT_HASH_STABLE_TARGETS
+        )
+
+        self.assertNotIn("model.layers.0.input_layernorm.weight", all_targets)
+        self.assertFalse(any(".mlp." in name for name in all_targets))
+        self.assertIn("model.layers.4.ffn.router.router_weights", all_targets)
+        self.assertIn("model.layers.22.ffn.experts_w12", all_targets)
+
+        stable_only = set(model_checker._CONTENT_HASH_STABLE_TARGETS)
+        self.assertFalse(
+            model_checker._content_hash_has_enough_sensitive_targets(stable_only)
+        )
+        sensitive = set(model_checker._CONTENT_HASH_CONTROL_TARGETS) | {
+            "model.layers.0.ffn.down.weight",
+            "model.layers.4.ffn.router.router_weights",
+        }
+        self.assertTrue(
+            model_checker._content_hash_has_enough_sensitive_targets(sensitive)
+        )
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # Dataset / Prompt Sampling Tests
 # ═══════════════════════════════════════════════════════════════════════════════
