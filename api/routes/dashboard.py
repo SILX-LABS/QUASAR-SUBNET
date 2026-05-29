@@ -19,6 +19,7 @@ from scripts.validator.single_eval import (
     SINGLE_EVAL_MIN_CROWN_QUALITY_AXES,
     composite_crown_quality_detail,
 )
+from eval.runtime import MAX_KL_THRESHOLD
 from state_store import (
     composite_scores,
     current_round,
@@ -244,6 +245,16 @@ def _composite_summary(comp):
         "crown_quality_pass": crown_quality_pass,
         "crown_quality_excluded_axes": sorted(CROWN_QUALITY_EXCLUDED_AXES),
     }
+
+
+def _real_legacy_score(value):
+    try:
+        score = float(value)
+    except (TypeError, ValueError):
+        return None
+    if score <= 0 or score > MAX_KL_THRESHOLD:
+        return None
+    return score
 
 
 def _augment_progress_with_pod(progress, round_state):
@@ -1118,7 +1129,8 @@ def _submission_rows(commitments, history_rows, king_uid, progress):
         uid_str = str(uid)
         comp = _composite_summary(composites.get(uid_str))
         has_composite = bool(comp)
-        has_legacy_score = uid_str in scored
+        legacy_score = _real_legacy_score(score_map.get(uid_str))
+        has_legacy_score = legacy_score is not None
         was_tested = uid_str in tested or uid in recent
         seen = has_composite or has_legacy_score or was_tested
         completed_entry = completed_by_uid.get(uid_str)
@@ -1166,7 +1178,8 @@ def _submission_rows(commitments, history_rows, king_uid, progress):
             "status": status,
             "status_label": label,
             "status_detail": detail,
-            "score": completed_score if completed_score is not None else score_map.get(uid_str),
+            "score": completed_score if completed_score is not None else legacy_score,
+            "score_is_placeholder": uid_str in scored and legacy_score is None,
             "composite": comp,
             "composite_weighted": comp.get("weighted") if comp else None,
             "composite_worst": comp.get("worst") if comp else None,
@@ -1418,6 +1431,12 @@ def get_dashboard_json():
     )
     status = _dashboard_status(progress, current_eval, latest, consensus_king, submissions)
     payload = {
+        "policy": {
+            "max_kl_threshold": MAX_KL_THRESHOLD,
+            "crown_quality_floor": SINGLE_EVAL_MIN_CROWN_QUALITY,
+            "crown_quality_min_axes": SINGLE_EVAL_MIN_CROWN_QUALITY_AXES,
+            "crown_quality_excluded_axes": sorted(CROWN_QUALITY_EXCLUDED_AXES),
+        },
         "market": market,
         "king": {
             "uid": king_uid,

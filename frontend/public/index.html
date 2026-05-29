@@ -1313,14 +1313,22 @@ function formatComposite(v) {
     var n = numberOrNull(v);
     return n != null ? n.toFixed(3) : "--";
 }
+function dashboardPolicy() {
+    return (_data && _data.policy) ? _data.policy : {};
+}
+function policyCrownFloor(row) {
+    var policyFloor = numberOrNull(dashboardPolicy().crown_quality_floor);
+    if (policyFloor != null) return policyFloor;
+    var rowFloor = numberOrNull(row && row.crown_quality_floor);
+    return rowFloor != null ? rowFloor : 0.2;
+}
 function crownQualityPass(row) {
     if (typeof row.crown_quality_pass === "boolean") return row.crown_quality_pass;
     var q = numberOrNull(row.crown_quality);
     if (q == null) return null;
-    var floor = numberOrNull(row.crown_quality_floor);
+    var floor = policyCrownFloor(row);
     var axes = numberOrNull(row.crown_quality_axes);
     var minAxes = numberOrNull(row.crown_quality_min_axes);
-    if (floor == null) floor = 0.2;
     if (minAxes == null) minAxes = 4;
     return q + 1e-12 >= floor && (axes == null || axes >= minAxes);
 }
@@ -1330,7 +1338,7 @@ function isGateFail(row) {
 function crownGateCell(row) {
     var q = numberOrNull(row.crown_quality);
     if (q == null) return "--";
-    var floor = numberOrNull(row.crown_quality_floor);
+    var floor = policyCrownFloor(row);
     var pass = crownQualityPass(row);
     var cls = pass === true ? "gate-pass" : pass === false ? "gate-fail" : "gate-muted";
     var label = pass === true ? "PASS" : pass === false ? "FAIL" : "CHECK";
@@ -1339,7 +1347,7 @@ function crownGateCell(row) {
 function crownQualityTableCell(row) {
     var q = numberOrNull(row.crown_quality);
     if (q == null || row.status === "dq") return "--";
-    var floor = numberOrNull(row.crown_quality_floor);
+    var floor = policyCrownFloor(row);
     var pass = crownQualityPass(row);
     var cls = pass === true ? "delta-good" : pass === false ? "delta-bad" : "delta-flat";
     return '<span class="'+cls+'">'+formatComposite(q)+'</span>'+(floor!=null?'<span class="submetric">/ '+formatComposite(floor)+'</span>':'');
@@ -1698,7 +1706,7 @@ function buildEvalRows(d) {
         else if(qst==="king") qst="accepted";
         else if(["scored","evaluated","scheduled","valid"].indexOf(qst)===-1) qst="pending";
         var qScore = numberOrNull(e.score);
-        if(qst==="valid" && qScore != null) qst="scored";
+        if(qst==="valid") qScore = null;
         var qComp = e.composite || {};
         rows.push({
             uid:e.uid,
@@ -1895,7 +1903,7 @@ function openEvalDrawer(row) {
     if(row.selection || row.gate){
         html+='<div class="reason-box"><strong>Decision detail</strong>'+esc(row.selection || row.gate)+'</div>';
     }
-    html+='<div class="reason-box info-box"><strong>Score rule</strong>Crown Quality must clear '+esc(formatComposite(row.crown_quality_floor!=null?row.crown_quality_floor:0.2))+' on non-relative quality axes. Weighted Composite is telemetry and still includes '+esc(exAxes.join(", ") || "kl, on_policy_rkl")+'.</div>';
+    html+='<div class="reason-box info-box"><strong>Score rule</strong>Crown Quality must clear '+esc(formatComposite(policyCrownFloor(row)))+' on non-relative quality axes. Weighted Composite is telemetry and still includes '+esc(exAxes.join(", ") || "kl, on_policy_rkl")+'.</div>';
     var axesText = compactAxes(row.composite, row);
     if(axesText){
         html+='<div class="reason-box info-box"><strong>Axis scores</strong>'+esc(axesText)+'</div>';
