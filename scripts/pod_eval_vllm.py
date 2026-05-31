@@ -195,16 +195,15 @@ def quasar_memory_generate(
     use_cache: bool = True,
     **kwargs,
 ) -> torch.Tensor:
-    """Generate through Quasar's recurrent ``memory_states`` cache.
+    """Generate Quasar text with a correctness-first default.
 
     HF ``generate(use_cache=True)`` currently calls ``Cache.get_seq_length()``
-    on Quasar's linear-attention cache and raises. Quasar itself exposes its
-    usable recurrent state as ``memory_states``. This helper bypasses HF
-    GenerationMixin for single-sample eval probes, carries ``memory_states``
-    manually, and falls back to safe no-cache HF generation if the loaded model
-    does not expose that state.
+    on Quasar's linear-attention cache and raises. Quasar also exposes a
+    ``memory_states`` recurrence, but that rollout is not guaranteed to match
+    full-prefix generation for all checkpoints. Keep it as an opt-in fast path;
+    default to no-cache generation so eval probes match the training objective.
     """
-    cache_enabled = os.environ.get("QUASAR_MEMORY_GENERATE", "1") != "0"
+    cache_enabled = os.environ.get("QUASAR_MEMORY_GENERATE", "0") == "1"
     if not cache_enabled or not use_cache or max_new_tokens <= 0:
         return model.generate(
             input_ids,
@@ -313,8 +312,9 @@ def quasar_memory_generate_batch(
     """Batched deterministic Quasar generation for probe prompts.
 
     The prompt prefill stays unpadded and per-sample so prompt semantics match
-    the old path. The expensive decode loop is batched by stacking Quasar
-    ``memory_states`` and one-token inputs across active samples.
+    the old path. By default this uses no-cache full-prefix generation for
+    correctness. Set ``QUASAR_MEMORY_GENERATE=1`` to opt into the faster
+    recurrent-memory path.
     """
     if not input_ids_list:
         return []
@@ -335,7 +335,7 @@ def quasar_memory_generate_batch(
             for ids in input_ids_list
         ]
 
-    cache_enabled = os.environ.get("QUASAR_MEMORY_GENERATE", "1") != "0"
+    cache_enabled = os.environ.get("QUASAR_MEMORY_GENERATE", "0") == "1"
     if not cache_enabled or not use_cache or max_new_tokens <= 0:
         return [
             model.generate(
