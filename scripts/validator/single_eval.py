@@ -111,6 +111,11 @@ def composite_crown_quality_detail(record: dict | None) -> tuple[float | None, i
     Stored ``composite.weighted`` still includes KL and on-policy RKL. Those
     are useful telemetry, but a model must also clear an absolute quality floor
     on generation/capability/judge/bench axes before it can become king.
+
+    Missing active quality axes count as zero in the numerator while staying in
+    the denominator. That keeps the gate comparable across rounds: a failed or
+    absent judge/bench axis must not silently shrink the denominator and make a
+    partial record look stronger than a fully scored one.
     """
     if not isinstance(record, dict):
         return None, 0
@@ -125,11 +130,17 @@ def composite_crown_quality_detail(record: dict | None) -> tuple[float | None, i
     for axis, weight in weights.items():
         if axis in CROWN_QUALITY_EXCLUDED_AXES or axis in broken:
             continue
+        try:
+            weight_f = float(weight)
+        except (TypeError, ValueError):
+            continue
+        if weight_f <= 0:
+            continue
+        total_weight += weight_f
         val = _as_float(axes.get(axis))
         if val is None:
             continue
-        total_weight += float(weight)
-        weighted_sum += float(weight) * val
+        weighted_sum += weight_f * val
         present += 1
     if total_weight <= 0:
         return None, present
@@ -312,30 +323,35 @@ def merge_composite_scores(
     flipped or not — when the flag eventually flips, the table is already
     populated and the king-by-composite selector has data to work with.
 
-    Returns the number of records updated. DQ rows and reference rows are
-    skipped. Rows with no composite payload are skipped (e.g. probes errored).
+    Returns the number of records updated. Reference rows are skipped. DQ rows
+    are still persisted as explicit ineligible records so a later KL/integrity
+    failure clears any older crown-quality score for the same UID instead of
+    leaving stale dashboard/selection state behind.
     """
     if not isinstance(getattr(state, "composite_scores", None), dict):
         state.composite_scores = {}
     n_updated = 0
     for row in h2h_results or []:
-        if row.get("disqualified") or row.get("is_reference"):
+        if row.get("is_reference"):
             continue
         comp = row.get("composite") or {}
         worst = comp.get("worst")
-        if worst is None:
+        is_dq = bool(row.get("disqualified") or comp.get("disqualified"))
+        if worst is None and not is_dq:
             continue
         uid = row.get("uid")
         if uid is None:
             continue
         uid_str = str(uid)
         info = models_to_eval.get(uid, {}) or {}
+        weighted = comp.get("weighted")
+        axes = dict(comp.get("axes") or {})
         record = {
-            "worst": float(worst),
+            "worst": float(worst) if worst is not None else None,
             "weighted": (
-                float(comp["weighted"]) if comp.get("weighted") is not None else None
+                float(weighted) if weighted is not None else None
             ),
-            "axes": dict(comp.get("axes") or {}),
+            "axes": axes,
             "n_axes": int(comp.get("present_count") or 0),
             "present_count": int(comp.get("present_count") or 0),
             "broken_axes": list(comp.get("broken_axes") or []),
@@ -347,6 +363,17 @@ def merge_composite_scores(
             "axis_spread": comp.get("axis_spread"),
             "bench_vs_rel_gap": comp.get("bench_vs_rel_gap"),
         }
+        quality, quality_axes = composite_crown_quality_detail(record)
+        record["crown_quality"] = (
+            round(float(quality), 6) if quality is not None else None
+        )
+        record["crown_quality_axes"] = int(quality_axes)
+        if is_dq:
+            record["disqualified"] = True
+            record["eligible"] = False
+            record["dq_reason"] = (
+                row.get("dq_reason") or comp.get("dq_reason") or "disqualified"
+            )
         state.composite_scores[uid_str] = record
         n_updated += 1
     if n_updated:
@@ -645,6 +672,12 @@ _KING_SELECTION_MIN_AXES = 12
 #         on_policy_rkl wording-memoriser keep their inflated low-KL
 #         floor under the old grading; the king filter quarantines
 #         old records until regraded under v26.
+#   v30 — bench variance reduction. Live benchmark item budget increases
+#         70 → 90 per round (math/code/reasoning/ifeval/aime/mbpp/tool/
+#         long-context/robustness) so one lucky or missed item moves the
+#         absolute crown-quality gate less. Mixing v29 and v30 records
+#         would compare different sampling budgets, so the king filter
+#         quarantines old records until regraded under v30.
 # Mixing schema versions would let a stale-grader UID inherit the crown via
 # inflated/deflated axis scores. The selector therefore filters to v_current
 # first and only falls through to legacy records when no v_current candidate
@@ -718,6 +751,8 @@ def select_king_by_composite(
                 state, uid, valid_models, state.dq_reasons,
                 uid_to_hotkey, commitments,
             ):
+                continue
+            if rec.get("disqualified") or rec.get("eligible") is False:
                 continue
             if min_version is not None:
                 rec_version = rec.get("version")
@@ -935,17 +970,20 @@ def _seed_one_h2h_round(state, latest: dict) -> int:
     """Seed composite_scores from a single H2H round payload.
 
     Skips any UID already present in ``state.composite_scores`` (older rounds
-    must not overwrite newer data). Returns count of newly seeded records.
+    must not overwrite newer data). DQ rows seed ineligible records too, so a
+    newer disqualification blocks older historical scores for the same UID.
+    Returns count of newly seeded records.
     """
     rows = latest.get("results") or []
     block = latest.get("block")
     seeded = 0
     for row in rows:
-        if row.get("disqualified") or row.get("is_reference"):
+        if row.get("is_reference"):
             continue
         comp = row.get("composite") or {}
         worst = comp.get("worst")
-        if worst is None:
+        is_dq = bool(row.get("disqualified") or comp.get("disqualified"))
+        if worst is None and not is_dq:
             continue
         uid = row.get("uid")
         if uid is None:
@@ -953,13 +991,17 @@ def _seed_one_h2h_round(state, latest: dict) -> int:
         uid_str = str(uid)
         if uid_str in state.composite_scores:
             continue
-        state.composite_scores[uid_str] = {
-            "worst": float(worst),
+        weighted = comp.get("weighted")
+        record = {
+            "worst": float(worst) if worst is not None else None,
             "weighted": (
-                float(comp["weighted"]) if comp.get("weighted") is not None else None
+                float(weighted) if weighted is not None else None
             ),
             "axes": dict(comp.get("axes") or {}),
             "n_axes": int(comp.get("present_count") or 0),
+            "present_count": int(comp.get("present_count") or 0),
+            "broken_axes": list(comp.get("broken_axes") or []),
+            "version": comp.get("version"),
             "model": row.get("model") or "",
             "revision": row.get("revision") or "main",
             "block": block,
@@ -968,6 +1010,18 @@ def _seed_one_h2h_round(state, latest: dict) -> int:
             "bench_vs_rel_gap": comp.get("bench_vs_rel_gap"),
             "_bootstrapped": True,
         }
+        quality, quality_axes = composite_crown_quality_detail(record)
+        record["crown_quality"] = (
+            round(float(quality), 6) if quality is not None else None
+        )
+        record["crown_quality_axes"] = int(quality_axes)
+        if is_dq:
+            record["disqualified"] = True
+            record["eligible"] = False
+            record["dq_reason"] = (
+                row.get("dq_reason") or comp.get("dq_reason") or "disqualified"
+            )
+        state.composite_scores[uid_str] = record
         seeded += 1
     return seeded
 

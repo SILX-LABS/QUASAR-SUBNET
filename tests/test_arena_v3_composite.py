@@ -486,6 +486,43 @@ class TestAnnotateH2HWithPareto(unittest.TestCase):
         self.assertIn("comparable", pareto)
         self.assertGreater(pareto["comparable"], 3)
 
+    def test_disqualified_row_preserves_raw_composite_telemetry(self):
+        from scripts.validator.composite import annotate_h2h_with_composite
+
+        students_data = {
+            "chall/model": _make_student(
+                kl=0.19,
+                rkl=0.07,
+                cap_frac=0.9,
+                bench={"math_bench": 0.75, "code_bench": 0.65,
+                       "reasoning_bench": 0.80, "knowledge_bench": 0.72,
+                       "ifeval_bench": 0.78},
+            ),
+        }
+        h2h = [
+            {
+                "uid": 11,
+                "model": "chall/model",
+                "is_king": False,
+                "kl": 4.5,
+                "disqualified": True,
+                "dq_reason": "quality: KL=4.500000 exceeds max threshold 4.000000",
+            },
+        ]
+
+        annotate_h2h_with_composite(h2h, king_kl=0.2, students_data=students_data)
+
+        comp = h2h[0]["composite"]
+        self.assertTrue(comp["disqualified"])
+        self.assertFalse(comp["eligible"])
+        self.assertEqual(
+            comp["dq_reason"],
+            "quality: KL=4.500000 exceeds max threshold 4.000000",
+        )
+        self.assertIsNotNone(comp["worst"])
+        self.assertIsNotNone(comp["weighted"])
+        self.assertGreater(comp["weighted"], 0.0)
+
 
 class TestAxisSummaryStats(unittest.TestCase):
     """Informational balance scores (2026-04-25, non-gating)."""

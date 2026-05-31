@@ -3042,33 +3042,34 @@ BENCH_BATTERY_SHADOW_AXES = (
 )
 
 # Session 2 per-round sample counts.
-# 2026-04-26 (v28) — quality > quantity rebalance:
-#   * math_bench:      10 → 12 (more depth on the hardest single axis;
-#                                weight bumped 0.12 → 0.14).
-#   * code_bench:       6 →  8 (HumanEval-quality, weight 0.12 → 0.14).
-#   * reasoning_bench: 10 → 10 (BBH MC, kept; weight 0.08 → 0.10).
+# 2026-05-30 (v30) — variance reduction pass after crown-quality went live:
+# raise the live bench budget 70 → 90 items so one lucky/missed item moves the
+# gate less, while keeping total round cost bounded for multi-model rounds.
+#   * math_bench:      12 → 16 (hardest high-weight correctness axis).
+#   * code_bench:       8 → 10 (sandboxed code is noisy but expensive).
+#   * reasoning_bench: 10 → 12 (fresh procedural logic breadth).
 #   * knowledge_bench: 10 →  0 (axis muted; the only signal it carried
 #                                  beyond reasoning_bench was the
 #                                  v27-upgraded arithmetic_mc, which is
 #                                  now better captured by capability +
 #                                  math_bench at no extra wall-time).
-#   * ifeval_bench:    10 →  8 (instruction-following, weight 0.05 → 0.07).
-BENCH_MATH_PER_ROUND = int(os.environ.get("BENCH_MATH_PER_ROUND", "12"))
-BENCH_CODE_PER_ROUND = int(os.environ.get("BENCH_CODE_PER_ROUND", "8"))
-BENCH_REASONING_PER_ROUND = int(os.environ.get("BENCH_REASONING_PER_ROUND", "10"))
+#   * ifeval_bench:     8 → 10 (instruction following has discrete graders).
+BENCH_MATH_PER_ROUND = int(os.environ.get("BENCH_MATH_PER_ROUND", "16"))
+BENCH_CODE_PER_ROUND = int(os.environ.get("BENCH_CODE_PER_ROUND", "10"))
+BENCH_REASONING_PER_ROUND = int(os.environ.get("BENCH_REASONING_PER_ROUND", "12"))
 BENCH_KNOWLEDGE_PER_ROUND = int(os.environ.get("BENCH_KNOWLEDGE_PER_ROUND", "0"))
-BENCH_IFEVAL_PER_ROUND = int(os.environ.get("BENCH_IFEVAL_PER_ROUND", "8"))
+BENCH_IFEVAL_PER_ROUND = int(os.environ.get("BENCH_IFEVAL_PER_ROUND", "10"))
 
 # Session 3 per-round sample counts — quality > quantity rebalance:
-#   * aime_bench:              6 → 8 (olympiad math, weight 0.06 → 0.10).
-#   * mbpp_bench:              6 → 8 (programming breadth, 0.06 → 0.08).
-#   * tool_use_bench:          6 → 6 (agentic Python, 0.04 → 0.06).
+#   * aime_bench:              8 → 10 (olympiad math, high variance).
+#   * mbpp_bench:              8 → 10 (programming breadth).
+#   * tool_use_bench:          6 →  8 (small-N agentic Python axis).
 #   * self_consistency_bench:  6 → 0 (axis muted: same items as
 #                                       math_bench, just majority-voted —
 #                                       no marginal signal).
-BENCH_AIME_PER_ROUND = int(os.environ.get("BENCH_AIME_PER_ROUND", "8"))
-BENCH_MBPP_PER_ROUND = int(os.environ.get("BENCH_MBPP_PER_ROUND", "8"))
-BENCH_TOOL_USE_PER_ROUND = int(os.environ.get("BENCH_TOOL_USE_PER_ROUND", "6"))
+BENCH_AIME_PER_ROUND = int(os.environ.get("BENCH_AIME_PER_ROUND", "10"))
+BENCH_MBPP_PER_ROUND = int(os.environ.get("BENCH_MBPP_PER_ROUND", "10"))
+BENCH_TOOL_USE_PER_ROUND = int(os.environ.get("BENCH_TOOL_USE_PER_ROUND", "8"))
 BENCH_SELF_CONSISTENCY_PER_ROUND = int(os.environ.get("BENCH_SELF_CONSISTENCY_PER_ROUND", "0"))
 BENCH_SELF_CONSISTENCY_SAMPLES = int(os.environ.get("BENCH_SELF_CONSISTENCY_SAMPLES", "5"))
 BENCH_SELF_CONSISTENCY_TEMP = float(os.environ.get("BENCH_SELF_CONSISTENCY_TEMP", "0.7"))
@@ -3080,11 +3081,11 @@ BENCH_ARC_PER_ROUND = int(os.environ.get("BENCH_ARC_PER_ROUND", "0"))
 # Muted in v28 — narrow factuality surface, dominated by refusal-trained
 # heuristics. Kept env-addressable.
 BENCH_TRUTHFUL_PER_ROUND = int(os.environ.get("BENCH_TRUTHFUL_PER_ROUND", "0"))
-# Long-context needle-in-haystack. v28 keeps this axis at small budget
+# Long-context needle-in-haystack. v30 keeps this axis at a modest budget
 # because each item is ~1400 input tokens and the procedural generator
 # is uniquely uncheatable (no static answer key). Composite weight
 # 0.03 → 0.04 reflects renewed importance after the cuts.
-BENCH_LC_PER_ROUND = int(os.environ.get("BENCH_LC_PER_ROUND", "4"))
+BENCH_LC_PER_ROUND = int(os.environ.get("BENCH_LC_PER_ROUND", "6"))
 # Number of distractor "facts" injected before + after the needle. Each
 # fact averages ~30 tokens, so 40 distractors => ~1200 filler tokens +
 # needle + question ≈ 1400 tokens total input.
@@ -3111,11 +3112,9 @@ BENCH_PROCEDURAL_PER_ROUND = int(os.environ.get("BENCH_PROCEDURAL_PER_ROUND", "0
 # wording of public math items will pass math_bench and fail this — the
 # axis directly punishes prompt-pattern memorization without re-evaling
 # anyone. Pure string transforms, no LLM call required.
-# 2026-04-26 (v28) — robustness now absorbs the noise_resistance signal
-# under one umbrella. Per-round count bumped 4 → 6 to keep statistical
-# power across both perturbation families (paraphrase + surface noise),
-# weight 0.04 → 0.07.
-BENCH_ROBUSTNESS_PER_ROUND = int(os.environ.get("BENCH_ROBUSTNESS_PER_ROUND", "6"))
+# 2026-05-30 (v30) — bump 6 → 8 to reduce the impact of one unlucky
+# perturbation while keeping the separate noise axis muted.
+BENCH_ROBUSTNESS_PER_ROUND = int(os.environ.get("BENCH_ROBUSTNESS_PER_ROUND", "8"))
 BENCH_ROBUSTNESS_PERTURB_K = int(os.environ.get("BENCH_ROBUSTNESS_PERTURB_K", "2"))
 # Session 3.7 (added 2026-04-25): noise_resistance_bench. Sibling of
 # ``robustness_bench``; same pool (alias of math) but the perturbations

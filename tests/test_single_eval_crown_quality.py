@@ -43,7 +43,45 @@ def _record(non_relative_value: float, *, weighted: float = 0.0, worst: float = 
     }
 
 
+def _composite_payload(record: dict) -> dict:
+    return {
+        "worst": record.get("worst"),
+        "weighted": record.get("weighted"),
+        "axes": dict(record.get("axes") or {}),
+        "present_count": record.get("present_count"),
+        "broken_axes": list(record.get("broken_axes") or []),
+        "version": record.get("version"),
+        "axis_spread": record.get("axis_spread"),
+        "bench_vs_rel_gap": record.get("bench_vs_rel_gap"),
+    }
+
+
 class TestSingleEvalCrownQuality(unittest.TestCase):
+    def test_missing_quality_axis_counts_as_zero_not_denominator_drop(self):
+        from scripts.validator.composite import active_composite_axis_weights
+        from scripts.validator.single_eval import (
+            CROWN_QUALITY_EXCLUDED_AXES,
+            composite_crown_quality_detail,
+        )
+
+        rec = _record(1.0, weighted=1.0, worst=1.0)
+        full_score, full_present = composite_crown_quality_detail(rec)
+        self.assertAlmostEqual(full_score, 1.0)
+
+        rec["axes"].pop("capability")
+        score, present = composite_crown_quality_detail(rec)
+
+        weights = active_composite_axis_weights()
+        total_quality_weight = sum(
+            float(w)
+            for axis, w in weights.items()
+            if axis not in CROWN_QUALITY_EXCLUDED_AXES
+        )
+        expected = (total_quality_weight - float(weights["capability"])) / total_quality_weight
+        self.assertEqual(present, full_present - 1)
+        self.assertAlmostEqual(score, expected)
+        self.assertLess(score, 1.0)
+
     def test_composite_selector_rejects_high_weighted_low_quality_candidate(self):
         from scripts.validator.single_eval import select_king_by_composite
 
@@ -138,6 +176,90 @@ class TestSingleEvalCrownQuality(unittest.TestCase):
         self.assertTrue(
             _incumbent_can_hold([], 42, _record(0.35, weighted=0.35, worst=0.0))
         )
+
+    def test_merge_dq_row_overwrites_stale_composite_record(self):
+        from scripts.validator.single_eval import (
+            merge_composite_scores,
+            select_king_by_composite,
+        )
+
+        state = DummyState({
+            "158": _record(0.55, weighted=0.80, worst=0.40),
+        })
+        current = _record(0.30, weighted=0.42, worst=0.12)
+        n_updated = merge_composite_scores(
+            state,
+            [{
+                "uid": 158,
+                "model": "william-777/passion-4",
+                "disqualified": True,
+                "dq_reason": "quality: KL=4.541961 exceeds max threshold 4.000000",
+                "composite": _composite_payload(current),
+            }],
+            {
+                158: {
+                    "model": "william-777/passion-4",
+                    "revision": "abc123",
+                    "commit_block": 8286480,
+                },
+            },
+            current_block=8290000,
+        )
+
+        self.assertEqual(n_updated, 1)
+        rec = state.composite_scores["158"]
+        self.assertTrue(rec["disqualified"])
+        self.assertFalse(rec["eligible"])
+        self.assertEqual(rec["dq_reason"], "quality: KL=4.541961 exceeds max threshold 4.000000")
+        self.assertAlmostEqual(rec["weighted"], 0.42)
+        self.assertAlmostEqual(rec["worst"], 0.12)
+        self.assertEqual(rec["block"], 8286480)
+
+        uid, selected = select_king_by_composite(
+            state,
+            {
+                158: {
+                    "model": "william-777/passion-4",
+                    "revision": "abc123",
+                    "commit_block": 8286480,
+                },
+            },
+        )
+        self.assertIsNone(uid)
+        self.assertIsNone(selected)
+
+    def test_merge_dq_without_composite_tombstones_old_score(self):
+        from scripts.validator.single_eval import merge_composite_scores
+
+        state = DummyState({
+            "220": _record(0.55, weighted=0.80, worst=0.40),
+        })
+        n_updated = merge_composite_scores(
+            state,
+            [{
+                "uid": 220,
+                "model": "missing/model",
+                "disqualified": True,
+                "dq_reason": "integrity: Cannot verify model accessibility",
+            }],
+            {
+                220: {
+                    "model": "missing/model",
+                    "revision": "main",
+                    "commit_block": 8286500,
+                },
+            },
+            current_block=8290000,
+        )
+
+        self.assertEqual(n_updated, 1)
+        rec = state.composite_scores["220"]
+        self.assertTrue(rec["disqualified"])
+        self.assertFalse(rec["eligible"])
+        self.assertIsNone(rec["worst"])
+        self.assertIsNone(rec["weighted"])
+        self.assertEqual(rec["axes"], {})
+        self.assertEqual(rec["crown_quality_axes"], 0)
 
 
 if __name__ == "__main__":
