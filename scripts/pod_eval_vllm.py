@@ -180,6 +180,17 @@ def _sample_next_token(
     return torch.multinomial(probs, num_samples=1)
 
 
+_QUASAR_MEMORY_GENERATE_LOGGED_MODES: set[str] = set()
+
+
+def _log_quasar_memory_generate_mode(mode: str, detail: str) -> None:
+    key = f"{mode}:{detail}"
+    if key in _QUASAR_MEMORY_GENERATE_LOGGED_MODES:
+        return
+    _QUASAR_MEMORY_GENERATE_LOGGED_MODES.add(key)
+    print(f"[quasar-memory-generate] mode={mode} {detail}", flush=True)
+
+
 def quasar_memory_generate(
     model,
     input_ids: torch.Tensor,
@@ -204,6 +215,10 @@ def quasar_memory_generate(
     """
     cache_enabled = os.environ.get("QUASAR_MEMORY_GENERATE", "1") != "0"
     if not cache_enabled or not use_cache or max_new_tokens <= 0:
+        _log_quasar_memory_generate_mode(
+            "hf_no_cache",
+            f"cache_enabled={int(cache_enabled)} use_cache={int(bool(use_cache))}",
+        )
         return model.generate(
             input_ids,
             max_new_tokens=max_new_tokens,
@@ -215,9 +230,10 @@ def quasar_memory_generate(
             attention_mask=attention_mask,
             use_cache=False,
             **kwargs,
-        )
+    )
 
     if input_ids.ndim != 2 or int(input_ids.shape[0]) != 1:
+        _log_quasar_memory_generate_mode("hf_no_cache", "reason=non_single_prompt")
         return model.generate(
             input_ids,
             max_new_tokens=max_new_tokens,
@@ -240,8 +256,27 @@ def quasar_memory_generate(
     try:
         from fla.models.utils import Cache as FlaCache
         past_key_values = FlaCache(seen_tokens=0)
-    except Exception:
-        past_key_values = None
+    except Exception as e:
+        _log_quasar_memory_generate_mode(
+            "hf_no_cache",
+            f"reason=fla_cache_unavailable error={type(e).__name__}",
+        )
+        return model.generate(
+            input_ids,
+            max_new_tokens=max_new_tokens,
+            do_sample=do_sample,
+            temperature=temperature,
+            top_p=top_p,
+            pad_token_id=pad_token_id,
+            eos_token_id=eos_token_id,
+            attention_mask=attention_mask,
+            use_cache=False,
+            **kwargs,
+        )
+    _log_quasar_memory_generate_mode(
+        "fla_cache",
+        "past_key_values=on memory_states=on batch=single",
+    )
     prompt_len = int(input_ids.shape[1])
     cur_ids = input_ids
     position_ids = torch.arange(
@@ -343,6 +378,10 @@ def quasar_memory_generate_batch(
 
     cache_enabled = os.environ.get("QUASAR_MEMORY_GENERATE", "1") != "0"
     if not cache_enabled or not use_cache or max_new_tokens <= 0:
+        _log_quasar_memory_generate_mode(
+            "hf_no_cache_batch",
+            f"cache_enabled={int(cache_enabled)} use_cache={int(bool(use_cache))}",
+        )
         return [
             model.generate(
                 ids,
@@ -360,6 +399,10 @@ def quasar_memory_generate_batch(
     # Keep the correctness-critical fast path in the single-prompt helper. The
     # Quasar FLA cache is stateful per layer; merging/splitting it for grouped
     # batch decode is easy to get subtly wrong and causes repeated-token loops.
+    _log_quasar_memory_generate_mode(
+        "fla_cache_batch",
+        f"batch=sequential_per_prompt prompts={len(input_ids_list)}",
+    )
     return [
         quasar_memory_generate(
             model,
