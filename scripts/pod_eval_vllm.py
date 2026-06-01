@@ -195,15 +195,14 @@ def quasar_memory_generate(
     use_cache: bool = True,
     **kwargs,
 ) -> torch.Tensor:
-    """Generate Quasar text with a correctness-first default.
+    """Generate Quasar text with its recurrent memory fast path.
 
     HF ``generate(use_cache=True)`` currently calls ``Cache.get_seq_length()``
-    on Quasar's linear-attention cache and raises. Quasar also exposes a
-    ``memory_states`` recurrence, but that rollout is not guaranteed to match
-    full-prefix generation for all checkpoints. Keep it as an opt-in fast path;
-    default to no-cache generation so eval probes match the training objective.
+    on Quasar's linear-attention cache and raises. Use Quasar's explicit
+    ``memory_states`` recurrence by default, while keeping ``QUASAR_MEMORY_GENERATE=0``
+    as a correctness/debug fallback.
     """
-    cache_enabled = os.environ.get("QUASAR_MEMORY_GENERATE", "0") == "1"
+    cache_enabled = os.environ.get("QUASAR_MEMORY_GENERATE", "1") != "0"
     if not cache_enabled or not use_cache or max_new_tokens <= 0:
         return model.generate(
             input_ids,
@@ -312,9 +311,9 @@ def quasar_memory_generate_batch(
     """Batched deterministic Quasar generation for probe prompts.
 
     The prompt prefill stays unpadded and per-sample so prompt semantics match
-    the old path. By default this uses no-cache full-prefix generation for
-    correctness. Set ``QUASAR_MEMORY_GENERATE=1`` to opt into the faster
-    recurrent-memory path.
+    the old path. Cached decode groups active rows by identical current RoPE
+    position because Quasar's model code indexes batched 2-D ``position_ids``
+    with ``position_ids[0]``.
     """
     if not input_ids_list:
         return []
@@ -335,7 +334,7 @@ def quasar_memory_generate_batch(
             for ids in input_ids_list
         ]
 
-    cache_enabled = os.environ.get("QUASAR_MEMORY_GENERATE", "0") == "1"
+    cache_enabled = os.environ.get("QUASAR_MEMORY_GENERATE", "1") != "0"
     if not cache_enabled or not use_cache or max_new_tokens <= 0:
         return [
             model.generate(
@@ -388,37 +387,44 @@ def quasar_memory_generate_batch(
             and max(len(tokens) for tokens in generated) < int(max_new_tokens)
         ):
             active = [i for i, done in enumerate(finished) if not done]
-            cur_ids = torch.cat([generated[i][-1] for i in active], dim=0)
-            pos = torch.tensor(
-                [[prompt_lens[i] + len(generated[i]) - 1] for i in active],
-                device=cur_ids.device,
-                dtype=torch.long,
-            )
-            keys = sorted(memory_states_list[active[0]].keys())
-            batched_memory = {
-                key: torch.cat([memory_states_list[i][key] for i in active], dim=0)
-                for key in keys
-            }
-            out = model(
-                input_ids=cur_ids,
-                position_ids=pos,
-                memory_states=batched_memory,
-                use_cache=True,
-                return_dict=True,
-            )
-            next_tokens = torch.argmax(out.logits[:, -1, :], dim=-1, keepdim=True)
-            next_memory = getattr(out, "memory_states", None)
-            if next_memory is None:
-                raise RuntimeError("model did not return batched Quasar memory_states")
-            for row, idx in enumerate(active):
-                token = next_tokens[row:row + 1]
-                generated[idx].append(token)
-                memory_states_list[idx] = {
-                    key: value[row:row + 1].contiguous()
-                    for key, value in next_memory.items()
+            active_by_pos: dict[int, list[int]] = {}
+            for idx in active:
+                cur_pos = prompt_lens[idx] + len(generated[idx]) - 1
+                active_by_pos.setdefault(cur_pos, []).append(idx)
+
+            for cur_pos, group in active_by_pos.items():
+                cur_ids = torch.cat([generated[i][-1] for i in group], dim=0)
+                pos = torch.full(
+                    (len(group), 1),
+                    int(cur_pos),
+                    device=cur_ids.device,
+                    dtype=torch.long,
+                )
+                keys = sorted(memory_states_list[group[0]].keys())
+                batched_memory = {
+                    key: torch.cat([memory_states_list[i][key] for i in group], dim=0)
+                    for key in keys
                 }
-                if eos_ids and int(token[0, 0].item()) in eos_ids:
-                    finished[idx] = True
+                out = model(
+                    input_ids=cur_ids,
+                    position_ids=pos,
+                    memory_states=batched_memory,
+                    use_cache=True,
+                    return_dict=True,
+                )
+                next_tokens = torch.argmax(out.logits[:, -1, :], dim=-1, keepdim=True)
+                next_memory = getattr(out, "memory_states", None)
+                if next_memory is None:
+                    raise RuntimeError("model did not return batched Quasar memory_states")
+                for row, idx in enumerate(group):
+                    token = next_tokens[row:row + 1]
+                    generated[idx].append(token)
+                    memory_states_list[idx] = {
+                        key: value[row:row + 1].contiguous()
+                        for key, value in next_memory.items()
+                    }
+                    if eos_ids and int(token[0, 0].item()) in eos_ids:
+                        finished[idx] = True
     except Exception as e:
         if os.environ.get("QUASAR_MEMORY_GENERATE_WARN", "1") != "0":
             print(
