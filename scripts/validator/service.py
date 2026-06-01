@@ -968,12 +968,12 @@ def _refresh_round_weight_target(
 def _refresh_round_weight_target_if_stale(
     subtensor, wallet, netuid, n_uids, king_uid, validator_uid, state_dir,
 ):
-    """Refresh the current/king target while waiting for activation.
+    """Refresh the current/king target when a round runs long.
 
     Coordinated rounds can finish evaluation hundreds of blocks before their
-    activation block. A single pre-wait refresh leaves validator trust aging
-    during that wait, so poll last_update and refresh again once the chain's
-    weight rate limit has passed.
+    activation block, and slow active evals can run across multiple weight
+    epochs. A single pre-round refresh leaves validator trust aging, so poll
+    last_update and refresh again once the chain's weight rate limit has passed.
     """
     target_uid, target_source = _resolve_no_winner_weight_target(
         subtensor, netuid, n_uids, king_uid, validator_uid, state_dir,
@@ -1003,14 +1003,14 @@ def _refresh_round_weight_target_if_stale(
         and _has_pending_weight_commit(subtensor, netuid, hotkey_ss58)
     ):
         logger.info(
-            "Activation wait: validator weights still reveal UID %s, "
+            "Round weight refresh: validator weights still reveal UID %s, "
             "but a pending commit exists; waiting",
             current_weight_target,
         )
         return False
 
     msg = (
-        f"Activation wait: refreshing weights to {target_source} UID {target_uid} "
+        f"Round weight refresh: refreshing weights to {target_source} UID {target_uid} "
         f"(last_update age {age} blocks since {last_update}; current={current_block})"
     )
     logger.warning(msg)
@@ -1199,7 +1199,19 @@ def _detect_resumable_round(state, pod):
         started = cur.get("started_at")
         if started is not None:
             age_min = (time.time() - float(started)) / 60
-            if age_min > 180:
+            try:
+                max_resume_age_min = int(
+                    os.environ.get("QUASAR_RESUME_MAX_AGE_MIN", "720") or "0"
+                )
+            except (TypeError, ValueError):
+                max_resume_age_min = 720
+            if max_resume_age_min > 0 and age_min > max_resume_age_min:
+                logger.warning(
+                    "Resume skipped: in-flight eval age %.1fm exceeds "
+                    "QUASAR_RESUME_MAX_AGE_MIN=%sm",
+                    age_min,
+                    max_resume_age_min,
+                )
                 return None
         round_block = cur.get("block")
         if round_block is not None:
@@ -1307,6 +1319,31 @@ def _run_resumed_round(subtensor, wallet, netuid, state, pod, resume_round,
         state.save_progress({"active": False, "stage": "resume_missing_fields"})
         return
 
+    resume_n_uids = None
+    resume_validator_uid = None
+    try:
+        resume_metagraph, _, _, resume_n_uids, resume_revealed = fetch_chain(subtensor, netuid)
+        _, resume_uid_to_hotkey, _ = parse_commitments(
+            resume_metagraph, resume_revealed, resume_n_uids,
+        )
+        resume_validator_uid = next(
+            (
+                uid for uid, hk in resume_uid_to_hotkey.items()
+                if hk == wallet.hotkey.ss58_address
+            ),
+            None,
+        )
+    except Exception as exc:
+        logger.warning("Resume: active eval weight refresh disabled; chain lookup failed: %s", exc)
+
+    def _active_eval_weight_refresh():
+        if resume_n_uids is None or resume_validator_uid is None:
+            return False
+        return _refresh_round_weight_target_if_stale(
+            subtensor, wallet, netuid, resume_n_uids,
+            king_uid, resume_validator_uid, state_dir,
+        )
+
     state.current_round = cr
     state.save_round()
     state.save_progress({
@@ -1342,6 +1379,7 @@ def _run_resumed_round(subtensor, wallet, netuid, state, pod, resume_round,
         state, is_full_eval, use_vllm, eval_script,
         block_seed=current_block,
         resume_pod_eval=resume_pod_eval,
+        active_eval_refresh_cb=_active_eval_weight_refresh,
     )
     if results is None:
         logger.warning("Resumed eval did not produce usable results — clearing round state")
@@ -2583,6 +2621,9 @@ def run_validator(network, netuid, wallet_name, hotkey_name, wallet_path,
                 pod, models_to_eval, king_uid, n_prompts, prompt_texts,
                 state, is_full_eval, use_vllm, eval_script,
                 block_seed=current_block,
+                active_eval_refresh_cb=lambda: _refresh_round_weight_target_if_stale(
+                    subtensor, wallet, netuid, n_uids, king_uid, validator_uid, state_dir,
+                ),
             )
             try:
                 if private_texts:

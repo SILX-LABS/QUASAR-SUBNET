@@ -19,7 +19,20 @@ EARLY_STOP_MIN = int(os.environ.get("QUASAR_EARLY_STOP_MIN", os.environ.get("DIS
 logger = logging.getLogger("quasar.validator")
 
 
-def run_eval_on_pod(pod: PodManager, models_to_eval: dict, king_uid, n_prompts: int, prompt_texts: list, state: ValidatorState, is_full_eval: bool, use_vllm: bool, eval_script: str, block_seed: int | None = None, resume_pod_eval: dict | None = None):
+def run_eval_on_pod(
+    pod: PodManager,
+    models_to_eval: dict,
+    king_uid,
+    n_prompts: int,
+    prompt_texts: list,
+    state: ValidatorState,
+    is_full_eval: bool,
+    use_vllm: bool,
+    eval_script: str,
+    block_seed: int | None = None,
+    resume_pod_eval: dict | None = None,
+    active_eval_refresh_cb=None,
+):
     """Drive a pod/local eval to completion, downloading results when done.
 
     When ``resume_pod_eval`` contains a previous run directory and remote
@@ -147,13 +160,25 @@ def run_eval_on_pod(pod: PodManager, models_to_eval: dict, king_uid, n_prompts: 
                 )
         except Exception as exc:
             logger.warning("Resume probe failed: %s — falling back to fresh run", exc)
-            return run_eval_on_pod(pod, models_to_eval, king_uid, n_prompts, prompt_texts, state, is_full_eval, use_vllm, eval_script, block_seed=block_seed, resume_pod_eval=None)
+            return run_eval_on_pod(
+                pod, models_to_eval, king_uid, n_prompts, prompt_texts,
+                state, is_full_eval, use_vllm, eval_script,
+                block_seed=block_seed,
+                resume_pod_eval=None,
+                active_eval_refresh_cb=active_eval_refresh_cb,
+            )
         if pid_status not in ("ALIVE", "DONE"):
             logger.warning(
                 "Resume target pid_remote=%s reports status=%r — falling back to fresh run",
                 pid_remote, pid_status,
             )
-            return run_eval_on_pod(pod, models_to_eval, king_uid, n_prompts, prompt_texts, state, is_full_eval, use_vllm, eval_script, block_seed=block_seed, resume_pod_eval=None)
+            return run_eval_on_pod(
+                pod, models_to_eval, king_uid, n_prompts, prompt_texts,
+                state, is_full_eval, use_vllm, eval_script,
+                block_seed=block_seed,
+                resume_pod_eval=None,
+                active_eval_refresh_cb=active_eval_refresh_cb,
+            )
         logger.info("Resume probe: %s eval is %s — skipping cleanup/upload/start", backend_label, pid_status)
     elif is_local_backend:
         logger.info("Local backend: skipping broad pre-eval process cleanup")
@@ -556,9 +581,25 @@ def run_eval_on_pod(pod: PodManager, models_to_eval: dict, king_uid, n_prompts: 
         max_cuda_restarts = max(1, len(models_to_eval) + 1)
         deadline = time.time() + eval_timeout
         eval_started_at = time.time()
+        try:
+            active_refresh_interval_s = int(
+                os.environ.get("QUASAR_ACTIVE_EVAL_WEIGHT_REFRESH_POLL_S", "120") or "120"
+            )
+        except (TypeError, ValueError):
+            logger.warning("Invalid QUASAR_ACTIVE_EVAL_WEIGHT_REFRESH_POLL_S; using 120s")
+            active_refresh_interval_s = 120
+        active_refresh_interval_s = max(30, active_refresh_interval_s)
+        next_active_refresh_at = time.time() + min(30, active_refresh_interval_s)
         while time.time() < deadline:
             status = pod.exec(status_cmd, timeout=90)
             out = status.get("stdout", "") or ""
+            if active_eval_refresh_cb is not None and time.time() >= next_active_refresh_at:
+                try:
+                    if active_eval_refresh_cb():
+                        logger.warning("Active eval stale-weight refresh submitted")
+                except Exception as exc:
+                    logger.warning("Active eval weight refresh check failed: %s", str(exc)[:180])
+                next_active_refresh_at = time.time() + active_refresh_interval_s
             if "QUASAR_STATUS:done" in out:
                 result = {"stdout": "", "stderr": "", "exit_code": 0, "success": True}
                 break

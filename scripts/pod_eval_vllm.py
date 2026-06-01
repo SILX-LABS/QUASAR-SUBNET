@@ -337,6 +337,91 @@ def quasar_memory_generate(
     return torch.cat([input_ids, torch.cat(generated, dim=1)], dim=1)
 
 
+def _batch_state_value(values):
+    """Concatenate a per-row Quasar/FLA cache state along batch dim."""
+    if not values:
+        return None
+    first = next((v for v in values if v is not None), None)
+    if first is None:
+        return None
+    if isinstance(first, torch.Tensor):
+        return torch.cat(values, dim=0)
+    if isinstance(first, dict):
+        return {
+            key: _batch_state_value([v[key] for v in values])
+            for key in first.keys()
+        }
+    if isinstance(first, tuple):
+        return tuple(
+            _batch_state_value([v[i] for v in values])
+            for i in range(len(first))
+        )
+    if isinstance(first, list):
+        return [
+            _batch_state_value([v[i] for v in values])
+            for i in range(len(first))
+        ]
+    raise TypeError(f"unsupported FLA cache state type: {type(first).__name__}")
+
+
+def _slice_state_value(value, row: int):
+    """Extract one row from a batched Quasar/FLA cache state."""
+    if value is None:
+        return None
+    if isinstance(value, torch.Tensor):
+        return value[row:row + 1].contiguous()
+    if isinstance(value, dict):
+        return {key: _slice_state_value(val, row) for key, val in value.items()}
+    if isinstance(value, tuple):
+        return tuple(_slice_state_value(val, row) for val in value)
+    if isinstance(value, list):
+        return [_slice_state_value(val, row) for val in value]
+    raise TypeError(f"unsupported FLA cache state type: {type(value).__name__}")
+
+
+def _ensure_fla_layer(cache, layer_idx: int):
+    while len(cache.layers) <= layer_idx:
+        if getattr(cache, "use_layer_class_to_replicate", True):
+            cache.layers.append(cache.layer_class_to_replicate())
+        else:
+            cache.append_new_layers(layer_idx)
+
+
+def _batch_fla_caches(caches):
+    """Build one batched FlaCache from per-row FlaCache objects."""
+    from fla.models.utils import Cache as FlaCache
+
+    batched = FlaCache(seen_tokens=getattr(caches[0], "_seen_tokens", 0))
+    n_layers = len(caches[0].layers)
+    for cache in caches[1:]:
+        if len(cache.layers) != n_layers:
+            raise RuntimeError("cannot batch FLA caches with different layer counts")
+    for layer_idx in range(n_layers):
+        _ensure_fla_layer(batched, layer_idx)
+        states = [cache.layers[layer_idx].state for cache in caches]
+        batched.layers[layer_idx].state = _batch_state_value(states)
+        batched.layers[layer_idx]._seen_tokens = getattr(
+            caches[0].layers[layer_idx], "_seen_tokens", 0,
+        )
+        if hasattr(caches[0].layers[layer_idx], "device"):
+            batched.layers[layer_idx].device = caches[0].layers[layer_idx].device
+    return batched
+
+
+def _slice_fla_cache(cache, row: int):
+    """Extract one row cache from a batched FlaCache."""
+    from fla.models.utils import Cache as FlaCache
+
+    sliced = FlaCache(seen_tokens=getattr(cache, "_seen_tokens", 0))
+    for layer_idx, layer in enumerate(cache.layers):
+        _ensure_fla_layer(sliced, layer_idx)
+        sliced.layers[layer_idx].state = _slice_state_value(layer.state, row)
+        sliced.layers[layer_idx]._seen_tokens = getattr(layer, "_seen_tokens", 0)
+        if hasattr(layer, "device"):
+            sliced.layers[layer_idx].device = layer.device
+    return sliced
+
+
 def quasar_memory_generate_batch(
     model,
     input_ids_list: list[torch.Tensor],
@@ -353,9 +438,8 @@ def quasar_memory_generate_batch(
     """Batched deterministic Quasar generation for probe prompts.
 
     The prompt prefill stays unpadded and per-sample so prompt semantics match
-    the old path. Each row uses the single-prompt FLA cache helper; Quasar's
-    FLA cache is stateful per layer, and the earlier memory-only grouped decode
-    path produced repeated-token loops.
+    the old path. Decode groups active rows by identical current RoPE position
+    and carries both FLA ``past_key_values`` and Quasar ``memory_states``.
     """
     if not input_ids_list:
         return []
@@ -396,27 +480,133 @@ def quasar_memory_generate_batch(
             for ids in input_ids_list
         ]
 
-    # Keep the correctness-critical fast path in the single-prompt helper. The
-    # Quasar FLA cache is stateful per layer; merging/splitting it for grouped
-    # batch decode is easy to get subtly wrong and causes repeated-token loops.
-    _log_quasar_memory_generate_mode(
-        "fla_cache_batch",
-        f"batch=sequential_per_prompt prompts={len(input_ids_list)}",
-    )
-    return [
-        quasar_memory_generate(
-            model,
-            ids,
-            max_new_tokens=max_new_tokens,
-            do_sample=False,
-            temperature=temperature,
-            top_p=top_p,
-            top_k=top_k,
-            pad_token_id=pad_token_id,
-            eos_token_id=eos_token_id,
-            use_cache=use_cache,
+    eos_ids = _normalize_eos_ids(eos_token_id)
+    if not eos_ids and pad_token_id is not None:
+        eos_ids = {int(pad_token_id)}
+
+    prompt_lens = [int(ids.shape[1]) for ids in input_ids_list]
+    memory_states_list = [None] * len(input_ids_list)
+    past_key_values_list = [None] * len(input_ids_list)
+    generated: list[list[torch.Tensor]] = [[] for _ in input_ids_list]
+    finished = [False] * len(input_ids_list)
+
+    try:
+        from fla.models.utils import Cache as FlaCache
+
+        _log_quasar_memory_generate_mode(
+            "fla_cache_batch",
+            f"batch=grouped_by_position prompts={len(input_ids_list)}",
         )
-        for ids in input_ids_list
+
+        # Prompt prefill stays per-row. This avoids padding changing Quasar's
+        # recurrent state, but still lets the long decode phase run batched.
+        for idx, ids in enumerate(input_ids_list):
+            if ids.ndim != 2 or int(ids.shape[0]) != 1:
+                raise RuntimeError("batch FLA generation expects [1, seq] inputs")
+            cache = FlaCache(seen_tokens=0)
+            pos = torch.arange(
+                prompt_lens[idx], device=ids.device, dtype=torch.long,
+            ).unsqueeze(0)
+            out = model(
+                input_ids=ids,
+                position_ids=pos,
+                past_key_values=cache,
+                memory_states=None,
+                use_cache=True,
+                return_dict=True,
+            )
+            next_token = _sample_next_token(
+                out.logits[:, -1, :],
+                do_sample=False,
+                temperature=temperature,
+                top_p=top_p,
+                top_k=top_k,
+            )
+            generated[idx].append(next_token)
+            past_key_values_list[idx] = getattr(out, "past_key_values", cache)
+            memory_states = getattr(out, "memory_states", None)
+            if memory_states is None:
+                raise RuntimeError("model did not return Quasar memory_states")
+            memory_states_list[idx] = memory_states
+            if eos_ids and int(next_token[0, 0].item()) in eos_ids:
+                finished[idx] = True
+
+        while (
+            any(not done for done in finished)
+            and max(len(tokens) for tokens in generated) < int(max_new_tokens)
+        ):
+            active = [i for i, done in enumerate(finished) if not done]
+            active_by_pos: dict[int, list[int]] = {}
+            for idx in active:
+                cur_pos = prompt_lens[idx] + len(generated[idx]) - 1
+                active_by_pos.setdefault(cur_pos, []).append(idx)
+
+            for cur_pos, group in active_by_pos.items():
+                cur_ids = torch.cat([generated[i][-1] for i in group], dim=0)
+                pos = torch.full(
+                    (len(group), 1),
+                    int(cur_pos),
+                    device=cur_ids.device,
+                    dtype=torch.long,
+                )
+                batched_cache = _batch_fla_caches(
+                    [past_key_values_list[i] for i in group]
+                )
+                batched_memory = _batch_state_value(
+                    [memory_states_list[i] for i in group]
+                )
+                out = model(
+                    input_ids=cur_ids,
+                    position_ids=pos,
+                    past_key_values=batched_cache,
+                    memory_states=batched_memory,
+                    use_cache=True,
+                    return_dict=True,
+                )
+                next_tokens = _sample_next_token(
+                    out.logits[:, -1, :],
+                    do_sample=False,
+                    temperature=temperature,
+                    top_p=top_p,
+                    top_k=top_k,
+                )
+                next_cache = getattr(out, "past_key_values", batched_cache)
+                next_memory = getattr(out, "memory_states", None)
+                if next_memory is None:
+                    raise RuntimeError("model did not return batched Quasar memory_states")
+                for row, idx in enumerate(group):
+                    token = next_tokens[row:row + 1]
+                    generated[idx].append(token)
+                    past_key_values_list[idx] = _slice_fla_cache(next_cache, row)
+                    memory_states_list[idx] = _slice_state_value(next_memory, row)
+                    if eos_ids and int(token[0, 0].item()) in eos_ids:
+                        finished[idx] = True
+    except Exception as e:
+        if os.environ.get("QUASAR_MEMORY_GENERATE_WARN", "1") != "0":
+            print(
+                f"[quasar-memory-generate] batch fallback to sequential FLA: {str(e)[:160]}",
+                flush=True,
+            )
+        return [
+            quasar_memory_generate(
+                model,
+                ids,
+                max_new_tokens=max_new_tokens,
+                do_sample=False,
+                temperature=temperature,
+                top_p=top_p,
+                top_k=top_k,
+                pad_token_id=pad_token_id,
+                eos_token_id=eos_token_id,
+                use_cache=use_cache,
+            )
+            for ids in input_ids_list
+        ]
+
+    return [
+        torch.cat([input_ids_list[i], torch.cat(generated[i], dim=1)], dim=1)
+        if generated[i] else input_ids_list[i]
+        for i in range(len(input_ids_list))
     ]
 
 
