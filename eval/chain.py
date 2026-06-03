@@ -89,13 +89,13 @@ def parse_commitments(metagraph, revealed: dict, n_uids: int) -> tuple[dict, dic
 
 
 def build_winner_take_all_weights(n_uids: int, winner_uid: int) -> list[float]:
-    """Build weights for the winner, optionally reserving a small burn weight."""
+    """Build weights for the winner, keeping a default 10% reserve/burn weight."""
     weights = [0.0] * max(n_uids, winner_uid + 1)
     if winner_uid < 0:
         return weights
 
     try:
-        reserve = float(os.environ.get("QUASAR_WEIGHT_RESERVE_FRACTION", "0") or 0)
+        reserve = float(os.environ.get("QUASAR_WEIGHT_RESERVE_FRACTION", "0.10") or 0)
         reserve_uid = int(os.environ.get("QUASAR_WEIGHT_RESERVE_UID", "155"))
     except (TypeError, ValueError):
         reserve = 0.0
