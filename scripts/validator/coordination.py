@@ -182,17 +182,17 @@ def scheduled_challenger_uids(
     *,
     king_uid: int | None = None,
 ) -> list[int]:
-    """Deterministically assign valid commitments to coordination rounds.
+    """Select the oldest currently-pending valid commitments for this round.
 
-    This removes local ``evaluated_uids`` / ``composite_scores`` timing from
-    candidate selection. Every validator with the same frozen ``valid_models``
-    and round manifest gets the same challenger list, even if one validator
-    has never seen earlier rounds locally.
+    ``valid_models`` is already filtered by the caller to UIDs without a
+    completed local single-eval score. Keeping the scheduler FIFO by
+    commit_block makes the cap intuitive: evaluate the oldest ``cap`` now and
+    leave the rest pending for the next coordination round.
     """
     cap = int(cap)
     if cap <= 0:
         cap = len(valid_models) or 1
-    items: list[tuple[int, int, int]] = []
+    items: list[tuple[int, int]] = []
     for uid, info in (valid_models or {}).items():
         if uid == king_uid or (info or {}).get("is_reference"):
             continue
@@ -202,18 +202,8 @@ def scheduled_challenger_uids(
             commit_block = 0
         first_round = first_eligible_round_id(commit_block)
         if first_round <= coord_round.round_id:
-            items.append((first_round, commit_block, int(uid)))
-
-    round_loads: dict[int, int] = {}
-    scheduled: list[int] = []
-    for first_round, _commit_block, uid in sorted(items):
-        rid = first_round
-        while round_loads.get(rid, 0) >= cap:
-            rid += 1
-        round_loads[rid] = round_loads.get(rid, 0) + 1
-        if rid == coord_round.round_id:
-            scheduled.append(uid)
-    return scheduled
+            items.append((commit_block, int(uid)))
+    return [uid for _commit_block, uid in sorted(items)[:cap]]
 
 
 def maintenance_challenger_uids(
@@ -263,12 +253,10 @@ def reset_anchor_challenger_uids(
     Coordinated scheduling assigns every commitment to its first eligible
     historical round. That is right for steady-state operation, but after an
     intentional local-state reset those historical rounds are gone. The reset
-    anchor lets every validator re-seat the same frozen valid candidates once
-    so current contenders are not skipped simply because their original round
-    slot predates the rollout. It intentionally ignores the steady-state cap:
-    any capped-out reset candidate would otherwise return to historical
-    scheduling and may never be selected.
+    anchor re-seats the oldest frozen valid candidates while still respecting
+    the per-round cap so a reset cannot create an oversized eval.
     """
+    cap = int(cap)
     items: list[tuple[int, int]] = []
     for uid, info in (valid_models or {}).items():
         if uid == king_uid or (info or {}).get("is_reference"):
@@ -278,7 +266,10 @@ def reset_anchor_challenger_uids(
         except (TypeError, ValueError, OverflowError):
             commit_block = 0
         items.append((commit_block, int(uid)))
-    return [uid for _commit_block, uid in sorted(items)]
+    ordered = [uid for _commit_block, uid in sorted(items)]
+    if cap <= 0:
+        return ordered
+    return ordered[:cap]
 
 
 def wait_for_round_start(subtensor: Any, state, state_dir: str) -> int | None:

@@ -196,8 +196,12 @@ for pair in query:
                 pass
     elif isinstance(data_str, dict):
         parsed = data_str
-    if parsed and isinstance(parsed, dict):
+    if parsed and isinstance(parsed, dict) and "model" in parsed:
         commits[str(hotkey)] = {"block": block, **parsed}
+    elif parsed and isinstance(parsed, dict):
+        # Tombstones / accidental non-model reveals should not appear as miner
+        # commitments in the public API.
+        continue
     else:
         print(f"[commitments] unparseable for {hotkey}: {str(data_str)[:100]}", file=sys.stderr)
         commits[str(hotkey)] = {"block": block, "raw": str(data_str)}

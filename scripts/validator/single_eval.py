@@ -66,8 +66,10 @@ SINGLE_EVAL_DETHRONE_MARGIN = float(
 # (oldest commitment first), so every miner is evaluated within a few
 # rounds without a single round being a multi-hour wallclock fire.
 #
-# 10 keeps the round target around 60–75 min on H200 with shadow axes off.
-SINGLE_EVAL_MAX_PER_ROUND = 10
+# 5 keeps coordinated rounds short enough that slow/hung models do not hold
+# the validator for hours. Overflow remains FIFO by commit_block and is picked
+# up in later rounds.
+SINGLE_EVAL_MAX_PER_ROUND = 5
 
 
 # When `worst` (min over axes) is at-or-below this epsilon, treat the UID as

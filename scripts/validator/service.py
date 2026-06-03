@@ -1,4 +1,5 @@
 import logging
+import json
 import os
 import subprocess
 import time
@@ -523,6 +524,48 @@ def _resolve_king(valid_models, state):
     return king_uid, king_kl, source
 
 
+def _resolve_h2h_king_for_coordination(n_uids, valid_models, state, state_dir, reason):
+    h2h_king_uid = _resolve_persisted_h2h_king_uid(n_uids, state_dir)
+    if h2h_king_uid is None:
+        return None, float("inf")
+    if h2h_king_uid not in valid_models:
+        msg = (
+            f"coordination: h2h_latest king UID {h2h_king_uid} is not valid "
+            "in the frozen candidate set; planning without local incumbent"
+        )
+        logger.warning(msg)
+        log_event(msg, level="warn", state_dir=state_dir)
+        return None, float("inf")
+    if is_single_eval_mode():
+        record = (getattr(state, "composite_scores", {}) or {}).get(str(h2h_king_uid))
+        if record:
+            quality, quality_axes = composite_crown_quality_detail(record)
+            if (
+                quality is None
+                or quality_axes < SINGLE_EVAL_MIN_CROWN_QUALITY_AXES
+                or quality + 1e-12 < SINGLE_EVAL_MIN_CROWN_QUALITY
+            ):
+                msg = (
+                    f"coordination: h2h_latest king UID {h2h_king_uid} "
+                    f"fails current crown quality floor "
+                    f"(quality={quality}, axes={quality_axes}, "
+                    f"floor={SINGLE_EVAL_MIN_CROWN_QUALITY:.3f}); "
+                    "planning without local incumbent"
+                )
+                logger.warning(msg)
+                log_event(msg, level="warn", state_dir=state_dir)
+                return None, float("inf")
+
+    king_kl = state.scores.get(str(h2h_king_uid), float("inf"))
+    msg = (
+        f"coordination: using h2h_latest king UID {h2h_king_uid} "
+        f"after {reason}"
+    )
+    logger.warning(msg)
+    log_event(msg, level="warn", state_dir=state_dir)
+    return h2h_king_uid, king_kl
+
+
 def _resolve_coordinated_king(
     subtensor, metagraph, netuid, n_uids, valid_models, state, state_dir,
     coord_round=None,
@@ -577,6 +620,12 @@ def _resolve_coordinated_king(
                     )
                     logger.warning(msg)
                     log_event(msg, level="warn", state_dir=state_dir)
+                    h2h_uid, h2h_kl = _resolve_h2h_king_for_coordination(
+                        n_uids, valid_models, state, state_dir,
+                        f"chain consensus UID {chain_king_uid} failed quality floor",
+                    )
+                    if h2h_uid is not None:
+                        return h2h_uid, h2h_kl, "h2h_latest"
                     return None, float("inf"), "chain_consensus"
         king_kl = state.scores.get(str(chain_king_uid), float("inf"))
         logger.info(
@@ -600,6 +649,11 @@ def _resolve_coordinated_king(
         )
     logger.warning(msg)
     log_event(msg, level="warn", state_dir=state_dir)
+    h2h_uid, h2h_kl = _resolve_h2h_king_for_coordination(
+        n_uids, valid_models, state, state_dir, msg,
+    )
+    if h2h_uid is not None:
+        return h2h_uid, h2h_kl, "h2h_latest"
     return None, float("inf"), "chain_consensus"
 
 
@@ -656,6 +710,15 @@ def _resolve_shared_no_winner_fallback_uid(n_uids, state_dir, *, env_name="QUASA
     return None, "invalid configured fallback"
 
 
+def _resolve_persisted_h2h_king_uid(n_uids, state_dir):
+    try:
+        state_path = Path(state_dir) / "h2h_latest.json"
+        data = json.loads(state_path.read_text())
+    except Exception:
+        return None
+    return _coerce_valid_uid(data.get("king_uid"), n_uids)
+
+
 def _resolve_no_winner_weight_target(
     subtensor, netuid, n_uids, king_uid, validator_uid, state_dir,
 ):
@@ -670,6 +733,10 @@ def _resolve_no_winner_weight_target(
     incumbent_uid = _coerce_valid_uid(king_uid, n_uids)
     if incumbent_uid is not None:
         return incumbent_uid, "incumbent king"
+
+    persisted_king_uid = _resolve_persisted_h2h_king_uid(n_uids, state_dir)
+    if persisted_king_uid is not None:
+        return persisted_king_uid, "h2h_latest king"
 
     validator_uid = _coerce_valid_uid(validator_uid, n_uids)
     fallback_uid, fallback_source = _resolve_shared_no_winner_fallback_uid(n_uids, state_dir)
@@ -2356,27 +2423,25 @@ def run_validator(network, netuid, wallet_name, hotkey_name, wallet_path,
             state.save()
             if coord_round is not None and precheck_errors:
                 logger.warning(
-                    "coordination: precheck incomplete for UIDs %s; skipping eval so this "
-                    "validator does not plan from an incomplete candidate set",
+                    "coordination: deferring precheck-error UIDs %s; continuing "
+                    "with %d valid model(s)",
                     sorted(precheck_errors),
+                    len(valid_models),
                 )
-                state.save_progress({
-                    "active": False,
-                    "stage": "coordination_precheck_incomplete",
-                    "commitments_total": len(commitments),
-                    "valid_models": len(valid_models),
-                    "disqualified": len(disqualified),
-                    "precheck_errors": {
-                        str(uid): reason for uid, reason in sorted(precheck_errors.items())
-                    },
-                    "coordination": coord_round.to_dict(),
-                    "updated_at": time.time(),
+                log_event(
+                    f"coordination: deferred precheck-error UIDs "
+                    f"{sorted(precheck_errors)}; continuing with "
+                    f"{len(valid_models)} valid model(s)",
+                    level="warn",
+                    state_dir=state_dir,
+                )
+                telemetry_log({
+                    "stage": "coordination_precheck_deferred",
+                    "epoch": epoch_count,
+                    "precheck/error_uids": sorted(precheck_errors),
+                    "precheck/errors": len(precheck_errors),
+                    "precheck/valid": len(valid_models),
                 })
-                state.save()
-                if once:
-                    break
-                time.sleep(60)
-                continue
             if not valid_models:
                 logger.info("No valid models after pre-checks")
                 state.save_progress({

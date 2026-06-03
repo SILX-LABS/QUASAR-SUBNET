@@ -23,6 +23,8 @@ def write_api_commitments_cache(commitments: dict, state_dir: str):
         cache_dir.mkdir(parents=True, exist_ok=True)
         hotkey_keyed = {}
         for uid, data in commitments.items():
+            if not data.get("model"):
+                continue
             hotkey = data.get("hotkey")
             if not hotkey:
                 continue

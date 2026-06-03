@@ -34,6 +34,37 @@ logger = logging.getLogger("quasar.model_checker")
 
 _HF_TOKEN = os.environ.get("HF_TOKEN") or None
 _MODEL_INFO_RETRY_DELAYS = (0.5, 1.5, 4.0)
+_TRANSIENT_ERROR_KEYWORDS = (
+    "429",
+    "rate limit",
+    "too many requests",
+    "500",
+    "internal server error",
+    "server error",
+    "503",
+    "502",
+    "temporary",
+    "temporarily",
+    "unavailable",
+    "timeout",
+    "timed out",
+    "connection",
+    "connectionerror",
+    "connecttimeout",
+    "network is unreachable",
+    "name resolution",
+    "temporary failure in name resolution",
+    "dns",
+    "gaierror",
+    "errno -3",
+    "errno 101",
+    "no route to host",
+)
+
+
+def _looks_transient_message(message: str) -> bool:
+    msg = str(message or "").lower()
+    return any(k in msg for k in _TRANSIENT_ERROR_KEYWORDS)
 
 
 def model_info(model_repo, revision=None, files_metadata=False, token=None, **kwargs):
@@ -53,8 +84,7 @@ def model_info(model_repo, revision=None, files_metadata=False, token=None, **kw
             )
         except Exception as exc:
             last_exc = exc
-            msg = str(exc).lower()
-            if not any(k in msg for k in ("429", "rate limit", "too many", "503", "502", "500", "internal server error", "server error", "timeout")):
+            if not _looks_transient_message(str(exc)):
                 raise
             if attempt == len(_MODEL_INFO_RETRY_DELAYS):
                 raise
@@ -676,8 +706,7 @@ def _verify_model_integrity_uncached(
                 "current_hash": None,
             }
         # Transient errors should not DQ
-        err_lower = err.lower()
-        if any(k in err_lower for k in ["429", "rate limit", "too many", "timeout", "503", "502", "500", "internal server error", "server error", "connection"]):
+        if _looks_transient_message(err):
             return {
                 "pass": True,
                 "reason": f"transient_error: {err}",
@@ -793,14 +822,7 @@ def assess_vllm_compatibility(config: dict, repo_info=None) -> tuple[bool, str]:
 
 def _is_transient_error(exc: Exception) -> bool:
     """Check if an exception is a transient network error that should not DQ."""
-    err_str = str(exc).lower()
-    return any(k in err_str for k in [
-        "429", "rate limit", "too many requests",
-        "500", "internal server error", "server error",
-        "503", "502", "temporary", "unavailable",
-        "timeout", "timed out",
-        "connection", "connectionerror", "connecttimeout",
-    ])
+    return _looks_transient_message(str(exc))
 
 
 def _repo_access_failure_reason(model_repo: str, exc: Exception) -> str | None:
@@ -1303,14 +1325,7 @@ def check_model_architecture(
         }
 
     except Exception as e:
-        err_str = str(e).lower()
         # Transient errors (rate limits, network issues) should NOT disqualify
-        is_transient = any(k in err_str for k in [
-            "429", "rate limit", "too many requests",
-            "connection", "timeout", "503", "502", "500",
-            "internal server error", "server error",
-            "temporary", "unavailable",
-        ])
-        if is_transient:
+        if _looks_transient_message(str(e)):
             return {"pass": True, "reason": f"transient_error:{e}", "transient": True}
         return {"pass": False, "reason": f"check_failed:{e}"}

@@ -37,6 +37,67 @@ class PrecheckCallTimeout(TimeoutError):
     pass
 
 
+_TRANSIENT_DQ_MARKERS = (
+    "network is unreachable",
+    "name resolution",
+    "temporary failure in name resolution",
+    "dns",
+    "gaierror",
+    "errno -3",
+    "errno 101",
+    "no route to host",
+    "connectionerror",
+    "connecttimeout",
+    "timeout",
+    "timed out",
+    "rate limit",
+    "too many requests",
+    "503",
+    "502",
+    "500",
+    "internal server error",
+    "server error",
+)
+
+
+def _is_transient_precheck_dq(reason: str | None) -> bool:
+    text = str(reason or "").lower()
+    if not text:
+        return False
+    # Keep consensus-stable access policy failures as hard DQ even if the
+    # message contains HTTP/client wording.
+    if any(k in text for k in (
+        "404",
+        "403",
+        "401",
+        "repository not found",
+        "no longer exists",
+        "private",
+        "gated",
+        "restricted",
+        "unauthorized",
+    )):
+        return False
+    return any(k in text for k in _TRANSIENT_DQ_MARKERS)
+
+
+def _clear_transient_precheck_dq(uid: int, hotkey: str, commit_block, state: ValidatorState) -> int:
+    keys = []
+    if commit_block is not None:
+        keys.append(f"{hotkey}:{commit_block}")
+    keys.extend([hotkey, str(uid)])
+    removed = 0
+    for key in keys:
+        if key and key in state.dq_reasons:
+            del state.dq_reasons[key]
+            removed += 1
+    state.scores.pop(str(uid), None)
+    state.evaluated_uids.discard(str(uid))
+    reset_failures(uid, state.failures)
+    state.failure_models.pop(str(uid), None)
+    return removed
+
+
 def _precheck_call_worker(module_name: str, function_name: str, args: tuple, out):
     try:
         import importlib
@@ -422,9 +483,18 @@ def precheck_all_models(commitments, uid_to_hotkey, uid_to_coldkey, state: Valid
             reason = _canonicalize_existing_copy_dq(
                 uid, hotkey, reason, commitments, uid_to_hotkey, state,
             )
-            logger.info(f"UID {uid} ({model_repo}): DISQUALIFIED — {reason}")
-            disqualified.add(uid)
-            continue
+            if _is_transient_precheck_dq(reason):
+                removed = _clear_transient_precheck_dq(
+                    uid, hotkey, this_commit_block, state,
+                )
+                logger.info(
+                    f"UID {uid} ({model_repo}): clearing transient precheck DQ "
+                    f"({removed} entry/entries) — {reason}; retrying this round"
+                )
+            else:
+                logger.info(f"UID {uid} ({model_repo}): DISQUALIFIED — {reason}")
+                disqualified.add(uid)
+                continue
         if not single_eval_mode and state.scores.get(str(uid), 0) > MAX_KL_THRESHOLD:
             disqualified.add(uid)
             continue

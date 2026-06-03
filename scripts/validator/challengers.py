@@ -125,6 +125,40 @@ def _consume_manual_reset_anchor(state: ValidatorState, coord_round, scheduled) 
     _write_reset_anchor(state, data)
 
 
+def _pending_single_eval_models(valid_models, state: ValidatorState, king_uid):
+    pending = {}
+    evict_stale_evaluated_uids(state, valid_models)
+    for uid, info in valid_models.items():
+        uid_str = str(uid)
+        model_name = info["model"]
+        if info.get("is_reference") or uid == king_uid:
+            continue
+        if model_name in state.permanently_bad_models:
+            state.evaluated_uids.add(uid_str)
+            continue
+        if uid_str in state.composite_scores:
+            continue
+        if uid_str in state.evaluated_uids:
+            continue
+        pending[uid] = info
+    return pending
+
+
+def _cap_pending_challengers(challengers, cap: int):
+    if not challengers or cap <= 0 or len(challengers) <= cap:
+        return dict(challengers), []
+    ordered = sorted(
+        challengers.items(),
+        key=lambda kv: (
+            int((kv[1] or {}).get("commit_block") or 0),
+            kv[0],
+        ),
+    )
+    kept = dict(ordered[:cap])
+    deferred = [uid for uid, _ in ordered[cap:]]
+    return kept, deferred
+
+
 def select_challengers(valid_models, state: ValidatorState, king_uid, king_kl,
                        epoch_count: int, trust_king_kl: bool = True,
                        coord_round=None):
@@ -166,10 +200,11 @@ def select_challengers(valid_models, state: ValidatorState, king_uid, king_kl,
                     )
         cap = int(single_eval_mod.SINGLE_EVAL_MAX_PER_ROUND)
         if coord_round is not None:
+            pending_models = _pending_single_eval_models(valid_models, state, king_uid)
             manual_reset_anchor = _manual_reset_anchor_requested(state, coord_round)
             if _looks_like_reset_state(state) or manual_reset_anchor:
                 scheduled = reset_anchor_challenger_uids(
-                    valid_models, cap, king_uid=king_uid,
+                    pending_models, cap, king_uid=king_uid,
                 )
                 if manual_reset_anchor:
                     _consume_manual_reset_anchor(state, coord_round, scheduled)
@@ -179,7 +214,7 @@ def select_challengers(valid_models, state: ValidatorState, king_uid, king_kl,
                 )
             else:
                 scheduled = scheduled_challenger_uids(
-                    valid_models, coord_round, cap, king_uid=king_uid,
+                    pending_models, coord_round, cap, king_uid=king_uid,
                 )
                 if not scheduled:
                     scheduled = maintenance_challenger_uids(
@@ -198,36 +233,7 @@ def select_challengers(valid_models, state: ValidatorState, king_uid, king_kl,
                     )
             challengers = {uid: valid_models[uid] for uid in scheduled}
         else:
-            evict_stale_evaluated_uids(state, valid_models)
-            for uid, info in valid_models.items():
-                uid_str = str(uid)
-                model_name = info["model"]
-                if info.get("is_reference"):
-                    continue
-                # The incumbent is always seated separately by service.plan_round
-                # for paired evaluation against the challengers. It must not live
-                # in the challenger pool here, otherwise the single-eval cap counts
-                # the king as one of the pending-new slots and can defer a real
-                # valid challenger.
-                if uid == king_uid:
-                    continue
-                if model_name in state.permanently_bad_models:
-                    state.evaluated_uids.add(uid_str)
-                    continue
-                if uid_str in state.composite_scores:
-                    continue
-                # Strict no-re-eval: a UID in evaluated_uids has been through a
-                # full round once already. Even if its score row got dropped
-                # later (DQ revert, partial-state reset, etc.), per single-eval
-                # policy it should not run again unless its commitment changed
-                # — and ``evict_stale_evaluated_uids`` already pulled out the
-                # commitment-changed entries above. The previous filter required
-                # both ``evaluated_uids`` AND ``scores`` to be set, which let
-                # historical UIDs sneak back into the queue when state was
-                # partially rebuilt.
-                if uid_str in state.evaluated_uids:
-                    continue
-                challengers[uid] = info
+            challengers = _pending_single_eval_models(valid_models, state, king_uid)
             # FIFO cap: oldest commitment first. Without this the planner
             # queues every pending new commit at once and rounds bloat to 8h
             # of pod compute. The cap forces rotation across rounds so each
@@ -235,21 +241,13 @@ def select_challengers(valid_models, state: ValidatorState, king_uid, king_kl,
             # cap from the single_eval module each call so unit tests can patch
             # it without changing the production constant.
             if challengers and cap > 0 and len(challengers) > cap:
-                ordered = sorted(
-                    challengers.items(),
-                    key=lambda kv: (
-                        int((kv[1] or {}).get("commit_block") or 0),
-                        kv[0],
-                    ),
-                )
-                kept = dict(ordered[:cap])
-                deferred = [uid for uid, _ in ordered[cap:]]
+                before_cap = len(challengers)
+                challengers, deferred = _cap_pending_challengers(challengers, cap)
                 logger.info(
-                    f"single-eval: capping round at {cap} of {len(challengers)} "
+                    f"single-eval: capping round at {cap} of {before_cap} "
                     f"pending new commitments (FIFO by commit_block); deferred "
                     f"to next round: {deferred}"
                 )
-                challengers = kept
         if challengers:
             logger.info(
                 f"single-eval: {len(challengers)} new commitment(s) to evaluate "

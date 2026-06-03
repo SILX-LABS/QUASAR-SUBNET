@@ -9,6 +9,7 @@ All Bittensor RPC calls are wrapped with retry logic.
 import json
 import logging
 import math
+import os
 import time
 
 logger = logging.getLogger("quasar.chain")
@@ -88,9 +89,24 @@ def parse_commitments(metagraph, revealed: dict, n_uids: int) -> tuple[dict, dic
 
 
 def build_winner_take_all_weights(n_uids: int, winner_uid: int) -> list[float]:
-    """Build a one-hot weight vector for the winning UID."""
+    """Build weights for the winner, optionally reserving a small burn weight."""
     weights = [0.0] * max(n_uids, winner_uid + 1)
-    weights[winner_uid] = 1.0
+    if winner_uid < 0:
+        return weights
+
+    try:
+        reserve = float(os.environ.get("QUASAR_WEIGHT_RESERVE_FRACTION", "0") or 0)
+        reserve_uid = int(os.environ.get("QUASAR_WEIGHT_RESERVE_UID", "155"))
+    except (TypeError, ValueError):
+        reserve = 0.0
+        reserve_uid = -1
+    reserve = min(0.90, max(0.0, reserve)) if math.isfinite(reserve) else 0.0
+    if reserve <= 0.0 or reserve_uid == winner_uid or not 0 <= reserve_uid < len(weights):
+        weights[winner_uid] = 1.0
+        return weights
+
+    weights[winner_uid] = 1.0 - reserve
+    weights[reserve_uid] = reserve
     return weights
 
 
@@ -206,18 +222,56 @@ class SetWeightsError(RuntimeError):
     """Raised when set_weights exhausts all retries."""
 
 
+def _env_int(name: str, default: int, minimum: int = 1) -> int:
+    try:
+        return max(minimum, int(os.environ.get(name, default)))
+    except (TypeError, ValueError):
+        return default
+
+
+def _env_float(name: str, default: float, minimum: float = 0.0) -> float:
+    try:
+        return max(minimum, float(os.environ.get(name, default)))
+    except (TypeError, ValueError):
+        return default
+
+
+def _looks_too_soon_to_set_weights(message: str | None) -> bool:
+    if not message:
+        return False
+    msg = str(message).lower()
+    return (
+        "too soon to commit weights" in msg
+        or "no attempt made" in msg
+        or "too soon" in msg and "weight" in msg
+    )
+
+
 def set_weights(subtensor, wallet, netuid: int, n_uids: int,
-                weights: list[float], winner_uid: int, max_attempts: int = 3):
+                weights: list[float], winner_uid: int, max_attempts: int | None = None):
     """Set weights on-chain with retry.
 
     Raises SetWeightsError if every attempt fails so callers can decide
     whether to sleep + retry instead of silently leaving weights stale.
     """
-    logger.info(f"Setting weights: UID {winner_uid} = 1.0")
+    logger.info(f"Setting weights: UID {winner_uid} = {float(weights[winner_uid]):.4f}")
     uids = list(range(n_uids))
     last_err: str | None = None
+    delay = _env_float("QUASAR_SET_WEIGHTS_RETRY_DELAY", 30.0, minimum=1.0)
+    normal_max_attempts = (
+        max(1, int(max_attempts))
+        if max_attempts is not None
+        else _env_int("QUASAR_SET_WEIGHTS_MAX_ATTEMPTS", 3)
+    )
+    too_soon_max_attempts = _env_int(
+        "QUASAR_SET_WEIGHTS_TOO_SOON_MAX_ATTEMPTS",
+        50,
+    )
+    effective_max_attempts = normal_max_attempts
 
-    for attempt in range(max_attempts):
+    attempt = 0
+    while attempt < effective_max_attempts:
+        attempt += 1
         try:
             result = subtensor.set_weights(
                 wallet=wallet, netuid=netuid,
@@ -230,13 +284,15 @@ def set_weights(subtensor, wallet, netuid: int, n_uids: int,
                 logger.info("✓ Weights set on-chain!")
                 return True
             last_err = result[1] if isinstance(result, (tuple, list)) and len(result) > 1 else str(result)
-            logger.warning(f"Attempt {attempt + 1}: rejected — {last_err}")
+            logger.warning(f"Attempt {attempt}: rejected — {last_err}")
         except Exception as e:
             last_err = str(e)
-            logger.error(f"Attempt {attempt + 1}: {e}")
-        if attempt < max_attempts - 1:
-            time.sleep(30)
+            logger.error(f"Attempt {attempt}: {e}")
+        if _looks_too_soon_to_set_weights(last_err):
+            effective_max_attempts = max(effective_max_attempts, too_soon_max_attempts)
+        if attempt < effective_max_attempts:
+            time.sleep(delay)
 
     raise SetWeightsError(
-        f"Failed to set weights (UID {winner_uid}) after {max_attempts} attempts: {last_err or 'unknown'}"
+        f"Failed to set weights (UID {winner_uid}) after {attempt} attempts: {last_err or 'unknown'}"
     )
