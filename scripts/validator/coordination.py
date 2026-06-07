@@ -41,6 +41,13 @@ COORD_ACTIVATION_DELAY_BLOCKS = 600
 # evaluates the same frozen candidate set instead of idling for the next round.
 COORD_START_GRACE_BLOCKS = max(1, COORD_ROUND_BLOCKS // 4)
 
+# Bulk-submission fairness. A 24h window is roughly 10 two-epoch coordination
+# rounds at 12s blocks. These constants are deliberately code-level rather
+# than validator-local env knobs so patched validators agree on the same queue.
+EVAL_RATE_LIMIT_WINDOW_BLOCKS = COORD_ROUND_BLOCKS * 10
+EVAL_RATE_LIMIT_HF_OWNER_PER_WINDOW = 2
+EVAL_RATE_LIMIT_HOTKEY_PER_WINDOW = 2
+
 
 def _env_int(name: str, default: int) -> int:
     raw = os.environ.get(name)
@@ -175,12 +182,31 @@ def first_eligible_round_id(commit_block: int | float | str | None) -> int:
     return max(0, (block + finality + rb - 1) // rb)
 
 
+def _commit_block(info: dict | None) -> int:
+    try:
+        return int((info or {}).get("commit_block") or (info or {}).get("block") or 0)
+    except (TypeError, ValueError, OverflowError):
+        return 0
+
+
+def _hf_owner(info: dict | None) -> str:
+    model = str((info or {}).get("model") or "")
+    if "/" not in model:
+        return ""
+    return model.split("/", 1)[0].strip().lower()
+
+
+def _hotkey(info: dict | None) -> str:
+    return str((info or {}).get("hotkey") or "").strip()
+
+
 def scheduled_challenger_uids(
     valid_models: dict[int, dict],
     coord_round: CoordinationRound,
     cap: int,
     *,
     king_uid: int | None = None,
+    pending_uids: set[int] | None = None,
 ) -> list[int]:
     """Select the oldest currently-pending valid commitments for this round.
 
@@ -192,18 +218,57 @@ def scheduled_challenger_uids(
     cap = int(cap)
     if cap <= 0:
         cap = len(valid_models) or 1
-    items: list[tuple[int, int]] = []
+    pending_set = {int(uid) for uid in pending_uids} if pending_uids is not None else None
+    candidates: list[tuple[int, int, dict]] = []
     for uid, info in (valid_models or {}).items():
         if uid == king_uid or (info or {}).get("is_reference"):
             continue
-        try:
-            commit_block = int((info or {}).get("commit_block") or (info or {}).get("block") or 0)
-        except (TypeError, ValueError, OverflowError):
-            commit_block = 0
+        commit_block = _commit_block(info)
         first_round = first_eligible_round_id(commit_block)
         if first_round <= coord_round.round_id:
-            items.append((commit_block, int(uid)))
-    return [uid for _commit_block, uid in sorted(items)[:cap]]
+            candidates.append((commit_block, int(uid), info or {}))
+
+    # When the caller passes the full valid set plus pending_uids, rank every
+    # valid submission in the 24h owner/hotkey windows, including ones already
+    # evaluated. That keeps later spam from becoming eligible just because the
+    # first two submissions were already scored and removed from the pending set.
+    items: list[tuple[int, int]] = []
+    owner_counts: dict[tuple[int, str], int] = {}
+    hotkey_counts: dict[tuple[int, str], int] = {}
+    limited_by_owner: list[int] = []
+    limited_by_hotkey: list[int] = []
+    for commit_block, uid, info in sorted(candidates):
+        window_id = max(0, commit_block) // EVAL_RATE_LIMIT_WINDOW_BLOCKS
+        owner = _hf_owner(info)
+        hotkey = _hotkey(info)
+        owner_limited = False
+        hotkey_limited = False
+        if owner:
+            key = (window_id, owner)
+            owner_counts[key] = owner_counts.get(key, 0) + 1
+            owner_limited = owner_counts[key] > EVAL_RATE_LIMIT_HF_OWNER_PER_WINDOW
+        if hotkey:
+            key = (window_id, hotkey)
+            hotkey_counts[key] = hotkey_counts.get(key, 0) + 1
+            hotkey_limited = hotkey_counts[key] > EVAL_RATE_LIMIT_HOTKEY_PER_WINDOW
+        if pending_set is not None and uid not in pending_set:
+            continue
+        if pending_set is not None and (owner_limited or hotkey_limited):
+            if owner_limited:
+                limited_by_owner.append(uid)
+            if hotkey_limited:
+                limited_by_hotkey.append(uid)
+            continue
+        items.append((commit_block, uid))
+
+    if limited_by_owner or limited_by_hotkey:
+        logger.info(
+            "single-eval: rate-limited pending challengers in 24h window; "
+            "hf_owner=%s hotkey=%s",
+            limited_by_owner,
+            limited_by_hotkey,
+        )
+    return [uid for _commit_block, uid in items[:cap]]
 
 
 def maintenance_challenger_uids(
@@ -410,7 +475,7 @@ def parse_commitments_at_cutoff(
         except Exception:
             continue
         if "model" in parsed:
-            commitments[uid] = {"block": block, "hotkey": hotkey, **parsed}
+            commitments[uid] = {**parsed, "block": block, "hotkey": hotkey}
 
     return commitments, uid_to_hotkey, uid_to_coldkey
 

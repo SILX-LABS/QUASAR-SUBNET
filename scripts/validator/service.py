@@ -491,14 +491,18 @@ def _resolve_king(valid_models, state):
                 f"UID {composite_king_uid} (stored KL={king_kl})"
             )
             return composite_king_uid, king_kl, "composite"
-        if state.h2h_latest:
-            logger.info(
-                "single-eval: no composite king cleared the crown quality "
-                "floor; not falling back to h2h_latest"
+        # No composite model is crownable under the current policy. That means
+        # do not crown/weight a model from stale composite state, but still seat
+        # the most recent H2H incumbent for paired comparison when available.
+        h2h_uid = _h2h_incumbent_uid_from_latest(getattr(state, "h2h_latest", None), None)
+        if h2h_uid is not None and h2h_uid in valid_models:
+            king_kl = state.scores.get(str(h2h_uid), float("inf"))
+            logger.warning(
+                "single-eval: no composite king cleared the crown quality floor; "
+                "seating H2H incumbent UID %s for paired eval",
+                h2h_uid,
             )
-        # Cold start: no composite king yet. Start a challenger round without
-        # selecting a KL fallback king; the first crown must come from
-        # composite rows produced by evaluation.
+            return h2h_uid, king_kl, "h2h_latest_uncrowned_incumbent"
         return None, float("inf"), "none"
 
     king_uid, king_kl, source = None, float("inf"), "none"
@@ -525,7 +529,7 @@ def _resolve_king(valid_models, state):
 
 
 def _resolve_h2h_king_for_coordination(n_uids, valid_models, state, state_dir, reason):
-    h2h_king_uid = _resolve_persisted_h2h_king_uid(n_uids, state_dir)
+    h2h_king_uid = _resolve_persisted_h2h_incumbent_uid(n_uids, state_dir, state)
     if h2h_king_uid is None:
         return None, float("inf")
     if h2h_king_uid not in valid_models:
@@ -550,11 +554,10 @@ def _resolve_h2h_king_for_coordination(n_uids, valid_models, state, state_dir, r
                     f"fails current crown quality floor "
                     f"(quality={quality}, axes={quality_axes}, "
                     f"floor={SINGLE_EVAL_MIN_CROWN_QUALITY:.3f}); "
-                    "planning without local incumbent"
+                    "seating as uncrowned incumbent for paired eval"
                 )
                 logger.warning(msg)
                 log_event(msg, level="warn", state_dir=state_dir)
-                return None, float("inf")
 
     king_kl = state.scores.get(str(h2h_king_uid), float("inf"))
     msg = (
@@ -599,6 +602,21 @@ def _resolve_coordinated_king(
         )
         raise RuntimeError(msg) from exc
 
+    h2h_uid, h2h_kl = _resolve_h2h_king_for_coordination(
+        n_uids, valid_models, state, state_dir,
+        f"canonical h2h_latest overrides chain consensus UID {chain_king_uid}",
+    )
+    if h2h_uid is not None and h2h_uid != chain_king_uid:
+        msg = (
+            f"coordination: using canonical h2h_latest UID {h2h_uid} instead "
+            f"of on-chain weight consensus UID {chain_king_uid} at block "
+            f"{weight_block}; chain weights may lag a repaired or "
+            "provisional-rescore state"
+        )
+        logger.warning(msg)
+        log_event(msg, level="warn", state_dir=state_dir)
+        return h2h_uid, h2h_kl, "h2h_latest"
+
     if chain_king_uid is not None and chain_king_uid in valid_models:
         if is_single_eval_mode():
             chain_record = (
@@ -620,10 +638,6 @@ def _resolve_coordinated_king(
                     )
                     logger.warning(msg)
                     log_event(msg, level="warn", state_dir=state_dir)
-                    h2h_uid, h2h_kl = _resolve_h2h_king_for_coordination(
-                        n_uids, valid_models, state, state_dir,
-                        f"chain consensus UID {chain_king_uid} failed quality floor",
-                    )
                     if h2h_uid is not None:
                         return h2h_uid, h2h_kl, "h2h_latest"
                     return None, float("inf"), "chain_consensus"
@@ -649,9 +663,6 @@ def _resolve_coordinated_king(
         )
     logger.warning(msg)
     log_event(msg, level="warn", state_dir=state_dir)
-    h2h_uid, h2h_kl = _resolve_h2h_king_for_coordination(
-        n_uids, valid_models, state, state_dir, msg,
-    )
     if h2h_uid is not None:
         return h2h_uid, h2h_kl, "h2h_latest"
     return None, float("inf"), "chain_consensus"
@@ -717,6 +728,50 @@ def _resolve_persisted_h2h_king_uid(n_uids, state_dir):
     except Exception:
         return None
     return _coerce_valid_uid(data.get("king_uid"), n_uids)
+
+
+def _coerce_h2h_incumbent_uid(value, n_uids):
+    if n_uids is not None:
+        return _coerce_valid_uid(value, n_uids)
+    try:
+        uid = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return uid if uid >= 0 else None
+
+
+def _h2h_incumbent_uid_from_latest(latest, n_uids):
+    if not isinstance(latest, dict):
+        return None
+    king_uid = _coerce_h2h_incumbent_uid(latest.get("king_uid"), n_uids)
+    if king_uid is not None:
+        return king_uid
+    crown_rescore = latest.get("crown_rescore")
+    if not isinstance(crown_rescore, dict):
+        return None
+    if crown_rescore.get("selected_king_uid") is not None:
+        return None
+    return _coerce_h2h_incumbent_uid(crown_rescore.get("previous_king_uid"), n_uids)
+
+
+def _resolve_persisted_h2h_incumbent_uid(n_uids, state_dir, state=None):
+    """Return the last H2H incumbent for eval seating.
+
+    This is intentionally broader than ``_resolve_persisted_h2h_king_uid``:
+    a scoring-policy rescore may mark the stored king as uncrowned for weight
+    purposes, but that same model must still be seated as the incumbent for the
+    next paired comparison round.
+    """
+    state_latest = getattr(state, "h2h_latest", None) if state is not None else None
+    uid = _h2h_incumbent_uid_from_latest(state_latest, n_uids)
+    if uid is not None:
+        return uid
+    try:
+        state_path = Path(state_dir) / "h2h_latest.json"
+        data = json.loads(state_path.read_text())
+    except Exception:
+        return None
+    return _h2h_incumbent_uid_from_latest(data, n_uids)
 
 
 def _resolve_no_winner_weight_target(
@@ -845,15 +900,43 @@ def _stamp_h2h_latest_crown_rescore(
 
     if selected_uid is None:
         latest["prev_king_uid"] = previous_uid
-        latest["king_uid"] = None
-        latest["king_model"] = ""
-        latest["king_kl"] = None
-        latest["king_h2h_kl"] = None
+        latest["king_uid"] = previous_uid
+        previous_info = valid_models.get(previous_uid, {}) if previous_uid is not None else {}
+        latest["king_model"] = latest.get("king_model") or previous_info.get("model") or ""
+        latest["uncrowned_incumbent_uid"] = previous_uid
+        latest["weight_fallback_uid"] = fallback_uid
         latest["new_king_uid"] = None
         latest["king_changed"] = False
         latest["king_retained_reason"] = (
             f"Stored king UID {previous_uid} rejected by current scoring "
-            f"policy; fallback weights target is UID {fallback_uid}"
+            f"policy for crown weights; retaining it as the paired-eval "
+            f"incumbent while fallback weights target UID {fallback_uid}"
+        )
+    elif selected_uid is not None and previous_uid is not None and selected_uid != previous_uid:
+        selected_record = decision.get("selected_record") or {}
+        selected_info = valid_models.get(selected_uid, {}) or {}
+        previous_info = valid_models.get(previous_uid, {}) or {}
+        latest["prev_king_uid"] = previous_uid
+        latest["king_uid"] = previous_uid
+        latest["king_model"] = (
+            latest.get("king_model")
+            or previous_info.get("model")
+            or ""
+        )
+        latest["provisional_rescored_king_uid"] = selected_uid
+        latest["provisional_rescored_king_model"] = (
+            selected_info.get("model")
+            or selected_record.get("model")
+            or ""
+        )
+        latest["uncrowned_incumbent_uid"] = previous_uid
+        latest["weight_fallback_uid"] = fallback_uid
+        latest["new_king_uid"] = None
+        latest["king_changed"] = False
+        latest["king_retained_reason"] = (
+            f"Scoring rescore preferred UID {selected_uid}, but crown changes "
+            "must be confirmed by the coordinated H2H round; retaining "
+            f"UID {previous_uid} as canonical incumbent"
         )
     else:
         selected_record = decision.get("selected_record") or {}
@@ -940,6 +1023,16 @@ def rescore_persisted_king_after_scoring_change(
                     fallback_uid, state_dir,
                 )
             sync_king_runtime(False, "", None)
+    elif selected_uid is not None and previous_uid is not None and selected_uid != previous_uid:
+        fallback_uid = previous_uid
+        fallback_source = "coordinated H2H incumbent"
+        weights_set = False
+        logger.warning(
+            "single-eval: scoring rescore changed king UID %s -> UID %s; "
+            "deferring weights/runtime switch until coordinated H2H confirms",
+            previous_uid,
+            selected_uid,
+        )
     else:
         fallback_uid = selected_uid
         fallback_source = "rescored king"
@@ -2368,17 +2461,28 @@ def run_validator(network, netuid, wallet_name, hotkey_name, wallet_path,
                     logger.warning("Invalid QUASAR_MIN_COMMIT_BLOCK=%r; ignoring", min_commit_block_raw)
                 else:
                     before = len(commitments)
+                    protected_incumbent_uid = _resolve_persisted_h2h_incumbent_uid(
+                        n_uids, state_dir, state,
+                    )
                     commitments = {
                         uid: info for uid, info in commitments.items()
-                        if int((info or {}).get("block") or 0) >= min_commit_block
+                        if (
+                            uid == protected_incumbent_uid
+                            or int((info or {}).get("block") or 0) >= min_commit_block
+                        )
                     }
                     uid_to_hotkey = {uid: hk for uid, hk in uid_to_hotkey.items() if uid in commitments}
                     uid_to_coldkey = {uid: ck for uid, ck in uid_to_coldkey.items() if uid in commitments}
                     removed = before - len(commitments)
                     if removed:
+                        protected_msg = (
+                            f"; protected incumbent UID {protected_incumbent_uid}"
+                            if protected_incumbent_uid in commitments else ""
+                        )
                         msg = (
                             f"Filtered {removed} commitment(s) older than block "
                             f"{min_commit_block}; {len(commitments)} remain"
+                            f"{protected_msg}"
                         )
                         logger.warning(msg)
                         log_event(msg, level="warn", state_dir=state_dir)

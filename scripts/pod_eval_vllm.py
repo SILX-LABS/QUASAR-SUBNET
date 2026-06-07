@@ -191,6 +191,17 @@ def _log_quasar_memory_generate_mode(mode: str, detail: str) -> None:
     print(f"[quasar-memory-generate] mode={mode} {detail}", flush=True)
 
 
+def _new_fla_cache(cache_cls, *, seen_tokens: int = 0):
+    """Create an FLA Cache across minor constructor API differences."""
+    try:
+        return cache_cls(seen_tokens=seen_tokens)
+    except TypeError:
+        cache = cache_cls()
+        if hasattr(cache, "_seen_tokens"):
+            cache._seen_tokens = seen_tokens
+        return cache
+
+
 def quasar_memory_generate(
     model,
     input_ids: torch.Tensor,
@@ -255,7 +266,7 @@ def quasar_memory_generate(
     memory_states = None
     try:
         from fla.models.utils import Cache as FlaCache
-        past_key_values = FlaCache(seen_tokens=0)
+        past_key_values = _new_fla_cache(FlaCache, seen_tokens=0)
     except Exception as e:
         _log_quasar_memory_generate_mode(
             "hf_no_cache",
@@ -341,22 +352,34 @@ def _batch_state_value(values):
     """Concatenate a per-row Quasar/FLA cache state along batch dim."""
     if not values:
         return None
-    first = next((v for v in values if v is not None), None)
-    if first is None:
+    if all(v is None for v in values):
         return None
+    if any(v is None for v in values):
+        raise RuntimeError("cannot batch mixed missing/present FLA state")
+    first = values[0]
     if isinstance(first, torch.Tensor):
+        if any(not isinstance(v, torch.Tensor) for v in values):
+            raise TypeError("cannot batch mixed FLA tensor/non-tensor states")
         return torch.cat(values, dim=0)
     if isinstance(first, dict):
+        keys = list(first.keys())
+        key_set = set(keys)
+        if any(not isinstance(v, dict) or set(v.keys()) != key_set for v in values):
+            raise RuntimeError("cannot batch FLA dict states with different keys")
         return {
             key: _batch_state_value([v[key] for v in values])
-            for key in first.keys()
+            for key in keys
         }
     if isinstance(first, tuple):
+        if any(not isinstance(v, tuple) or len(v) != len(first) for v in values):
+            raise RuntimeError("cannot batch FLA tuple states with different shapes")
         return tuple(
             _batch_state_value([v[i] for v in values])
             for i in range(len(first))
         )
     if isinstance(first, list):
+        if any(not isinstance(v, list) or len(v) != len(first) for v in values):
+            raise RuntimeError("cannot batch FLA list states with different shapes")
         return [
             _batch_state_value([v[i] for v in values])
             for i in range(len(first))
@@ -391,7 +414,10 @@ def _batch_fla_caches(caches):
     """Build one batched FlaCache from per-row FlaCache objects."""
     from fla.models.utils import Cache as FlaCache
 
-    batched = FlaCache(seen_tokens=getattr(caches[0], "_seen_tokens", 0))
+    batched = _new_fla_cache(
+        FlaCache,
+        seen_tokens=getattr(caches[0], "_seen_tokens", 0),
+    )
     n_layers = len(caches[0].layers)
     for cache in caches[1:]:
         if len(cache.layers) != n_layers:
@@ -412,7 +438,7 @@ def _slice_fla_cache(cache, row: int):
     """Extract one row cache from a batched FlaCache."""
     from fla.models.utils import Cache as FlaCache
 
-    sliced = FlaCache(seen_tokens=getattr(cache, "_seen_tokens", 0))
+    sliced = _new_fla_cache(FlaCache, seen_tokens=getattr(cache, "_seen_tokens", 0))
     for layer_idx, layer in enumerate(cache.layers):
         _ensure_fla_layer(sliced, layer_idx)
         sliced.layers[layer_idx].state = _slice_state_value(layer.state, row)
@@ -503,7 +529,7 @@ def quasar_memory_generate_batch(
         for idx, ids in enumerate(input_ids_list):
             if ids.ndim != 2 or int(ids.shape[0]) != 1:
                 raise RuntimeError("batch FLA generation expects [1, seq] inputs")
-            cache = FlaCache(seen_tokens=0)
+            cache = _new_fla_cache(FlaCache, seen_tokens=0)
             pos = torch.arange(
                 prompt_lens[idx], device=ids.device, dtype=torch.long,
             ).unsqueeze(0)
@@ -3182,6 +3208,10 @@ def _render_chat_prompt(tokenizer, user_text: str, enable_thinking: bool = False
 # design doc and rationale.
 
 BENCH_BATTERY_ENABLED = os.environ.get("BENCH_BATTERY_ENABLED", "1") != "0"
+# Default fast path: only pay the expensive public-bench battery for models
+# that can still dethrone after paired KL, plus the incumbent reference.
+BENCH_ONLY_KL_CANDIDATES = os.environ.get("BENCH_ONLY_KL_CANDIDATES", "1") != "0"
+BENCH_KL_CANDIDATE_SLACK = float(os.environ.get("BENCH_KL_CANDIDATE_SLACK", "0.0"))
 
 # 2026-04-24 — upstream operators flagged the bench battery as the
 # new bottleneck after the teacher-gen GIL fix (379s/student × 14 ≈ 88 min
@@ -10950,6 +10980,140 @@ def main():
         )
         raise SystemExit(42)
 
+    def _run_benchmark_battery_for_student(student, student_name, student_idx):
+        """Run and persist benchmark axes for a student that can affect crown state."""
+        if student is None or not BENCH_BATTERY_ENABLED:
+            return 0.0
+        try:
+            _set_student_progress(
+                "benchmark_probe",
+                student_name,
+                student_idx,
+                "Benchmark probes",
+                prompts_done=0,
+            )
+
+            def _bench_progress(axis_name, axis_idx, axis_total, status, payload=None):
+                axis_label = axis_name.replace("_bench", "").replace("_", " ").title()
+                fields = {
+                    "prompts_done": 0,
+                    "bench_axis": axis_name,
+                    "bench_axis_label": axis_label,
+                    "bench_axis_index": axis_idx,
+                    "bench_axis_total": axis_total,
+                    "bench_axis_status": status,
+                }
+                if isinstance(payload, dict):
+                    fields.update({
+                        "bench_axis_n": payload.get("n", 0),
+                        "bench_axis_correct": payload.get("correct", 0),
+                        "bench_axis_pass_frac": payload.get("pass_frac", 0.0),
+                        "bench_axis_wall_s": payload.get("wall_s", 0.0),
+                        "bench_axis_error": payload.get("error"),
+                    })
+                _set_student_progress(
+                    "benchmark_probe",
+                    student_name,
+                    student_idx,
+                    f"Benchmark probes: {axis_label}",
+                    **fields,
+                )
+
+            bench_res = run_bench_battery(
+                student, tokenizer, device, progress_cb=_bench_progress,
+            )
+            total_w = bench_res.pop("_total_wall_s", 0.0)
+            results["students"].setdefault(student_name, {})
+            summary_bits = []
+            for axis_name, payload in bench_res.items():
+                if not isinstance(payload, dict):
+                    continue
+                results["students"][student_name][axis_name] = {
+                    "n": payload.get("n", 0),
+                    "correct": payload.get("correct", 0),
+                    "pass_frac": round(payload.get("pass_frac", 0.0), 3),
+                    "wall_s": payload.get("wall_s", 0.0),
+                    "items": payload.get("items", []),
+                    "error": payload.get("error"),
+                    "mean_gen_tokens": payload.get("mean_gen_tokens", 0.0),
+                    "mean_gen_tokens_correct": payload.get(
+                        "mean_gen_tokens_correct", 0.0
+                    ),
+                }
+                short = axis_name.replace("_bench", "")
+                if payload.get("_skipped"):
+                    summary_bits.append(f"{short}=SKIP")
+                elif payload.get("error"):
+                    summary_bits.append(f"{short}=ERR")
+                elif payload.get("n", 0) > 0:
+                    summary_bits.append(
+                        f"{short}={payload['correct']}/{payload['n']} "
+                        f"({payload['pass_frac']*100:.0f}%)"
+                    )
+                else:
+                    summary_bits.append(f"{short}=skip")
+            token_bits = []
+            for axis_name, payload in bench_res.items():
+                if not isinstance(payload, dict):
+                    continue
+                if payload.get("error") or not payload.get("n"):
+                    continue
+                mg = payload.get("mean_gen_tokens") or 0.0
+                mgc = payload.get("mean_gen_tokens_correct") or 0.0
+                token_bits.append(
+                    f"{axis_name.replace('_bench', '')}={mg:.0f}/{mgc:.0f}"
+                )
+            print(
+                f"[eval] Bench battery (Arena v3 — live composite axes): "
+                f"{' | '.join(summary_bits)} "
+                f"[total {total_w:.1f}s]",
+                flush=True,
+            )
+            if token_bits:
+                print(
+                    "[eval] Bench tokens (all/correct): "
+                    + " | ".join(token_bits),
+                    flush=True,
+                )
+            return float(total_w or 0.0)
+        except Exception as e:
+            if _is_cuda_context_poisoned(e):
+                _request_fresh_process(
+                    student_name,
+                    "bench_cuda_error",
+                    f"bench:{e}",
+                )
+            print(f"[eval] Bench battery error (non-fatal): {e}", flush=True)
+            return 0.0
+
+    def _should_run_benchmark_battery(
+        *,
+        is_king,
+        status,
+        early_stopped,
+        scoring_error,
+        kl_avg,
+        king_kl_for_bench,
+    ):
+        if not BENCH_BATTERY_ENABLED:
+            return False, "disabled"
+        if is_king:
+            return True, "incumbent"
+        if not BENCH_ONLY_KL_CANDIDATES:
+            return True, "all_students"
+        if scoring_error:
+            return False, "scoring_error"
+        if early_stopped:
+            return False, "early_stopped"
+        if status not in ("scored", "partial"):
+            return False, f"status_{status}"
+        if king_kl_for_bench is None:
+            return True, "no_king_kl"
+        threshold = float(king_kl_for_bench) + float(BENCH_KL_CANDIDATE_SLACK)
+        if float(kl_avg) < threshold:
+            return True, "kl_candidate"
+        return False, "kl_not_candidate"
+
     # Early stopping state. args.early_stop_min <= 0 disables it outright.
     best_kl_so_far = None
     best_kl_per_prompt_cumulative = None
@@ -10964,6 +11128,7 @@ def main():
     # every subsequent challenger to at most N so every paired comparison
     # has the exact same number of matched pairs. Fairness > throughput.
     king_prompts_done = None
+    king_kl_for_bench = None
 
     # King stays in VRAM
     king_model = None
@@ -11449,121 +11614,8 @@ def main():
                 print(f"[eval] Chat-turns probe collection error "
                       f"(non-fatal): {e}", flush=True)
 
-        # ── Pareto holistic bench battery (SHADOW) ─────────────────────
-        # 2026-04-24 — Five absolute-correctness axes drawn from public
-        # held-out benchmarks (GSM8K/MATH, HumanEval, BBH, MMLU-Pro,
-        # IFEval). Shadow mode: computed + logged + shown on dashboard
-        # but not yet in the composite ranking gate. See
-        # ``reports/2026-04-24-pareto-holistic-eval-v2.md``.
-        bench_this = (
-            student is not None
-            and BENCH_BATTERY_ENABLED
-        )
-        if is_king and king_model is not None and student is king_model and load_time == 0.0:
-            bench_this = False
-        if bench_this:
-            try:
-                _set_student_progress(
-                    "benchmark_probe",
-                    student_name,
-                    student_idx,
-                    "Benchmark probes",
-                    prompts_done=0,
-                )
-                def _bench_progress(axis_name, axis_idx, axis_total, status, payload=None):
-                    axis_label = axis_name.replace("_bench", "").replace("_", " ").title()
-                    fields = {
-                        "prompts_done": 0,
-                        "bench_axis": axis_name,
-                        "bench_axis_label": axis_label,
-                        "bench_axis_index": axis_idx,
-                        "bench_axis_total": axis_total,
-                        "bench_axis_status": status,
-                    }
-                    if isinstance(payload, dict):
-                        fields.update({
-                            "bench_axis_n": payload.get("n", 0),
-                            "bench_axis_correct": payload.get("correct", 0),
-                            "bench_axis_pass_frac": payload.get("pass_frac", 0.0),
-                            "bench_axis_wall_s": payload.get("wall_s", 0.0),
-                            "bench_axis_error": payload.get("error"),
-                        })
-                    _set_student_progress(
-                        "benchmark_probe",
-                        student_name,
-                        student_idx,
-                        f"Benchmark probes: {axis_label}",
-                        **fields,
-                    )
-
-                bench_res = run_bench_battery(
-                    student, tokenizer, device, progress_cb=_bench_progress,
-                )
-                total_w = bench_res.pop("_total_wall_s", 0.0)
-                results["students"].setdefault(student_name, {})
-                summary_bits = []
-                for axis_name, payload in bench_res.items():
-                    if not isinstance(payload, dict):
-                        continue
-                    results["students"][student_name][axis_name] = {
-                        "n": payload.get("n", 0),
-                        "correct": payload.get("correct", 0),
-                        "pass_frac": round(payload.get("pass_frac", 0.0), 3),
-                        "wall_s": payload.get("wall_s", 0.0),
-                        "items": payload.get("items", []),
-                        "error": payload.get("error"),
-                        "mean_gen_tokens": payload.get("mean_gen_tokens", 0.0),
-                        "mean_gen_tokens_correct": payload.get(
-                            "mean_gen_tokens_correct", 0.0
-                        ),
-                    }
-                    short = axis_name.replace("_bench", "")
-                    if payload.get("_skipped"):
-                        summary_bits.append(f"{short}=SKIP")
-                    elif payload.get("error"):
-                        summary_bits.append(f"{short}=ERR")
-                    elif payload.get("n", 0) > 0:
-                        summary_bits.append(
-                            f"{short}={payload['correct']}/{payload['n']} "
-                            f"({payload['pass_frac']*100:.0f}%)"
-                        )
-                    else:
-                        summary_bits.append(f"{short}=skip")
-                # Collect a compact mean-tokens line so we can eyeball
-                # over-thinking vs memorization at a glance. Only axes
-                # that actually emitted items get a number; shadow-axes
-                # that ran at n=0 are omitted.
-                token_bits = []
-                for axis_name, payload in bench_res.items():
-                    if not isinstance(payload, dict):
-                        continue
-                    if payload.get("error") or not payload.get("n"):
-                        continue
-                    mg = payload.get("mean_gen_tokens") or 0.0
-                    mgc = payload.get("mean_gen_tokens_correct") or 0.0
-                    token_bits.append(
-                        f"{axis_name.replace('_bench', '')}={mg:.0f}/{mgc:.0f}"
-                    )
-                print(
-                    f"[eval] Bench battery (Arena v3 — live composite axes): "
-                    f"{' | '.join(summary_bits)} "
-                    f"[total {total_w:.1f}s]",
-                    flush=True,
-                )
-                if token_bits:
-                    print(
-                        "[eval] Bench tokens (all/correct): "
-                        + " | ".join(token_bits),
-                        flush=True,
-                    )
-            except Exception as e:
-                if _is_cuda_context_poisoned(e):
-                    _request_fresh_process(
-                        student_name,
-                        "bench_cuda_error",
-                        f"bench:{e}",
-                    )
-                print(f"[eval] Bench battery error (non-fatal): {e}", flush=True)
+        # The Pareto holistic bench battery is intentionally deferred until
+        # after KL scoring so obvious non-candidates do not spend 30m+ here.
 
         # ── Activation fingerprint (for functional copy detection) ──
         if student is not None:
@@ -12009,15 +12061,11 @@ def main():
                 except Exception as e:
                     print(f"  → On-policy rollouts skipped: {str(e)[:140]}", flush=True)
 
-            # Merge KL scoring fields into the existing student dict
-            # instead of replacing it — all the probes and benches above
-            # (capability, judge_probe_meta, chat_turns_probe_meta, math_bench,
-            # code_bench, reasoning_bench, knowledge_bench, ifeval_bench,
-            # aime_bench, mbpp_bench, tool_use_bench, self_consistency_bench,
-            # arc_bench, truthful_bench, long_context_bench, think_probe,
-            # chat_probe, activation_fingerprint, on_policy_rkl…) already
-            # live in ``results["students"][student_name]`` and were silently
-            # wiped by a previous overwrite-with-preserved-4-keys pattern.
+            # Merge KL scoring fields into the existing student dict instead
+            # of replacing it. Probes collected before scoring already live
+            # in ``results["students"][student_name]``; the expensive bench
+            # battery may append after this KL gate. A previous overwrite-
+            # with-preserved-4-keys pattern silently wiped these axes.
             # The bug surfaced in upstream production review:
             # mrchen): last clean round's h2h_latest.json showed every v3
             # axis as ``null`` for every challenger — only ``kl``,
@@ -12026,6 +12074,52 @@ def main():
             # system in practice even though the code registered 20 axes.
             existing = results["students"].setdefault(student_name, {})
             existing.update(student_result)
+
+            if is_king and king_kl_for_bench is None:
+                king_kl_for_bench = kl_avg
+
+            bench_cached_king = (
+                is_king
+                and king_model is not None
+                and student is king_model
+                and load_time == 0.0
+            )
+            if bench_cached_king:
+                bench_run, bench_reason = False, "incumbent_cached"
+            else:
+                bench_run, bench_reason = _should_run_benchmark_battery(
+                    is_king=is_king,
+                    status=status,
+                    early_stopped=early_stopped,
+                    scoring_error=scoring_error,
+                    kl_avg=kl_avg,
+                    king_kl_for_bench=king_kl_for_bench,
+                )
+
+            bench_gate = {
+                "run": bool(bench_run),
+                "reason": bench_reason,
+                "only_kl_candidates": BENCH_ONLY_KL_CANDIDATES,
+                "kl_candidate_slack": BENCH_KL_CANDIDATE_SLACK,
+                "student_kl": round(kl_avg, 6),
+                "king_kl": (
+                    round(float(king_kl_for_bench), 6)
+                    if king_kl_for_bench is not None else None
+                ),
+            }
+            if bench_run:
+                bench_wall = _run_benchmark_battery_for_student(
+                    student, student_name, student_idx,
+                )
+                bench_gate["wall_s"] = round(float(bench_wall), 1)
+            else:
+                print(
+                    f"[eval] Bench battery skipped: reason={bench_reason} "
+                    f"student_kl={kl_avg:.6f} "
+                    f"king_kl={king_kl_for_bench if king_kl_for_bench is not None else 'unknown'}",
+                    flush=True,
+                )
+            existing["bench_gate"] = bench_gate
 
             if kl_avg > 0.001 and not early_stopped and not scoring_error:
                 if best_kl_so_far is None or kl_avg < best_kl_so_far:

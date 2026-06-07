@@ -81,7 +81,7 @@ def parse_commitments(metagraph, revealed: dict, n_uids: int) -> tuple[dict, dic
             try:
                 parsed = json.loads(data)
                 if "model" in parsed:
-                    commitments[uid] = {"block": block, "hotkey": hotkey, **parsed}
+                    commitments[uid] = {**parsed, "block": block, "hotkey": hotkey}
             except Exception:
                 continue
 

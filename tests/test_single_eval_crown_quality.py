@@ -18,6 +18,25 @@ class DummyState:
         self.h2h_latest = {"king_uid": prior_king_uid} if prior_king_uid is not None else {}
 
 
+class StampState:
+    def __init__(self):
+        self.h2h_latest = {
+            "king_uid": 211,
+            "king_model": "coolroman/quasar-sn24-v56",
+            "king_changed": False,
+            "new_king_uid": None,
+        }
+        self.scores = {"169": 2.919188}
+        self.saved_h2h = False
+        self.saved = False
+
+    def save_h2h(self):
+        self.saved_h2h = True
+
+    def save(self):
+        self.saved = True
+
+
 def _record(non_relative_value: float, *, weighted: float = 0.0, worst: float = 0.0) -> dict:
     from scripts.validator.single_eval import CROWN_QUALITY_EXCLUDED_AXES
     from scripts.validator.composite import (
@@ -155,6 +174,35 @@ class TestSingleEvalCrownQuality(unittest.TestCase):
         self.assertFalse(decision["changed"])
         self.assertEqual(decision["selected_king_uid"], 42)
         self.assertEqual(decision["reason"], "persisted_king_still_valid")
+
+    def test_rescore_stamp_preserves_canonical_king_until_h2h_confirms(self):
+        from scripts.validator.service import _stamp_h2h_latest_crown_rescore
+
+        state = StampState()
+        decision = {
+            "reason": "rescored_king_changed",
+            "previous_king_uid": 211,
+            "selected_king_uid": 169,
+            "selected_record": {"model": "coolroman/quasar-sn24-v60"},
+        }
+        valid_models = {
+            211: {"model": "coolroman/quasar-sn24-v56"},
+            169: {"model": "coolroman/quasar-sn24-v60"},
+        }
+
+        _stamp_h2h_latest_crown_rescore(
+            state, decision, valid_models,
+            fallback_uid=211, fallback_source="coordinated H2H incumbent",
+            weights_set=False,
+        )
+
+        self.assertEqual(state.h2h_latest["king_uid"], 211)
+        self.assertFalse(state.h2h_latest["king_changed"])
+        self.assertIsNone(state.h2h_latest["new_king_uid"])
+        self.assertEqual(state.h2h_latest["provisional_rescored_king_uid"], 169)
+        self.assertEqual(state.h2h_latest["weight_fallback_uid"], 211)
+        self.assertTrue(state.saved_h2h)
+        self.assertTrue(state.saved)
 
     def test_incumbent_cannot_hold_when_current_round_dqs_it(self):
         from scripts.validator.service import _incumbent_can_hold

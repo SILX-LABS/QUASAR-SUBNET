@@ -1,5 +1,6 @@
 import logging
 import json
+import math
 import os
 import time
 from pathlib import Path
@@ -8,6 +9,7 @@ from eval.scoring import disqualify
 from eval.state import ValidatorState
 from scripts.validator.config import MAX_KL_THRESHOLD, TOP_N_ALWAYS_INCLUDE
 from scripts.validator.coordination import (
+    EVAL_RATE_LIMIT_WINDOW_BLOCKS,
     maintenance_challenger_uids,
     reset_anchor_challenger_uids,
     scheduled_challenger_uids,
@@ -75,6 +77,157 @@ def _reset_anchor_path(state: ValidatorState) -> Path:
     return _state_dir(state) / RESET_ANCHOR_FILE
 
 
+def _load_state_json(state: ValidatorState, filename: str, default):
+    path = _state_dir(state) / filename
+    try:
+        with path.open() as handle:
+            data = json.load(handle)
+        return data if isinstance(data, type(default)) else default
+    except FileNotFoundError:
+        return default
+    except Exception as exc:
+        logger.warning("single-eval: could not read %s: %s", path, exc)
+        return default
+
+
+def _finite_positive(value) -> bool:
+    try:
+        value_f = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return False
+    return math.isfinite(value_f) and value_f > 0
+
+
+def _record_has_successful_score(record) -> bool:
+    if not isinstance(record, dict):
+        return False
+    if record.get("disqualified") or record.get("eligible") is False:
+        return False
+    if _finite_positive(record.get("kl")):
+        return True
+    if _finite_positive(record.get("h2h_kl")):
+        return True
+    if _finite_positive(record.get("king_h2h_kl")):
+        return True
+    return record.get("worst") is not None or record.get("weighted") is not None
+
+
+def _scored_uid_rows(state: ValidatorState):
+    for uid_str, record in (getattr(state, "composite_scores", {}) or {}).items():
+        if _record_has_successful_score(record):
+            try:
+                yield int(uid_str), record, record.get("block")
+            except (TypeError, ValueError):
+                continue
+
+    for uid_str, score in (getattr(state, "scores", {}) or {}).items():
+        if _finite_positive(score) and float(score) < float(MAX_KL_THRESHOLD):
+            try:
+                yield int(uid_str), {"kl": score}, None
+            except (TypeError, ValueError):
+                continue
+
+    rounds = []
+    latest = getattr(state, "h2h_latest", None)
+    if isinstance(latest, dict):
+        rounds.append(latest)
+    history = getattr(state, "h2h_history", None)
+    if isinstance(history, list):
+        rounds.extend(item for item in history if isinstance(item, dict))
+    for round_record in rounds:
+        round_block = round_record.get("block")
+        for row in round_record.get("results") or []:
+            if not isinstance(row, dict) or not _record_has_successful_score(row):
+                continue
+            uid = row.get("uid")
+            if uid is None:
+                continue
+            try:
+                yield int(uid), row, row.get("block") or row.get("commit_block") or round_block
+            except (TypeError, ValueError):
+                continue
+
+
+def _uid_hash(uid, hashes):
+    if not isinstance(hashes, dict):
+        return None
+    value = hashes.get(str(uid))
+    if isinstance(value, str) and value:
+        return value
+    return None
+
+
+def _already_scored_identity_index(state: ValidatorState, current_block=None):
+    content_hashes = _load_state_json(state, "model_content_hashes.json", {})
+    weight_hashes = _load_state_json(state, "weight_hashes.json", {})
+    model_hashes = getattr(state, "model_hashes", {}) or {}
+    index = {
+        "content": set(),
+        "weight": set(),
+        "model_hash": set(),
+        "model_revision": set(),
+        "recent_model": set(),
+    }
+    scored_uids = set()
+    try:
+        cutoff_block = int(current_block) - int(EVAL_RATE_LIMIT_WINDOW_BLOCKS)
+    except (TypeError, ValueError, OverflowError):
+        cutoff_block = None
+
+    for uid, record, scored_block in _scored_uid_rows(state):
+        scored_uids.add(uid)
+        for name, hashes in (
+            ("content", content_hashes),
+            ("weight", weight_hashes),
+            ("model_hash", model_hashes),
+        ):
+            value = _uid_hash(uid, hashes)
+            if value:
+                index[name].add(value)
+        model = str((record or {}).get("model") or "").strip()
+        revision = str((record or {}).get("revision") or "").strip()
+        if model and revision:
+            index["model_revision"].add((model, revision))
+        if model and cutoff_block is not None:
+            try:
+                block_i = int(scored_block or 0)
+            except (TypeError, ValueError, OverflowError):
+                block_i = 0
+            if block_i >= cutoff_block:
+                index["recent_model"].add(model)
+    return index, scored_uids, content_hashes, weight_hashes, model_hashes
+
+
+def _already_scored_match(
+    uid,
+    info,
+    identity_state,
+):
+    index, scored_uids, content_hashes, weight_hashes, model_hashes = identity_state
+    if uid in scored_uids:
+        return "uid"
+    for label, hashes in (
+        ("content hash", content_hashes),
+        ("weight hash", weight_hashes),
+        ("model hash", model_hashes),
+    ):
+        value = _uid_hash(uid, hashes)
+        key = {
+            "content hash": "content",
+            "weight hash": "weight",
+            "model hash": "model_hash",
+        }[label]
+        if value and value in index[key]:
+            return label
+    model = str((info or {}).get("model") or "").strip()
+    revision = str((info or {}).get("revision") or "").strip()
+    if model and revision and (model, revision) in index["model_revision"]:
+        return "model@revision"
+    if model and model in index["recent_model"]:
+        return "recent model repo"
+    return None
+
+
 def _read_reset_anchor(state: ValidatorState) -> dict:
     path = _reset_anchor_path(state)
     try:
@@ -125,9 +278,12 @@ def _consume_manual_reset_anchor(state: ValidatorState, coord_round, scheduled) 
     _write_reset_anchor(state, data)
 
 
-def _pending_single_eval_models(valid_models, state: ValidatorState, king_uid):
+def _pending_single_eval_models(
+    valid_models, state: ValidatorState, king_uid, current_block=None
+):
     pending = {}
     evict_stale_evaluated_uids(state, valid_models)
+    identity_state = _already_scored_identity_index(state, current_block)
     for uid, info in valid_models.items():
         uid_str = str(uid)
         model_name = info["model"]
@@ -139,6 +295,15 @@ def _pending_single_eval_models(valid_models, state: ValidatorState, king_uid):
         if uid_str in state.composite_scores:
             continue
         if uid_str in state.evaluated_uids:
+            continue
+        matched = _already_scored_match(uid, info, identity_state)
+        if matched:
+            logger.info(
+                "single-eval: skipping UID %s (%s) — already evaluated by %s",
+                uid,
+                model_name,
+                matched,
+            )
             continue
         pending[uid] = info
     return pending
@@ -200,7 +365,10 @@ def select_challengers(valid_models, state: ValidatorState, king_uid, king_kl,
                     )
         cap = int(single_eval_mod.SINGLE_EVAL_MAX_PER_ROUND)
         if coord_round is not None:
-            pending_models = _pending_single_eval_models(valid_models, state, king_uid)
+            pending_models = _pending_single_eval_models(
+                valid_models, state, king_uid,
+                current_block=getattr(coord_round, "round_start_block", None),
+            )
             manual_reset_anchor = _manual_reset_anchor_requested(state, coord_round)
             if _looks_like_reset_state(state) or manual_reset_anchor:
                 scheduled = reset_anchor_challenger_uids(
@@ -214,11 +382,12 @@ def select_challengers(valid_models, state: ValidatorState, king_uid, king_kl,
                 )
             else:
                 scheduled = scheduled_challenger_uids(
-                    pending_models, coord_round, cap, king_uid=king_uid,
+                    valid_models, coord_round, cap, king_uid=king_uid,
+                    pending_uids=set(pending_models),
                 )
                 if not scheduled:
                     scheduled = maintenance_challenger_uids(
-                        valid_models, coord_round, cap, king_uid=king_uid,
+                        pending_models, coord_round, cap, king_uid=king_uid,
                     )
                     logger.info(
                         f"single-eval: coordination maintenance scheduled "
@@ -233,7 +402,10 @@ def select_challengers(valid_models, state: ValidatorState, king_uid, king_kl,
                     )
             challengers = {uid: valid_models[uid] for uid in scheduled}
         else:
-            challengers = _pending_single_eval_models(valid_models, state, king_uid)
+            current_block = (getattr(state, "eval_progress", {}) or {}).get("current_block")
+            challengers = _pending_single_eval_models(
+                valid_models, state, king_uid, current_block=current_block,
+            )
             # FIFO cap: oldest commitment first. Without this the planner
             # queues every pending new commit at once and rounds bloat to 8h
             # of pod compute. The cap forces rotation across rounds so each
