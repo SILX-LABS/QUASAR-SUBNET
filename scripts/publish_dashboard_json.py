@@ -124,9 +124,9 @@ def _put_dashboard_payloads(s3, bucket, key, body, acl=None):
     return keys
 
 
-def _publish_state_files(s3, bucket, state_dir, prefix="", acl=None):
+def _collect_state_files(state_dir):
     state_dir = Path(state_dir)
-    published = []
+    files = {}
     for name in PUBLIC_STATE_FILES:
         path = state_dir / name
         if not path.exists() or not path.is_file():
@@ -135,11 +135,35 @@ def _publish_state_files(s3, bucket, state_dir, prefix="", acl=None):
             data = json.loads(path.read_text())
         except Exception:
             continue
+        files[name] = data
+    return files
+
+
+def _publish_state_files(s3, bucket, state_files, prefix="", acl=None):
+    published = []
+    for name, data in state_files.items():
         body = json.dumps(data, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
         key = f"{prefix.strip('/')}/{name}" if prefix.strip("/") else name
         _put_json(s3, bucket, key, body, acl=acl)
         published.append((key, len(body)))
     return published
+
+
+def _push_state_files(push_url, token, state_files):
+    if not push_url or not token or not state_files:
+        return []
+    endpoint = push_url.rstrip("/") + "/api/internal/state"
+    timeout = float(_env("QUASAR_STATE_PUSH_TIMEOUT", "10"))
+    response = requests.post(
+        endpoint,
+        json={"files": state_files},
+        headers={"X-Quasar-State-Token": token},
+        timeout=timeout,
+    )
+    response.raise_for_status()
+    data = response.json()
+    written = data.get("written", [])
+    return written if isinstance(written, list) else []
 
 
 def main():
@@ -161,31 +185,35 @@ def main():
     acl = _env("QUASAR_BUCKET_ACL")
     state_dir = _env("QUASAR_STATE_DIR", str(ROOT / "state"))
     state_prefix = _env("QUASAR_STATE_KEY_PREFIX", "")
+    push_url = _env("QUASAR_STATE_PUSH_URL")
+    push_token = _env("QUASAR_STATE_PUSH_TOKEN")
 
     if not bucket:
         raise SystemExit("Set QUASAR_BUCKET_NAME, for example: quasar")
 
     payload = _dashboard_payload(source_url)
     body = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    state_file_payloads = _collect_state_files(state_dir)
 
     if args.dry_run:
         print(f"dashboard payload: {len(body)} bytes for s3://{bucket}/{key}")
         if not args.dashboard_only:
-            existing = [
-                name for name in PUBLIC_STATE_FILES
-                if (Path(state_dir) / name).exists()
-            ]
+            existing = list(state_file_payloads)
             print(f"state files: {len(existing)} from {state_dir}: {', '.join(existing)}")
         return
+
+    pushed = _push_state_files(push_url, push_token, state_file_payloads)
 
     s3 = _client(endpoint, region, addressing_style)
     dashboard_keys = _put_dashboard_payloads(s3, bucket, key, body, acl=acl)
     state_files = []
     if not args.dashboard_only:
         state_files = _publish_state_files(
-            s3, bucket, state_dir, prefix=state_prefix, acl=acl,
+            s3, bucket, state_file_payloads, prefix=state_prefix, acl=acl,
         )
     suffix = f" + {len(state_files)} state file(s)" if state_files else ""
+    if pushed:
+        suffix += f" + pushed {len(pushed)} state file(s)"
     key_suffix = f" ({', '.join(dashboard_keys)})" if len(dashboard_keys) > 1 else ""
     print(f"published {len(body)} bytes to {endpoint.rstrip('/')}/{bucket}/{key}{key_suffix}{suffix}")
 

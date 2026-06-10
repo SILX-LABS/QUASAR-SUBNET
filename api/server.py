@@ -19,6 +19,7 @@ from routes.chat import router as chat_router
 from routes.debugging import router as debugging_router
 from routes.telemetry import router as telemetry_router
 from routes.dashboard import router as dashboard_router
+from routes.state_ingest import router as state_ingest_router
 
 
 app = FastAPI(
@@ -78,6 +79,7 @@ app.include_router(chat_router)
 app.include_router(debugging_router)
 app.include_router(telemetry_router)
 app.include_router(dashboard_router)
+app.include_router(state_ingest_router)
 
 # ── Startup: prime caches ────────────────────────────────────────────────────
 
