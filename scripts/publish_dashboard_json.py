@@ -204,18 +204,25 @@ def main():
 
     pushed = _push_state_files(push_url, push_token, state_file_payloads)
 
-    s3 = _client(endpoint, region, addressing_style)
-    dashboard_keys = _put_dashboard_payloads(s3, bucket, key, body, acl=acl)
     state_files = []
-    if not args.dashboard_only:
-        state_files = _publish_state_files(
-            s3, bucket, state_file_payloads, prefix=state_prefix, acl=acl,
-        )
+    dashboard_keys = []
+    try:
+        s3 = _client(endpoint, region, addressing_style)
+        dashboard_keys = _put_dashboard_payloads(s3, bucket, key, body, acl=acl)
+        if not args.dashboard_only:
+            state_files = _publish_state_files(
+                s3, bucket, state_file_payloads, prefix=state_prefix, acl=acl,
+            )
+    except Exception as exc:
+        if not pushed:
+            raise
+        print(f"s3 publish failed after state push: {type(exc).__name__}: {exc}")
     suffix = f" + {len(state_files)} state file(s)" if state_files else ""
     if pushed:
         suffix += f" + pushed {len(pushed)} state file(s)"
     key_suffix = f" ({', '.join(dashboard_keys)})" if len(dashboard_keys) > 1 else ""
-    print(f"published {len(body)} bytes to {endpoint.rstrip('/')}/{bucket}/{key}{key_suffix}{suffix}")
+    target = f"{endpoint.rstrip('/')}/{bucket}/{key}" if dashboard_keys else "state push endpoint"
+    print(f"published {len(body)} bytes to {target}{key_suffix}{suffix}")
 
 
 if __name__ == "__main__":
