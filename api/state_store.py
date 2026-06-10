@@ -57,8 +57,10 @@ def _read_remote_state(filename, default=None):
         default = {}
     cache_file = _remote_cache_path(filename)
     now = time.time()
+    cache_exists = False
     try:
-        if os.path.exists(cache_file) and now - os.path.getmtime(cache_file) <= REMOTE_STATE_TTL:
+        cache_exists = os.path.exists(cache_file)
+        if cache_exists and now - os.path.getmtime(cache_file) <= REMOTE_STATE_TTL:
             return _safe_json_load(cache_file, default)
     except OSError:
         pass
@@ -79,7 +81,7 @@ def _read_remote_state(filename, default=None):
     data = _read_bucket_state(filename, cache_file, default)
     if data is not default:
         return data
-    if os.path.exists(cache_file):
+    if not (REMOTE_STATE_BASE_URL or STATE_BUCKET_NAME) and cache_exists:
         return _safe_json_load(cache_file, default)
     return default
 
@@ -102,7 +104,12 @@ def _read_bucket_state(filename, cache_file, default=None):
             aws_access_key_id=STATE_BUCKET_ACCESS_KEY,
             aws_secret_access_key=STATE_BUCKET_SECRET_KEY,
             region_name=STATE_BUCKET_REGION,
-            config=Config(s3={"addressing_style": STATE_BUCKET_ADDRESSING_STYLE}),
+            config=Config(
+                connect_timeout=REMOTE_STATE_TIMEOUT,
+                read_timeout=REMOTE_STATE_TIMEOUT,
+                retries={"max_attempts": 1},
+                s3={"addressing_style": STATE_BUCKET_ADDRESSING_STYLE},
+            ),
         )
         obj = client.get_object(Bucket=STATE_BUCKET_NAME, Key=key)
         data = json.loads(obj["Body"].read().decode("utf-8"))
