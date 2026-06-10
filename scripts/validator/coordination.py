@@ -86,6 +86,29 @@ def wait_poll_seconds() -> int:
     return max(5, _env_int("QUASAR_COORD_WAIT_POLL_SECONDS", 30))
 
 
+def configured_start_block() -> int | None:
+    """Optional local gate before joining coordinated eval rounds.
+
+    This does not change the coordination manifest. It only lets an operator
+    hold a validator offline until a future chain block before normal
+    round-start logic applies.
+    """
+    raw = (
+        os.environ.get("QUASAR_COORDINATION_START_BLOCK")
+        or os.environ.get("DISTIL_COORDINATION_START_BLOCK")
+    )
+    if raw in (None, ""):
+        return None
+    try:
+        block = int(raw)
+    except (TypeError, ValueError, OverflowError):
+        logger.warning("ignoring invalid QUASAR_COORDINATION_START_BLOCK=%r", raw)
+        return None
+    if block <= 0:
+        return None
+    return block
+
+
 @dataclass(frozen=True)
 class CoordinationRound:
     protocol_version: int
@@ -164,6 +187,18 @@ def next_round_start_block(current_block: int) -> int:
     if in_round_start_window(current_block, coord_round):
         return coord_round.round_start_block
     return coord_round.round_start_block + coord_round.round_blocks
+
+
+def round_start_wait_target(current_block: int) -> tuple[int | None, str]:
+    """Return the next block to wait for, or ``None`` when eval may start."""
+    start_block = configured_start_block()
+    if start_block is not None and int(current_block) < start_block:
+        return start_block, "configured_start"
+
+    coord_round = build_coordination_round(current_block)
+    if in_round_start_window(current_block, coord_round):
+        return None, "round_start"
+    return coord_round.round_start_block + coord_round.round_blocks, "coordination_round"
 
 
 def first_eligible_round_id(commit_block: int | float | str | None) -> int:
@@ -354,44 +389,64 @@ def wait_for_round_start(subtensor: Any, state, state_dir: str) -> int | None:
             logger.warning("coordination: could not read chain block before round start: %s", exc)
             time.sleep(wait_poll_seconds())
             continue
-        coord_round = build_coordination_round(current)
-        if in_round_start_window(current, coord_round):
+        target, wait_reason = round_start_wait_target(current)
+        if target is None:
             return current
-        target = coord_round.round_start_block + coord_round.round_blocks
+        coord_round = build_coordination_round(current)
         remaining = max(0, target - current)
+        if wait_reason == "configured_start":
+            stage = "waiting_for_configured_start_block"
+            label = "Waiting for configured start block"
+            detail = (
+                f"Configured validator start block {target} "
+                f"({remaining} blocks left)."
+            )
+            wait_message = "configured start block"
+            telemetry_target_key = "coordination/configured_start_block"
+        else:
+            stage = "waiting_for_coordination_round_start"
+            label = "Waiting for next coordination round"
+            detail = (
+                f"Next coordination round at block {target} "
+                f"({remaining} blocks left)."
+            )
+            wait_message = "next round start block"
+            telemetry_target_key = "coordination/next_round_start_block"
         logger.info(
-            "coordination: waiting for next round start block %s "
+            "coordination: waiting for %s %s "
             "(current=%s, remaining=%s)",
+            wait_message,
             target,
             current,
             remaining,
         )
         telemetry_log({
-            "stage": "waiting_for_coordination_round_start",
+            "stage": stage,
             "coordination/current_block": current,
+            telemetry_target_key: target,
             "coordination/next_round_start_block": target,
             "coordination/blocks_remaining": remaining,
             "coordination/round_id": coord_round.round_id,
         })
         log_event(
-            f"waiting for coordination round start block {target} "
+            f"waiting for {wait_message} {target} "
             f"({remaining} blocks remaining)",
             state_dir=state_dir,
         )
         try:
             state.save_progress({
                 "active": False,
-                "phase": "waiting_for_coordination_round_start",
-                "stage": "waiting_for_coordination_round_start",
+                "phase": stage,
+                "stage": stage,
                 "current_block": current,
                 "next_round_start_block": target,
+                "configured_start_block": (
+                    target if wait_reason == "configured_start" else None
+                ),
                 "blocks_remaining": remaining,
                 "status_mode": "round_wait",
-                "status_label": "Waiting for next coordination round",
-                "status_detail": (
-                    f"Next coordination round at block {target} "
-                    f"({remaining} blocks left)."
-                ),
+                "status_label": label,
+                "status_detail": detail,
                 "updated_at": time.time(),
             })
         except Exception:

@@ -4,8 +4,10 @@ from eval.chain import parse_commitments
 from scripts.validator.challengers import select_challengers
 from scripts.validator.coordination import (
     CoordinationRound,
+    configured_start_block,
     parse_commitments_at_cutoff,
     reset_anchor_challenger_uids,
+    round_start_wait_target,
     scheduled_challenger_uids,
 )
 
@@ -55,6 +57,26 @@ def test_scheduled_challengers_cap_to_five_oldest_pending():
     ])
 
     assert scheduled_challenger_uids(models, _round(), 5) == [11, 12, 13, 14, 15]
+
+
+def test_configured_start_block_waits_until_requested_block(monkeypatch):
+    monkeypatch.setenv("QUASAR_COORDINATION_START_BLOCK", "8381520")
+
+    assert configured_start_block() == 8381520
+    assert round_start_wait_target(8378786) == (8381520, "configured_start")
+
+
+def test_configured_start_block_allows_requested_round_window(monkeypatch):
+    monkeypatch.setenv("QUASAR_COORDINATION_START_BLOCK", "8381520")
+
+    assert round_start_wait_target(8381520) == (None, "round_start")
+
+
+def test_invalid_configured_start_block_is_ignored(monkeypatch):
+    monkeypatch.setenv("QUASAR_COORDINATION_START_BLOCK", "not-a-block")
+
+    assert configured_start_block() is None
+    assert round_start_wait_target(8378786) == (None, "round_start")
 
 
 def test_scheduled_challengers_next_round_takes_remaining_oldest():
