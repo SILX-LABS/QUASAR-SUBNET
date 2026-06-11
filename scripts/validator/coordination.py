@@ -41,6 +41,10 @@ COORD_ACTIVATION_DELAY_BLOCKS = 600
 # evaluates the same frozen candidate set instead of idling for the next round.
 COORD_START_GRACE_BLOCKS = max(1, COORD_ROUND_BLOCKS // 4)
 
+# Temporary clean-restart gate for the June 2026 validator restart. Operators
+# can override with QUASAR_COORDINATION_START_BLOCK, or set it to 0 to disable.
+DEFAULT_COORDINATION_START_BLOCK = 8_382_960
+
 # Bulk-submission fairness. A 24h window is roughly 10 two-epoch coordination
 # rounds at 12s blocks. These constants are deliberately code-level rather
 # than validator-local env knobs so patched validators agree on the same queue.
@@ -98,7 +102,7 @@ def configured_start_block() -> int | None:
         or os.environ.get("DISTIL_COORDINATION_START_BLOCK")
     )
     if raw in (None, ""):
-        return None
+        return DEFAULT_COORDINATION_START_BLOCK
     try:
         block = int(raw)
     except (TypeError, ValueError, OverflowError):

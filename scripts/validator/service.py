@@ -97,6 +97,10 @@ logger = logging.getLogger("quasar.validator")
 
 # ── helpers ──────────────────────────────────────────────────────────────
 
+# Temporary clean-restart eligibility floor. Operators can override with
+# QUASAR_MIN_COMMIT_BLOCK, or set it to 0 to disable.
+DEFAULT_MIN_COMMIT_BLOCK = 8_380_400
+
 _RELATIVE_SELECTION_AXES = CROWN_QUALITY_EXCLUDED_AXES
 
 
@@ -569,11 +573,10 @@ def _resolve_h2h_king_for_coordination(n_uids, valid_models, state, state_dir, r
     return h2h_king_uid, king_kl
 
 
-def _resolve_coordinated_king(
-    subtensor, metagraph, netuid, n_uids, valid_models, state, state_dir,
-    coord_round=None,
-):
-    """Resolve the incumbent king from chain state for coordinated rounds."""
+def _capture_coordination_chain_snapshot(
+    subtensor, metagraph, netuid, n_uids, coord_round, state_dir,
+) -> dict:
+    """Capture block-pinned chain consensus while the round block is fresh."""
     weight_block = getattr(coord_round, "round_start_block", None)
     try:
         # Use documented block-pinned Bittensor APIs for every consensus input:
@@ -601,6 +604,51 @@ def _resolve_coordinated_king(
             state_dir=state_dir,
         )
         raise RuntimeError(msg) from exc
+
+    snapshot = {
+        "weight_block": int(weight_block) if weight_block is not None else None,
+        "chain_king_uid": (
+            int(chain_king_uid) if chain_king_uid is not None else None
+        ),
+        "captured_at": time.time(),
+    }
+    telemetry_log({
+        "stage": "coordination_chain_snapshot_captured",
+        "coordination/weight_block": snapshot["weight_block"],
+        "coordination/chain_king_uid": snapshot["chain_king_uid"],
+    })
+    log_event(
+        "coordination: captured chain consensus snapshot at block "
+        f"{snapshot['weight_block']} (king_uid={snapshot['chain_king_uid']})",
+        state_dir=state_dir,
+    )
+    return snapshot
+
+
+def _resolve_coordinated_king(
+    subtensor, metagraph, netuid, n_uids, valid_models, state, state_dir,
+    coord_round=None, chain_snapshot: dict | None = None,
+):
+    """Resolve the incumbent king from the captured coordinated snapshot."""
+    weight_block = getattr(coord_round, "round_start_block", None)
+    chain_king_uid = None
+    if (
+        isinstance(chain_snapshot, dict)
+        and chain_snapshot.get("weight_block") == weight_block
+    ):
+        raw_uid = chain_snapshot.get("chain_king_uid")
+        chain_king_uid = int(raw_uid) if raw_uid is not None else None
+        logger.info(
+            "coordination: using captured chain consensus snapshot at block %s: UID %s",
+            weight_block,
+            chain_king_uid,
+        )
+    else:
+        chain_snapshot = _capture_coordination_chain_snapshot(
+            subtensor, metagraph, netuid, n_uids, coord_round, state_dir,
+        )
+        raw_uid = chain_snapshot.get("chain_king_uid")
+        chain_king_uid = int(raw_uid) if raw_uid is not None else None
 
     h2h_uid, h2h_kl = _resolve_h2h_king_for_coordination(
         n_uids, valid_models, state, state_dir,
@@ -2430,9 +2478,26 @@ def run_validator(network, netuid, wallet_name, hotkey_name, wallet_path,
             write_api_commitments_cache(commitments, state_dir)
             logger.info(f"Found {len(commitments)} miner commitments")
             coord_round = None
+            coord_chain_snapshot = None
             if coordination_enabled():
                 coord_round = build_coordination_round(current_block)
                 coord_hash = get_block_hash(subtensor, coord_round.eval_seed_block)
+                try:
+                    coord_chain_snapshot = _capture_coordination_chain_snapshot(
+                        subtensor, metagraph, netuid, n_uids, coord_round, state_dir,
+                    )
+                except RuntimeError:
+                    state.save_progress({
+                        "active": False,
+                        "stage": "coordination_chain_snapshot_unavailable",
+                        "coordination": coord_round.to_dict(),
+                        "updated_at": time.time(),
+                    })
+                    state.save()
+                    if once:
+                        break
+                    time.sleep(60)
+                    continue
                 commitments, uid_to_hotkey, uid_to_coldkey = parse_commitments_at_cutoff(
                     metagraph, revealed, n_uids, coord_round.commit_cutoff_block,
                 )
@@ -2454,38 +2519,40 @@ def run_validator(network, netuid, wallet_name, hotkey_name, wallet_path,
                 (uid for uid, hk in uid_to_hotkey.items() if hk == wallet.hotkey.ss58_address), None,
             )
             min_commit_block_raw = os.environ.get("QUASAR_MIN_COMMIT_BLOCK", "").strip()
+            min_commit_block = DEFAULT_MIN_COMMIT_BLOCK
             if min_commit_block_raw:
                 try:
                     min_commit_block = int(min_commit_block_raw)
                 except ValueError:
                     logger.warning("Invalid QUASAR_MIN_COMMIT_BLOCK=%r; ignoring", min_commit_block_raw)
-                else:
-                    before = len(commitments)
-                    protected_incumbent_uid = _resolve_persisted_h2h_incumbent_uid(
-                        n_uids, state_dir, state,
+                    min_commit_block = DEFAULT_MIN_COMMIT_BLOCK
+            if min_commit_block > 0:
+                before = len(commitments)
+                protected_incumbent_uid = _resolve_persisted_h2h_incumbent_uid(
+                    n_uids, state_dir, state,
+                )
+                commitments = {
+                    uid: info for uid, info in commitments.items()
+                    if (
+                        uid == protected_incumbent_uid
+                        or int((info or {}).get("block") or 0) >= min_commit_block
                     )
-                    commitments = {
-                        uid: info for uid, info in commitments.items()
-                        if (
-                            uid == protected_incumbent_uid
-                            or int((info or {}).get("block") or 0) >= min_commit_block
-                        )
-                    }
-                    uid_to_hotkey = {uid: hk for uid, hk in uid_to_hotkey.items() if uid in commitments}
-                    uid_to_coldkey = {uid: ck for uid, ck in uid_to_coldkey.items() if uid in commitments}
-                    removed = before - len(commitments)
-                    if removed:
-                        protected_msg = (
-                            f"; protected incumbent UID {protected_incumbent_uid}"
-                            if protected_incumbent_uid in commitments else ""
-                        )
-                        msg = (
-                            f"Filtered {removed} commitment(s) older than block "
-                            f"{min_commit_block}; {len(commitments)} remain"
-                            f"{protected_msg}"
-                        )
-                        logger.warning(msg)
-                        log_event(msg, level="warn", state_dir=state_dir)
+                }
+                uid_to_hotkey = {uid: hk for uid, hk in uid_to_hotkey.items() if uid in commitments}
+                uid_to_coldkey = {uid: ck for uid, ck in uid_to_coldkey.items() if uid in commitments}
+                removed = before - len(commitments)
+                if removed:
+                    protected_msg = (
+                        f"; protected incumbent UID {protected_incumbent_uid}"
+                        if protected_incumbent_uid in commitments else ""
+                    )
+                    msg = (
+                        f"Filtered {removed} commitment(s) older than block "
+                        f"{min_commit_block}; {len(commitments)} remain"
+                        f"{protected_msg}"
+                    )
+                    logger.warning(msg)
+                    log_event(msg, level="warn", state_dir=state_dir)
             if not commitments:
                 state.save_progress({
                     "active": False,
@@ -2584,6 +2651,7 @@ def run_validator(network, netuid, wallet_name, hotkey_name, wallet_path,
                     king_uid, king_kl, king_source = _resolve_coordinated_king(
                         subtensor, metagraph, netuid, n_uids,
                         valid_models, state, state_dir, coord_round=coord_round,
+                        chain_snapshot=coord_chain_snapshot,
                     )
                 except RuntimeError:
                     state.save_progress({
@@ -2783,6 +2851,7 @@ def run_validator(network, netuid, wallet_name, hotkey_name, wallet_path,
                     "fraction": DEFAULT_PRIVATE_FRACTION,
                 },
                 "coordination": coord_round.to_dict() if coord_round else None,
+                "chain_consensus_snapshot": coord_chain_snapshot,
             }
             state.save_round()
 

@@ -1,4 +1,5 @@
 import json
+from types import SimpleNamespace
 
 from eval.chain import parse_commitments
 from scripts.validator.challengers import select_challengers
@@ -9,6 +10,10 @@ from scripts.validator.coordination import (
     reset_anchor_challenger_uids,
     round_start_wait_target,
     scheduled_challenger_uids,
+)
+from scripts.validator.service import (
+    _capture_coordination_chain_snapshot,
+    _resolve_coordinated_king,
 )
 
 
@@ -72,6 +77,14 @@ def test_configured_start_block_allows_requested_round_window(monkeypatch):
     assert round_start_wait_target(8381520) == (None, "round_start")
 
 
+def test_default_configured_start_block_targets_clean_restart(monkeypatch):
+    monkeypatch.delenv("QUASAR_COORDINATION_START_BLOCK", raising=False)
+    monkeypatch.delenv("DISTIL_COORDINATION_START_BLOCK", raising=False)
+
+    assert configured_start_block() == 8382960
+    assert round_start_wait_target(8381520) == (8382960, "configured_start")
+
+
 def test_invalid_configured_start_block_is_ignored(monkeypatch):
     monkeypatch.setenv("QUASAR_COORDINATION_START_BLOCK", "not-a-block")
 
@@ -91,6 +104,69 @@ def test_scheduled_challengers_next_round_takes_remaining_oldest():
     ])
 
     assert scheduled_challenger_uids(models, _round(), 5) == [15, 16, 17, 18, 19]
+
+
+class _SnapshotSubtensor:
+    def __init__(self):
+        self.permit_calls = 0
+        self.stake_calls = 0
+        self.weight_calls = 0
+
+    def get_subnet_validator_permits(self, netuid, block=None):
+        self.permit_calls += 1
+        assert block == 8382960
+        return [True] * 256
+
+    def get_stake_weight(self, netuid, block=None):
+        self.stake_calls += 1
+        assert block == 8382960
+        return [1.0] * 256
+
+    def weights(self, netuid, block=None):
+        self.weight_calls += 1
+        assert block == 8382960
+        return [(0, [(155, 65535)])]
+
+
+class _ExplodingSubtensor:
+    def get_subnet_validator_permits(self, *args, **kwargs):
+        raise AssertionError("captured snapshot should avoid permit refetch")
+
+    def get_stake_weight(self, *args, **kwargs):
+        raise AssertionError("captured snapshot should avoid stake refetch")
+
+    def weights(self, *args, **kwargs):
+        raise AssertionError("captured snapshot should avoid weight refetch")
+
+
+def test_coordinated_king_uses_captured_chain_snapshot(tmp_path):
+    coord_round = _round(11643)
+    subtensor = _SnapshotSubtensor()
+
+    snapshot = _capture_coordination_chain_snapshot(
+        subtensor, None, 24, 256, coord_round, str(tmp_path),
+    )
+
+    assert snapshot["weight_block"] == 8382960
+    assert snapshot["chain_king_uid"] == 155
+    assert subtensor.permit_calls == 1
+    assert subtensor.stake_calls == 1
+    assert subtensor.weight_calls == 1
+
+    state = SimpleNamespace(h2h_latest={}, scores={"155": 2.5}, composite_scores={})
+    king_uid, king_kl, source = _resolve_coordinated_king(
+        _ExplodingSubtensor(),
+        None,
+        24,
+        256,
+        {155: _model(155, "silx", 8380400)},
+        state,
+        str(tmp_path),
+        coord_round=coord_round,
+        chain_snapshot=snapshot,
+    )
+
+    assert (king_uid, king_kl, source) == (155, 2.5, "chain_consensus")
 
 
 def test_scheduled_challengers_rate_limits_hf_owner_window():
