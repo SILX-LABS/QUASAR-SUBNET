@@ -810,9 +810,24 @@ FINETUNE_PROBE_TEXTS = (
 )
 FINETUNE_GRAD_NORM_MAX = float(os.environ.get("FINETUNE_GRAD_NORM_MAX", "500"))
 FINETUNE_NORM_WEIGHT_MAX = float(os.environ.get("FINETUNE_NORM_WEIGHT_MAX", "30"))
+FINETUNE_PROBE_ROUND_BLOCKS = int(os.environ.get("FINETUNE_PROBE_ROUND_BLOCKS", "720"))
+FINETUNE_CONFIRM_GRAD_NAN = os.environ.get("FINETUNE_CONFIRM_GRAD_NAN", "1") != "0"
+FINETUNE_CONFIRM_OFFSET = int(os.environ.get("FINETUNE_CONFIRM_OFFSET", "7"))
 
 
-def _pick_finetune_probe_text(block_seed):
+def _finetune_probe_index(block_seed, offset=0):
+    if block_seed is None:
+        base = 0
+    else:
+        seed = int(block_seed)
+        if FINETUNE_PROBE_ROUND_BLOCKS > 0 and seed % FINETUNE_PROBE_ROUND_BLOCKS == 0:
+            base = seed // FINETUNE_PROBE_ROUND_BLOCKS
+        else:
+            base = seed
+    return (base + offset) % len(FINETUNE_PROBE_TEXTS)
+
+
+def _pick_finetune_probe_text(block_seed, offset=0):
     """Deterministically rotate the probe sentence per block.
 
     Same seed that rotates capability prompts — every validator computes the
@@ -820,9 +835,11 @@ def _pick_finetune_probe_text(block_seed):
     the text changes every round so a gaming miner has to defeat the whole
     pool rather than a single fixed sentence.
     """
-    if block_seed is None:
-        return FINETUNE_PROBE_TEXTS[0]
-    return FINETUNE_PROBE_TEXTS[int(block_seed) % len(FINETUNE_PROBE_TEXTS)]
+    return FINETUNE_PROBE_TEXTS[_finetune_probe_index(block_seed, offset=offset)]
+
+
+def _finetune_probe_text_hash(probe_text):
+    return hashlib.sha256(probe_text.encode("utf-8")).hexdigest()[:12]
 
 
 def _classify_probe_param(name: str) -> str:
@@ -842,6 +859,126 @@ def _classify_probe_param(name: str) -> str:
     return "other"
 
 
+def _clear_finetune_probe_grads(model):
+    for p in model.parameters():
+        p.grad = None
+
+
+def _restore_finetune_probe_mode(model, was_training):
+    _clear_finetune_probe_grads(model)
+    if not was_training:
+        model.eval()
+
+
+def _run_finetune_probe_once(model, tokenizer, device, probe_text, probe_idx):
+    attempt = {
+        "pass": True, "reason": "",
+        "global_grad_norm": 0.0,
+        "global_grad_norm_complete": False,
+        "worst_param_type": "",
+        "worst_param_norm": 0.0,
+        "loss": 0.0,
+        "probe_text_idx": probe_idx,
+        "probe_text_hash": _finetune_probe_text_hash(probe_text),
+        "grad_tensors_checked": 0,
+        "nonfinite_grad_name": "",
+        "nonfinite_grad_count": 0,
+        "nonfinite_grad_total": 0,
+        "nonfinite_grad_dtype": "",
+        "nonfinite_grad_device": "",
+    }
+    was_training = model.training
+    try:
+        model.train()
+        for p in model.parameters():
+            p.requires_grad_(True)
+            p.grad = None
+
+        ids = tokenizer(probe_text, return_tensors="pt").input_ids.to(device)
+        try:
+            with torch.enable_grad():
+                out = model(input_ids=ids, labels=ids)
+                loss = out.loss
+        except Exception as fwd_err:
+            _restore_finetune_probe_mode(model, was_training)
+            attempt.update({"pass": False, "reason": f"forward_failed:{str(fwd_err)[:120]}"})
+            return attempt
+
+        loss_val = float(loss.detach().float().item()) if loss is not None else float("nan")
+        attempt["loss"] = round(loss_val, 4)
+        if loss is None or not math.isfinite(loss_val):
+            _restore_finetune_probe_mode(model, was_training)
+            attempt.update({"pass": False, "reason": f"loss_nan_inf:{loss_val}"})
+            return attempt
+
+        try:
+            loss.backward()
+        except Exception as bwd_err:
+            _restore_finetune_probe_mode(model, was_training)
+            attempt.update({"pass": False, "reason": f"backward_failed:{str(bwd_err)[:120]}"})
+            return attempt
+
+        global_sq = 0.0
+        per_type_sq: dict = {}
+        for nm, p in model.named_parameters():
+            if p.grad is None:
+                continue
+            attempt["grad_tensors_checked"] += 1
+            g = p.grad.detach()
+            finite = torch.isfinite(g)
+            if not bool(finite.all().item()):
+                bad_count = int((~finite).sum().item())
+                attempt.update({
+                    "pass": False,
+                    "reason": f"grad_nan_inf:{nm}",
+                    "global_grad_norm": round(global_sq ** 0.5, 2),
+                    "nonfinite_grad_name": nm,
+                    "nonfinite_grad_count": bad_count,
+                    "nonfinite_grad_total": int(g.numel()),
+                    "nonfinite_grad_dtype": str(g.dtype).replace("torch.", ""),
+                    "nonfinite_grad_device": str(g.device),
+                })
+                _restore_finetune_probe_mode(model, was_training)
+                return attempt
+            n_sq = float((g.float() ** 2).sum().item())
+            global_sq += n_sq
+            ptype = _classify_probe_param(nm)
+            per_type_sq[ptype] = per_type_sq.get(ptype, 0.0) + n_sq
+
+        _restore_finetune_probe_mode(model, was_training)
+
+        global_norm = global_sq ** 0.5
+        attempt["global_grad_norm"] = round(global_norm, 2)
+        attempt["global_grad_norm_complete"] = True
+        if global_norm > FINETUNE_GRAD_NORM_MAX:
+            attempt["pass"] = False
+            attempt["reason"] = f"grad_explode:global={global_norm:.1f}>{FINETUNE_GRAD_NORM_MAX:.0f}"
+            return attempt
+
+        worst_type = ""
+        worst_norm = 0.0
+        for ptype, sq in per_type_sq.items():
+            n = sq ** 0.5
+            if n > worst_norm:
+                worst_norm = n
+                worst_type = ptype
+        attempt["worst_param_type"] = worst_type
+        attempt["worst_param_norm"] = round(worst_norm, 2)
+        if worst_norm > FINETUNE_GRAD_NORM_MAX:
+            attempt["pass"] = False
+            attempt["reason"] = f"grad_explode:{worst_type}={worst_norm:.1f}>{FINETUNE_GRAD_NORM_MAX:.0f}"
+            return attempt
+
+        return attempt
+    except Exception as e:
+        try:
+            _restore_finetune_probe_mode(model, was_training)
+        except Exception:
+            pass
+        attempt["reason"] = f"probe_error:{str(e)[:120]}"
+        return attempt
+
+
 def finetunability_probe(model, tokenizer, device="cuda", block_seed=None):
     """Fine-tunability diagnostic for suspiciously overfit submissions.
 
@@ -857,16 +994,30 @@ def finetunability_probe(model, tokenizer, device="cuda", block_seed=None):
 
     Returns dict with pass, reason, stats. Never raises — errors return pass=True with note.
     """
-    probe_text = _pick_finetune_probe_text(block_seed)
+    probe_idx = _finetune_probe_index(block_seed)
+    probe_text = FINETUNE_PROBE_TEXTS[probe_idx]
     stats = {
         "pass": True, "reason": "",
         "global_grad_norm": 0.0,
+        "global_grad_norm_complete": False,
         "worst_param_type": "",
         "worst_param_norm": 0.0,
         "worst_norm_weight": 0.0,
         "worst_norm_name": "",
         "loss": 0.0,
-        "probe_text_hash": hash(probe_text) & 0xFFFF,
+        "probe_text_idx": probe_idx,
+        "probe_text_hash": _finetune_probe_text_hash(probe_text),
+        "primary_reason": "",
+        "confirm_reason": "",
+        "confirm_probe_text_idx": None,
+        "confirm_probe_text_hash": "",
+        "confirm_loss": None,
+        "grad_tensors_checked": 0,
+        "nonfinite_grad_name": "",
+        "nonfinite_grad_count": 0,
+        "nonfinite_grad_total": 0,
+        "nonfinite_grad_dtype": "",
+        "nonfinite_grad_device": "",
     }
     try:
         worst_name = ""
@@ -889,89 +1040,57 @@ def finetunability_probe(model, tokenizer, device="cuda", block_seed=None):
             stats["reason"] = f"norm_weight_scaled:{worst_name}={worst_val:.1f}>{FINETUNE_NORM_WEIGHT_MAX:.0f}"
             return stats
 
-        was_training = model.training
-        model.train()
-        for p in model.parameters():
-            p.requires_grad_(True)
-            p.grad = None
-
-        ids = tokenizer(probe_text, return_tensors="pt").input_ids.to(device)
-        try:
-            with torch.enable_grad():
-                out = model(input_ids=ids, labels=ids)
-                loss = out.loss
-        except Exception as fwd_err:
-            if not was_training:
-                model.eval()
-            for p in model.parameters():
-                p.grad = None
-            stats.update({"pass": False, "reason": f"forward_failed:{str(fwd_err)[:120]}"})
+        primary = _run_finetune_probe_once(model, tokenizer, device, probe_text, probe_idx)
+        stats.update(primary)
+        primary_reason = primary.get("reason", "")
+        if (
+            primary.get("pass")
+            or not FINETUNE_CONFIRM_GRAD_NAN
+            or not primary_reason.startswith("grad_nan_inf:")
+            or len(FINETUNE_PROBE_TEXTS) < 2
+        ):
             return stats
 
-        loss_val = float(loss.detach().float().item()) if loss is not None else float("nan")
-        stats["loss"] = round(loss_val, 4)
-        if loss is None or not math.isfinite(loss_val):
-            if not was_training:
-                model.eval()
-            for p in model.parameters():
-                p.grad = None
-            stats.update({"pass": False, "reason": f"loss_nan_inf:{loss_val}"})
+        confirm_offset = FINETUNE_CONFIRM_OFFSET % len(FINETUNE_PROBE_TEXTS)
+        if confirm_offset == 0:
+            confirm_offset = 1
+        confirm_idx = _finetune_probe_index(block_seed, offset=confirm_offset)
+        if confirm_idx == probe_idx:
+            confirm_idx = (probe_idx + 1) % len(FINETUNE_PROBE_TEXTS)
+        confirm_text = FINETUNE_PROBE_TEXTS[confirm_idx]
+        confirm = _run_finetune_probe_once(
+            model, tokenizer, device, confirm_text, confirm_idx,
+        )
+        stats["primary_reason"] = primary_reason
+        stats["confirm_reason"] = confirm.get("reason", "")
+        stats["confirm_probe_text_idx"] = confirm_idx
+        stats["confirm_probe_text_hash"] = confirm.get("probe_text_hash", "")
+        stats["confirm_loss"] = confirm.get("loss")
+        if confirm.get("pass"):
+            stats.update({
+                "pass": True,
+                "reason": f"grad_nan_inf_unconfirmed:{primary_reason}",
+                "global_grad_norm": confirm.get("global_grad_norm", 0.0),
+                "global_grad_norm_complete": confirm.get("global_grad_norm_complete", False),
+                "worst_param_type": confirm.get("worst_param_type", ""),
+                "worst_param_norm": confirm.get("worst_param_norm", 0.0),
+                "loss": confirm.get("loss", 0.0),
+                "grad_tensors_checked": confirm.get("grad_tensors_checked", 0),
+            })
             return stats
 
-        try:
-            loss.backward()
-        except Exception as bwd_err:
-            if not was_training:
-                model.eval()
-            for p in model.parameters():
-                p.grad = None
-            stats.update({"pass": False, "reason": f"backward_failed:{str(bwd_err)[:120]}"})
-            return stats
-
-        global_sq = 0.0
-        per_type_sq: dict = {}
-        for nm, p in model.named_parameters():
-            if p.grad is None:
-                continue
-            g = p.grad.detach()
-            if not torch.isfinite(g).all():
-                if not was_training:
-                    model.eval()
-                for pp in model.parameters():
-                    pp.grad = None
-                stats.update({"pass": False, "reason": f"grad_nan_inf:{nm}"})
-                return stats
-            n_sq = float((g.float() ** 2).sum().item())
-            global_sq += n_sq
-            ptype = _classify_probe_param(nm)
-            per_type_sq[ptype] = per_type_sq.get(ptype, 0.0) + n_sq
-
-        for p in model.parameters():
-            p.grad = None
-        if not was_training:
-            model.eval()
-
-        global_norm = global_sq ** 0.5
-        stats["global_grad_norm"] = round(global_norm, 2)
-        if global_norm > FINETUNE_GRAD_NORM_MAX:
-            stats["pass"] = False
-            stats["reason"] = f"grad_explode:global={global_norm:.1f}>{FINETUNE_GRAD_NORM_MAX:.0f}"
-            return stats
-
-        worst_type = ""
-        worst_norm = 0.0
-        for ptype, sq in per_type_sq.items():
-            n = sq ** 0.5
-            if n > worst_norm:
-                worst_norm = n
-                worst_type = ptype
-        stats["worst_param_type"] = worst_type
-        stats["worst_param_norm"] = round(worst_norm, 2)
-        if worst_norm > FINETUNE_GRAD_NORM_MAX:
-            stats["pass"] = False
-            stats["reason"] = f"grad_explode:{worst_type}={worst_norm:.1f}>{FINETUNE_GRAD_NORM_MAX:.0f}"
-            return stats
-
+        stats["pass"] = False
+        stats["reason"] = (
+            f"grad_nan_inf_confirmed:{primary_reason};"
+            f"confirm={confirm.get('reason', '')}"
+        )
+        if confirm.get("reason", "").startswith("grad_nan_inf:"):
+            for key in (
+                "nonfinite_grad_name", "nonfinite_grad_count",
+                "nonfinite_grad_total", "nonfinite_grad_dtype",
+                "nonfinite_grad_device",
+            ):
+                stats[f"confirm_{key}"] = confirm.get(key)
         return stats
     except Exception as e:
         try:
@@ -981,6 +1100,96 @@ def finetunability_probe(model, tokenizer, device="cuda", block_seed=None):
             pass
         stats["reason"] = f"probe_error:{str(e)[:120]}"
         return stats
+
+
+def fresh_process_finetunability_probe(model_name, revision, teacher_name, block_seed):
+    """Re-run the finetune probe in a clean process after a NaN/Inf failure.
+
+    A full eval process runs teacher generation, king probes, scoring, and
+    benchmark code before later challengers are probed. If that long-lived
+    CUDA/Python state produces a non-finite gradient, confirm it in a fresh
+    process before turning the result into a permanent anti-finetune DQ.
+    """
+    timeout_s = int(os.environ.get("FINETUNE_FRESH_CONFIRM_TIMEOUT", "360"))
+    code = r"""
+import importlib.util
+import json
+import os
+import sys
+
+import torch
+from transformers import AutoTokenizer
+
+path = os.environ["POD_EVAL_SELF"]
+spec = importlib.util.spec_from_file_location("_pod_eval_probe", path)
+mod = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = mod
+spec.loader.exec_module(mod)
+
+teacher = os.environ["PROBE_TEACHER"]
+model_name = os.environ["PROBE_MODEL"]
+revision = os.environ.get("PROBE_REVISION") or None
+block_seed_raw = os.environ.get("PROBE_BLOCK_SEED")
+block_seed = int(block_seed_raw) if block_seed_raw not in (None, "") else None
+
+tokenizer = AutoTokenizer.from_pretrained(teacher, trust_remote_code=True)
+model = mod.load_model(model_name, device="cuda", dtype=torch.bfloat16, revision=revision)
+result = mod.finetunability_probe(model, tokenizer, device="cuda", block_seed=block_seed)
+print("FRESH_PROBE_JSON:" + json.dumps(result, sort_keys=True), flush=True)
+"""
+    env = os.environ.copy()
+    env.update({
+        "POD_EVAL_SELF": os.path.abspath(__file__),
+        "PROBE_MODEL": str(model_name),
+        "PROBE_REVISION": "" if revision in (None, "main") else str(revision),
+        "PROBE_TEACHER": str(teacher_name),
+        "PROBE_BLOCK_SEED": "" if block_seed is None else str(block_seed),
+        "TOKENIZERS_PARALLELISM": "false",
+    })
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-c", code],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=timeout_s,
+        )
+    except subprocess.TimeoutExpired:
+        return {
+            "pass": False,
+            "reason": f"fresh_probe_timeout:{timeout_s}s",
+        }
+    except Exception as exc:
+        return {
+            "pass": False,
+            "reason": f"fresh_probe_error:{str(exc)[:160]}",
+        }
+
+    stdout = proc.stdout or ""
+    stderr = proc.stderr or ""
+    for line in reversed(stdout.splitlines()):
+        if line.startswith("FRESH_PROBE_JSON:"):
+            try:
+                result = json.loads(line.split(":", 1)[1])
+                result["fresh_process_returncode"] = proc.returncode
+                if proc.returncode != 0 and result.get("pass"):
+                    result["pass"] = False
+                    result["reason"] = f"fresh_probe_returncode:{proc.returncode}"
+                return result
+            except Exception as exc:
+                return {
+                    "pass": False,
+                    "reason": f"fresh_probe_json_error:{str(exc)[:160]}",
+                    "returncode": proc.returncode,
+                }
+
+    tail = "\n".join((stdout + "\n" + stderr).splitlines()[-12:])
+    return {
+        "pass": False,
+        "reason": f"fresh_probe_no_json:returncode={proc.returncode}",
+        "returncode": proc.returncode,
+        "output_tail": tail[:1000],
+    }
 
 
 CHAT_PROBE_PROMPTS = [
@@ -11257,6 +11466,44 @@ def main():
                     student, tokenizer, device, block_seed=args.block_seed,
                 )
                 _fp_dur = time.time() - _fp_start
+                if (
+                    not probe.get("pass")
+                    and str(probe.get("reason", "")).startswith("grad_nan_inf_confirmed:")
+                    and os.environ.get("FINETUNE_FRESH_CONFIRM", "1") != "0"
+                ):
+                    original_probe = dict(probe)
+                    print(
+                        f"[eval] Finetune probe failed with non-finite gradients; "
+                        f"confirming {student_name} in a fresh process",
+                        flush=True,
+                    )
+                    _fresh_start = time.time()
+                    fresh_probe = fresh_process_finetunability_probe(
+                        student_name,
+                        student_rev,
+                        args.teacher,
+                        args.block_seed,
+                    )
+                    fresh_probe["wall_s"] = round(time.time() - _fresh_start, 1)
+                    if fresh_probe.get("pass"):
+                        print(
+                            f"[eval] Fresh finetune confirm PASSED for {student_name}; "
+                            f"treating initial non-finite gradient as transient process-state failure",
+                            flush=True,
+                        )
+                        probe = dict(fresh_probe)
+                        probe["fresh_process_cleared_failure"] = True
+                        probe["initial_process_reason"] = original_probe.get("reason", "")
+                        probe["initial_process_probe_text_idx"] = original_probe.get("probe_text_idx")
+                        probe["initial_process_probe_text_hash"] = original_probe.get("probe_text_hash", "")
+                        probe["fresh_process_retry"] = fresh_probe
+                    else:
+                        print(
+                            f"[eval] Fresh finetune confirm also failed for {student_name}: "
+                            f"{fresh_probe.get('reason', '')}",
+                            flush=True,
+                        )
+                        probe["fresh_process_retry"] = fresh_probe
                 mark = "✓" if probe["pass"] else f"✗ DQ: {probe['reason']}"
                 print(
                     f"[eval] Finetune probe: loss={probe['loss']:.3f} "
@@ -11266,15 +11513,48 @@ def main():
                     f"({_fp_dur:.1f}s) {mark}",
                     flush=True,
                 )
+                if probe.get("primary_reason") or probe.get("confirm_reason"):
+                    print(
+                        f"[eval] Finetune confirm: "
+                        f"primary_idx={probe.get('probe_text_idx')} "
+                        f"confirm_idx={probe.get('confirm_probe_text_idx')} "
+                        f"primary={probe.get('primary_reason', '')} "
+                        f"confirm={probe.get('confirm_reason', '')}",
+                        flush=True,
+                    )
                 results["students"].setdefault(student_name, {})["finetune_probe"] = {
                     "pass": probe["pass"],
                     "reason": probe.get("reason", ""),
                     "global_grad_norm": probe["global_grad_norm"],
+                    "global_grad_norm_complete": probe.get("global_grad_norm_complete", False),
                     "worst_param_type": probe["worst_param_type"],
                     "worst_param_norm": probe["worst_param_norm"],
                     "worst_norm_weight": probe["worst_norm_weight"],
                     "worst_norm_name": probe.get("worst_norm_name", ""),
                     "loss": probe["loss"],
+                    "probe_text_idx": probe.get("probe_text_idx"),
+                    "probe_text_hash": probe.get("probe_text_hash", ""),
+                    "primary_reason": probe.get("primary_reason", ""),
+                    "confirm_reason": probe.get("confirm_reason", ""),
+                    "confirm_probe_text_idx": probe.get("confirm_probe_text_idx"),
+                    "confirm_probe_text_hash": probe.get("confirm_probe_text_hash", ""),
+                    "confirm_loss": probe.get("confirm_loss"),
+                    "grad_tensors_checked": probe.get("grad_tensors_checked", 0),
+                    "nonfinite_grad_name": probe.get("nonfinite_grad_name", ""),
+                    "nonfinite_grad_count": probe.get("nonfinite_grad_count", 0),
+                    "nonfinite_grad_total": probe.get("nonfinite_grad_total", 0),
+                    "nonfinite_grad_dtype": probe.get("nonfinite_grad_dtype", ""),
+                    "nonfinite_grad_device": probe.get("nonfinite_grad_device", ""),
+                    "confirm_nonfinite_grad_name": probe.get("confirm_nonfinite_grad_name", ""),
+                    "confirm_nonfinite_grad_count": probe.get("confirm_nonfinite_grad_count", 0),
+                    "confirm_nonfinite_grad_total": probe.get("confirm_nonfinite_grad_total", 0),
+                    "confirm_nonfinite_grad_dtype": probe.get("confirm_nonfinite_grad_dtype", ""),
+                    "confirm_nonfinite_grad_device": probe.get("confirm_nonfinite_grad_device", ""),
+                    "fresh_process_cleared_failure": probe.get("fresh_process_cleared_failure", False),
+                    "initial_process_reason": probe.get("initial_process_reason", ""),
+                    "initial_process_probe_text_idx": probe.get("initial_process_probe_text_idx"),
+                    "initial_process_probe_text_hash": probe.get("initial_process_probe_text_hash", ""),
+                    "fresh_process_retry": probe.get("fresh_process_retry"),
                 }
                 if not probe["pass"]:
                     if _is_cuda_context_poisoned(probe.get("reason", "")):
