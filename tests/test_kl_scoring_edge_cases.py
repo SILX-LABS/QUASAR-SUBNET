@@ -397,6 +397,255 @@ class TestModelChecker(unittest.TestCase):
             model_checker._content_hash_has_enough_sensitive_targets(sensitive)
         )
 
+    def test_tensor_signature_detects_partial_copy(self):
+        """Mostly-identical train-sensitive tensors should flag a later copy."""
+        from eval import model_checker
+
+        tmpdir = tempfile.mkdtemp()
+        state_dir = Path(tmpdir)
+        try:
+            train_targets = list(model_checker._CONTENT_HASH_TRAIN_TARGETS[:16])
+            original = {
+                "sample_tensors": 16,
+                "sensitive_targets": train_targets,
+                "sensitive_found": train_targets,
+                "tensor_hashes": {
+                    name: f"same-{idx}" for idx, name in enumerate(train_targets)
+                } | {
+                    "model.all_moe_bias": "orig-control",
+                    "model.norm.weight": "orig-norm",
+                },
+            }
+            copy = {
+                "sample_tensors": 16,
+                "sensitive_targets": train_targets,
+                "sensitive_found": train_targets,
+                "tensor_hashes": {
+                    name: f"same-{idx}" for idx, name in enumerate(train_targets)
+                } | {
+                    "model.all_moe_bias": "changed-control",
+                    "model.norm.weight": "changed-norm",
+                },
+            }
+
+            model_checker.register_tensor_similarity_signature(
+                original,
+                137,
+                state_dir,
+                model_repo="qxyz/azir",
+                revision="orig",
+                commit_block=8388548,
+            )
+
+            matches = model_checker.duplicate_tensor_signature_matches(
+                copy, 181, state_dir
+            )
+            self.assertEqual([m["uid"] for m in matches], [137])
+            self.assertEqual(matches[0]["identical_sensitive_tensors"], 16)
+            self.assertEqual(matches[0]["common_sensitive_tensors"], 16)
+            self.assertEqual(matches[0]["identical_ratio"], 1.0)
+        finally:
+            import shutil
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_tensor_signature_detects_private_chunk_copy(self):
+        """Private chunk matches should flag copies even when full tensor hashes differ."""
+        from eval import model_checker
+
+        tmpdir = tempfile.mkdtemp()
+        state_dir = Path(tmpdir)
+        try:
+            train_targets = list(model_checker._CONTENT_HASH_TRAIN_TARGETS[:16])
+            chunks_original = {}
+            chunks_copy = {}
+            for idx in range(80):
+                target = train_targets[idx % len(train_targets)]
+                key = f"{target}:{idx * 4096}:4096"
+                chunks_original[key] = f"chunk-{idx}"
+                chunks_copy[key] = f"chunk-{idx}" if idx < 72 else f"changed-{idx}"
+            original = {
+                "sample_tensors": 16,
+                "near_copy_targets": train_targets,
+                "tensor_hashes": {
+                    name: f"orig-full-{idx}" for idx, name in enumerate(train_targets)
+                },
+                "tensor_chunk_hashes": chunks_original,
+            }
+            copy = {
+                "sample_tensors": 16,
+                "near_copy_targets": train_targets,
+                "tensor_hashes": {
+                    name: f"copy-full-{idx}" for idx, name in enumerate(train_targets)
+                },
+                "tensor_chunk_hashes": chunks_copy,
+            }
+
+            model_checker.register_tensor_similarity_signature(
+                original, 137, state_dir, model_repo="qxyz/azir"
+            )
+            matches = model_checker.duplicate_tensor_signature_matches(
+                copy, 181, state_dir
+            )
+            self.assertEqual([m["uid"] for m in matches], [137])
+            self.assertEqual(matches[0]["identical_sensitive_tensors"], 0)
+            self.assertEqual(matches[0]["common_chunk_signatures"], 80)
+            self.assertEqual(matches[0]["identical_chunk_signatures"], 72)
+            self.assertAlmostEqual(matches[0]["identical_chunk_ratio"], 0.9)
+        finally:
+            import shutil
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_tensor_signature_detects_tiny_value_perturbation(self):
+        """Numeric sketches should flag near-copies that perturb bytes everywhere."""
+        from eval import model_checker
+
+        tmpdir = tempfile.mkdtemp()
+        state_dir = Path(tmpdir)
+        try:
+            train_targets = list(model_checker._CONTENT_HASH_TRAIN_TARGETS[:16])
+            original_values = {}
+            copy_values = {}
+            for idx in range(512):
+                target = train_targets[idx % len(train_targets)]
+                key = f"{target}:{idx}"
+                value = 0.5 + (idx % 31) / 100.0
+                original_values[key] = value
+                copy_values[key] = value + 1e-7
+            original = {
+                "sample_tensors": 16,
+                "near_copy_targets": train_targets,
+                "tensor_hashes": {
+                    name: f"orig-full-{idx}" for idx, name in enumerate(train_targets)
+                },
+                "tensor_value_sketches": original_values,
+            }
+            copy = {
+                "sample_tensors": 16,
+                "near_copy_targets": train_targets,
+                "tensor_hashes": {
+                    name: f"copy-full-{idx}" for idx, name in enumerate(train_targets)
+                },
+                "tensor_value_sketches": copy_values,
+            }
+
+            model_checker.register_tensor_similarity_signature(
+                original, 137, state_dir, model_repo="qxyz/azir"
+            )
+            matches = model_checker.duplicate_tensor_signature_matches(
+                copy, 181, state_dir
+            )
+            self.assertEqual([m["uid"] for m in matches], [137])
+            self.assertEqual(matches[0]["identical_sensitive_tensors"], 0)
+            self.assertEqual(matches[0]["common_value_sketches"], 512)
+            self.assertGreaterEqual(
+                matches[0]["value_sketch_cosine"],
+                model_checker.TENSOR_VALUE_NEAR_COPY_MIN_COSINE,
+            )
+            self.assertLessEqual(
+                matches[0]["value_sketch_rel_l2"],
+                model_checker.TENSOR_VALUE_NEAR_COPY_MAX_REL_L2,
+            )
+        finally:
+            import shutil
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_tensor_signature_backfill_detects_legacy_records(self):
+        """Legacy records without chunk/value sketches should be backfilled."""
+        from eval import model_checker
+
+        tmpdir = tempfile.mkdtemp()
+        state_dir = Path(tmpdir)
+        try:
+            train_targets = list(model_checker._CONTENT_HASH_TRAIN_TARGETS[:16])
+            legacy = {
+                "sample_tensors": 16,
+                "near_copy_targets": train_targets,
+                "tensor_hashes": {
+                    name: f"same-{idx}" for idx, name in enumerate(train_targets)
+                },
+            }
+            model_checker.register_tensor_similarity_signature(
+                legacy, 137, state_dir, model_repo="qxyz/azir"
+            )
+            self.assertTrue(
+                model_checker.tensor_similarity_signature_needs_backfill(
+                    137, state_dir
+                )
+            )
+
+            upgraded = dict(legacy)
+            upgraded["tensor_chunk_hashes"] = {
+                f"{train_targets[0]}:{idx}:4096": f"chunk-{idx}"
+                for idx in range(64)
+            }
+            upgraded["tensor_value_sketches"] = {
+                f"{train_targets[0]}:{idx}": 0.5
+                for idx in range(512)
+            }
+            model_checker.register_tensor_similarity_signature(
+                upgraded, 137, state_dir, model_repo="qxyz/azir"
+            )
+            self.assertFalse(
+                model_checker.tensor_similarity_signature_needs_backfill(
+                    137, state_dir
+                )
+            )
+        finally:
+            import shutil
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_tensor_signature_ignores_stable_only_overlap(self):
+        """Stable/base tensors alone are not enough to call a model a copy."""
+        from eval import model_checker
+
+        tmpdir = tempfile.mkdtemp()
+        state_dir = Path(tmpdir)
+        try:
+            stable_targets = list(model_checker._CONTENT_HASH_STABLE_TARGETS)
+            original = {
+                "sample_tensors": 16,
+                "sensitive_targets": list(model_checker._CONTENT_HASH_TRAIN_TARGETS[:16]),
+                "tensor_hashes": {
+                    name: f"stable-{idx}" for idx, name in enumerate(stable_targets)
+                },
+                "tensor_chunk_hashes": {
+                    f"{name}:{idx}:4096": f"stable-chunk-{idx}"
+                    for idx, name in enumerate(stable_targets)
+                },
+                "tensor_value_sketches": {
+                    f"{name}:{idx}": 0.1 + idx
+                    for idx, name in enumerate(stable_targets)
+                },
+            }
+            incoming = {
+                "sample_tensors": 16,
+                "sensitive_targets": list(model_checker._CONTENT_HASH_TRAIN_TARGETS[:16]),
+                "tensor_hashes": {
+                    name: f"stable-{idx}" for idx, name in enumerate(stable_targets)
+                },
+                "tensor_chunk_hashes": {
+                    f"{name}:{idx}:4096": f"stable-chunk-{idx}"
+                    for idx, name in enumerate(stable_targets)
+                },
+                "tensor_value_sketches": {
+                    f"{name}:{idx}": 0.1 + idx
+                    for idx, name in enumerate(stable_targets)
+                },
+            }
+
+            model_checker.register_tensor_similarity_signature(
+                original, 1, state_dir, model_repo="owner/orig"
+            )
+            self.assertEqual(
+                model_checker.duplicate_tensor_signature_matches(
+                    incoming, 2, state_dir
+                ),
+                [],
+            )
+        finally:
+            import shutil
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # Dataset / Prompt Sampling Tests
 # ═══════════════════════════════════════════════════════════════════════════════

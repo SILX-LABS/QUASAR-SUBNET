@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import json
 import logging
 import math
@@ -9,12 +11,15 @@ import time
 
 from eval.model_checker import (
     check_model_architecture,
-    compute_content_hash,
+    compute_content_fingerprint,
+    duplicate_tensor_signature_matches,
     compute_model_hash,
     duplicate_content_hash_uids,
     duplicate_hash_uids,
     register_content_hash,
     register_model_hash,
+    register_tensor_similarity_signature,
+    tensor_similarity_signature_needs_backfill,
     verify_model_integrity,
 )
 from eval.scoring import (
@@ -269,6 +274,110 @@ def _dq_later_duplicate(
     disqualified.add(duplicate_uid)
 
 
+def _tensor_copy_relation(evidence: dict) -> str:
+    identical = int(evidence.get("identical_sensitive_tensors") or 0)
+    common = int(evidence.get("common_sensitive_tensors") or 0)
+    ratio = float(evidence.get("identical_ratio") or 0.0)
+    chunk_identical = int(evidence.get("identical_chunk_signatures") or 0)
+    chunk_common = int(evidence.get("common_chunk_signatures") or 0)
+    chunk_ratio = float(evidence.get("identical_chunk_ratio") or 0.0)
+    value_common = int(evidence.get("common_value_sketches") or 0)
+    value_cosine = float(evidence.get("value_sketch_cosine") or 0.0)
+    value_rel_l2 = float(evidence.get("value_sketch_rel_l2") or 0.0)
+    return (
+        "partial tensor copy "
+        f"({identical}/{common} train-sensitive tensors identical, "
+        f"ratio={ratio:.3f}; chunks={chunk_identical}/{chunk_common}, "
+        f"chunk_ratio={chunk_ratio:.3f}; sketch_n={value_common}, "
+        f"sketch_cos={value_cosine:.6f}, sketch_rel_l2={value_rel_l2:.6g})"
+    )
+
+
+def _handle_content_fingerprint_duplicates(
+    uid: int,
+    model_repo: str,
+    revision: str,
+    this_commit_block,
+    commitments: dict,
+    uid_to_hotkey: dict,
+    state: ValidatorState,
+    valid_models: dict,
+    disqualified: set,
+    content_fingerprint: dict,
+) -> bool:
+    """Apply content/tensor-copy DQ checks and persist the current signature.
+
+    Returns True when the current UID was disqualified and the caller should
+    stop processing it.
+    """
+    content_hash = (
+        content_fingerprint.get("content_hash")
+        if isinstance(content_fingerprint, dict) else None
+    )
+    if not content_hash:
+        return False
+
+    duplicate_uids = duplicate_content_hash_uids(content_hash, uid, state.state_dir)
+    duplicate_uids = _duplicate_candidates_for_action(
+        uid, duplicate_uids, commitments, uid_to_hotkey, state,
+    )
+    canonical_uid = _canonical_duplicate_uid(uid, duplicate_uids, commitments)
+    if canonical_uid != uid:
+        _dq_later_duplicate(
+            uid, canonical_uid, "identical tensor content", model_repo,
+            commitments, uid_to_hotkey, state, valid_models, disqualified,
+        )
+        return True
+    for duplicate_uid in duplicate_uids:
+        if duplicate_uid in commitments and duplicate_uid != uid:
+            _dq_later_duplicate(
+                duplicate_uid, uid, "identical tensor content", model_repo,
+                commitments, uid_to_hotkey, state, valid_models, disqualified,
+            )
+
+    tensor_matches = duplicate_tensor_signature_matches(
+        content_fingerprint, uid, state.state_dir
+    )
+    tensor_match_by_uid = {
+        int(match["uid"]): match
+        for match in tensor_matches
+        if match.get("uid") is not None
+    }
+    tensor_evidence_by_candidate = dict(tensor_match_by_uid)
+    for matched_uid, evidence in tensor_match_by_uid.items():
+        root_uid = _copy_root_uid_from_dq(
+            matched_uid, commitments, uid_to_hotkey, state
+        )
+        if root_uid is not None:
+            tensor_evidence_by_candidate.setdefault(root_uid, evidence)
+    tensor_duplicate_uids = _duplicate_candidates_for_action(
+        uid, list(tensor_match_by_uid), commitments, uid_to_hotkey, state,
+    )
+
+    canonical_uid = _canonical_duplicate_uid(uid, tensor_duplicate_uids, commitments)
+    if canonical_uid != uid:
+        _dq_later_duplicate(
+            uid, canonical_uid,
+            _tensor_copy_relation(tensor_evidence_by_candidate.get(canonical_uid, {})),
+            model_repo, commitments, uid_to_hotkey, state, valid_models, disqualified,
+        )
+        return True
+    for duplicate_uid in tensor_duplicate_uids:
+        if duplicate_uid in commitments and duplicate_uid != uid:
+            _dq_later_duplicate(
+                duplicate_uid, uid,
+                _tensor_copy_relation(tensor_evidence_by_candidate.get(duplicate_uid, {})),
+                model_repo, commitments, uid_to_hotkey, state, valid_models, disqualified,
+            )
+
+    register_content_hash(content_hash, uid, state.state_dir)
+    register_tensor_similarity_signature(
+        content_fingerprint, uid, state.state_dir,
+        model_repo=model_repo, revision=revision, commit_block=this_commit_block,
+    )
+    return False
+
+
 def _canonicalize_existing_copy_dq(
     uid: int,
     hotkey: str,
@@ -364,12 +473,18 @@ def check_activation_fingerprint(model_name: str, uid: int, fingerprint: dict, s
     max_sim_uid = None
     max_sim_model = None
     max_sim_stored_block = None
+    live_uid_set = (
+        {int(other_uid) for other_uid in uid_to_commit_block}
+        if uid_to_commit_block is not None else None
+    )
     for other_uid_str, other_data in stored.items():
         try:
             other_uid = int(other_uid_str)
         except (TypeError, ValueError):
             continue
         if other_uid == uid:
+            continue
+        if live_uid_set is not None and other_uid not in live_uid_set:
             continue
         other_fps = other_data.get("layer_fingerprints", {})
         if not other_fps:
@@ -473,7 +588,10 @@ def precheck_all_models(commitments, uid_to_hotkey, uid_to_coldkey, state: Valid
     disqualified = set()
     precheck_errors = {}
     single_eval_mode = is_single_eval_mode()
-    for uid, commit in commitments.items():
+    for uid, commit in sorted(
+        commitments.items(),
+        key=lambda item: _commit_sort_key(item[0], commitments),
+    ):
         model_repo = commit["model"]
         revision = commit.get("revision", "main")
         hotkey = commit.get("hotkey", uid_to_hotkey.get(uid, ""))
@@ -625,6 +743,37 @@ def precheck_all_models(commitments, uid_to_hotkey, uid_to_coldkey, state: Valid
                     disqualified.add(uid)
                     state.evaluated_uids.discard(uid_str)
                     continue
+                if tensor_similarity_signature_needs_backfill(uid, state.state_dir):
+                    try:
+                        content_fingerprint = _call_precheck_bounded(
+                            "tensor signature backfill", compute_content_fingerprint,
+                            model_repo, revision, 16, str(state.state_dir),
+                        )
+                    except PrecheckCallTimeout as exc:
+                        reason = f"tensor signature backfill transient: {exc}"
+                        logger.info(f"UID {uid} ({model_repo}): PRECHECK ERROR — {reason}")
+                        precheck_errors[uid] = reason
+                        continue
+                    except Exception as exc:
+                        reason = f"tensor signature backfill transient: {exc}"
+                        logger.info(f"UID {uid} ({model_repo}): PRECHECK ERROR — {reason}")
+                        precheck_errors[uid] = reason
+                        continue
+                    content_hash = (
+                        content_fingerprint.get("content_hash")
+                        if isinstance(content_fingerprint, dict) else None
+                    )
+                    if not content_hash:
+                        reason = "tensor signature backfill unavailable after integrity check"
+                        logger.info(f"UID {uid} ({model_repo}): PRECHECK ERROR — {reason}")
+                        precheck_errors[uid] = reason
+                        continue
+                    if _handle_content_fingerprint_duplicates(
+                        uid, model_repo, revision, this_commit_block,
+                        commitments, uid_to_hotkey, state, valid_models,
+                        disqualified, content_fingerprint,
+                    ):
+                        continue
                 valid_models[uid] = {
                     "model": model_repo,
                     "revision": revision,
@@ -704,43 +853,35 @@ def precheck_all_models(commitments, uid_to_hotkey, uid_to_coldkey, state: Valid
         # Shard-invariant content hash — catches re-sharded copies that slip
         # past compute_model_hash (aizaysi's wind77/third ↔ pure-iron-6291 case).
         try:
-            content_hash = _call_precheck_bounded(
-                "content hash", compute_content_hash, model_repo, revision
+            content_fingerprint = _call_precheck_bounded(
+                "content fingerprint", compute_content_fingerprint,
+                model_repo, revision, 16, str(state.state_dir),
             )
         except PrecheckCallTimeout as exc:
-            reason = f"content hash transient: {exc}"
+            reason = f"content fingerprint transient: {exc}"
             logger.info(f"UID {uid} ({model_repo}): PRECHECK ERROR — {reason}")
             precheck_errors[uid] = reason
             continue
         except Exception as exc:
-            reason = f"content hash transient: {exc}"
+            reason = f"content fingerprint transient: {exc}"
             logger.info(f"UID {uid} ({model_repo}): PRECHECK ERROR — {reason}")
             precheck_errors[uid] = reason
             continue
+        content_hash = (
+            content_fingerprint.get("content_hash")
+            if isinstance(content_fingerprint, dict) else None
+        )
         if not content_hash:
-            reason = "content hash unavailable after architecture check"
+            reason = "content fingerprint unavailable after architecture check"
             logger.info(f"UID {uid} ({model_repo}): PRECHECK ERROR — {reason}")
             precheck_errors[uid] = reason
             continue
-        if content_hash:
-            duplicate_uids = duplicate_content_hash_uids(content_hash, uid, state.state_dir)
-            duplicate_uids = _duplicate_candidates_for_action(
-                uid, duplicate_uids, commitments, uid_to_hotkey, state,
-            )
-            canonical_uid = _canonical_duplicate_uid(uid, duplicate_uids, commitments)
-            if canonical_uid != uid:
-                _dq_later_duplicate(
-                    uid, canonical_uid, "identical tensor content", model_repo,
-                    commitments, uid_to_hotkey, state, valid_models, disqualified,
-                )
-                continue
-            for duplicate_uid in duplicate_uids:
-                if duplicate_uid in commitments and duplicate_uid != uid:
-                    _dq_later_duplicate(
-                        duplicate_uid, uid, "identical tensor content", model_repo,
-                        commitments, uid_to_hotkey, state, valid_models, disqualified,
-                    )
-            register_content_hash(content_hash, uid, state.state_dir)
+        if _handle_content_fingerprint_duplicates(
+            uid, model_repo, revision, this_commit_block,
+            commitments, uid_to_hotkey, state, valid_models,
+            disqualified, content_fingerprint,
+        ):
+            continue
         expected_hash = state.model_hashes.get(str(uid))
         stored_commit_block = state.model_hashes.get(f"{uid}_block")
         stored_hotkey = state.model_hashes.get(f"{uid}_hotkey")

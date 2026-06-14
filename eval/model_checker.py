@@ -9,10 +9,14 @@ Checks:
 5. Tokenizer file integrity against the official Quasar base
 6. Tokenizer encoding verification (spot-check)
 """
+from __future__ import annotations
+
 import json
 import hashlib
 import logging
+import math
 import os
+import struct
 import time
 import requests as _requests
 from pathlib import Path
@@ -468,26 +472,168 @@ def _content_hash_has_enough_sensitive_targets(
     return len(set(found_targets) & sensitive_targets) >= min_sensitive
 
 
-def compute_content_hash(model_repo: str, revision: str = None, sample_tensors: int = 16) -> Optional[str]:
+TENSOR_SIGNATURE_FILE = "tensor_similarity_signatures.json"
+TENSOR_SIGNATURE_SECRET_FILE = "tensor_similarity_secret.json"
+TENSOR_NEAR_COPY_MIN_COMMON = int(os.environ.get("QUASAR_TENSOR_NEAR_COPY_MIN_COMMON", "12"))
+TENSOR_NEAR_COPY_MIN_IDENTICAL = int(os.environ.get("QUASAR_TENSOR_NEAR_COPY_MIN_IDENTICAL", "12"))
+TENSOR_NEAR_COPY_IDENTICAL_RATIO = float(os.environ.get("QUASAR_TENSOR_NEAR_COPY_IDENTICAL_RATIO", "0.90"))
+TENSOR_CHUNK_SIGNATURE_CHUNKS = int(os.environ.get("QUASAR_TENSOR_CHUNK_SIGNATURE_CHUNKS", "8"))
+TENSOR_CHUNK_SIGNATURE_BYTES = int(os.environ.get("QUASAR_TENSOR_CHUNK_SIGNATURE_BYTES", "4096"))
+TENSOR_CHUNK_NEAR_COPY_MIN_COMMON = int(os.environ.get("QUASAR_TENSOR_CHUNK_NEAR_COPY_MIN_COMMON", "64"))
+TENSOR_CHUNK_NEAR_COPY_IDENTICAL_RATIO = float(os.environ.get("QUASAR_TENSOR_CHUNK_NEAR_COPY_IDENTICAL_RATIO", "0.90"))
+TENSOR_VALUE_SKETCH_VALUES = int(os.environ.get("QUASAR_TENSOR_VALUE_SKETCH_VALUES", "64"))
+TENSOR_VALUE_NEAR_COPY_MIN_COMMON = int(os.environ.get("QUASAR_TENSOR_VALUE_NEAR_COPY_MIN_COMMON", "512"))
+TENSOR_VALUE_NEAR_COPY_MIN_COSINE = float(os.environ.get("QUASAR_TENSOR_VALUE_NEAR_COPY_MIN_COSINE", "0.999999"))
+TENSOR_VALUE_NEAR_COPY_MAX_REL_L2 = float(os.environ.get("QUASAR_TENSOR_VALUE_NEAR_COPY_MAX_REL_L2", "0.001"))
+
+
+def _shape_numel(shape) -> int:
+    try:
+        n = 1
+        for dim in shape or []:
+            n *= int(dim)
+        return int(n)
+    except Exception:
+        return 0
+
+
+def _tensor_similarity_secret(state_dir: Path = STATE_DIR) -> str:
+    env_secret = os.environ.get("QUASAR_TENSOR_SIMILARITY_SECRET")
+    if env_secret:
+        return env_secret
+    state_dir = Path(state_dir or STATE_DIR)
+    state_dir.mkdir(parents=True, exist_ok=True)
+    f = state_dir / TENSOR_SIGNATURE_SECRET_FILE
+    if f.exists():
+        try:
+            data = json.loads(f.read_text())
+            secret = data.get("secret")
+            if secret:
+                return str(secret)
+        except Exception:
+            pass
+    secret = hashlib.sha256(os.urandom(32) + str(time.time()).encode()).hexdigest()
+    f.write_text(json.dumps({"version": 1, "secret": secret, "created": time.time()}, indent=2))
+    return secret
+
+
+def _secret_indices(secret: str, label: str, count: int, limit: int) -> list[int]:
+    count = max(0, int(count or 0))
+    limit = max(0, int(limit or 0))
+    if count <= 0 or limit <= 0:
+        return []
+    if count >= limit:
+        return list(range(limit))
+    out = set()
+    counter = 0
+    while len(out) < count and counter < count * 20 + 128:
+        digest = hashlib.sha256(f"{secret}:{label}:{counter}".encode()).digest()
+        out.add(int.from_bytes(digest[:8], "big") % limit)
+        counter += 1
+    while len(out) < count:
+        out.add(len(out) % limit)
+    return sorted(out)
+
+
+def _tensor_chunk_hashes(tname: str, data: bytes, secret: str) -> dict[str, str]:
+    size = len(data or b"")
+    if size <= 0:
+        return {}
+    chunk_size = max(32, min(int(TENSOR_CHUNK_SIGNATURE_BYTES or 4096), size))
+    max_start = max(1, size - chunk_size + 1)
+    starts = _secret_indices(
+        secret, f"chunk:{tname}:{size}:{chunk_size}",
+        TENSOR_CHUNK_SIGNATURE_CHUNKS, max_start,
+    )
+    chunks = {}
+    for start in starts:
+        end = min(size, start + chunk_size)
+        chunks[f"{tname}:{start}:{end - start}"] = hashlib.sha256(data[start:end]).hexdigest()
+    return chunks
+
+
+def _safetensors_dtype_size(dtype: str | None) -> int:
+    d = str(dtype or "").upper()
+    return {
+        "F16": 2,
+        "BF16": 2,
+        "F32": 4,
+        "F64": 8,
+    }.get(d, 0)
+
+
+def _decode_safetensors_float(data: bytes, dtype: str | None, index: int, item_size: int) -> Optional[float]:
+    pos = int(index) * int(item_size)
+    raw = data[pos:pos + item_size]
+    if len(raw) != item_size:
+        return None
+    d = str(dtype or "").upper()
+    try:
+        if d == "BF16":
+            bits16 = int.from_bytes(raw, "little")
+            bits32 = bits16 << 16
+            return struct.unpack("<f", bits32.to_bytes(4, "little"))[0]
+        if d == "F16":
+            return struct.unpack("<e", raw)[0]
+        if d == "F32":
+            return struct.unpack("<f", raw)[0]
+        if d == "F64":
+            return struct.unpack("<d", raw)[0]
+    except Exception:
+        return None
+    return None
+
+
+def _tensor_value_sketch(tname: str, tinfo: dict, data: bytes, secret: str) -> dict[str, float]:
+    dtype = (tinfo or {}).get("dtype")
+    item_size = _safetensors_dtype_size(dtype)
+    if item_size <= 0:
+        return {}
+    numel = _shape_numel((tinfo or {}).get("shape"))
+    if numel <= 0:
+        numel = len(data or b"") // item_size
+    if numel <= 0:
+        return {}
+    indices = _secret_indices(
+        secret, f"value:{tname}:{dtype}:{numel}",
+        min(TENSOR_VALUE_SKETCH_VALUES, numel), numel,
+    )
+    sketch = {}
+    for idx in indices:
+        value = _decode_safetensors_float(data, dtype, idx, item_size)
+        if value is None or not math.isfinite(float(value)):
+            continue
+        sketch[f"{tname}:{idx}"] = round(float(value), 8)
+    return sketch
+
+
+def compute_content_fingerprint(
+    model_repo: str,
+    revision: str = None,
+    sample_tensors: int = 16,
+    state_dir: Path | str | None = None,
+) -> Optional[dict]:
     """
-    Shard-invariant content hash from the raw bytes of a few specific tensors.
+    Shard-invariant fingerprint from raw bytes of specific Quasar tensors.
 
     Re-sharding a model (same weights, different file layout) produces
     different SHA256s at the shard-file level but identical tensor bytes.
-    This hashes the bytes of a fixed set of named tensors, so it catches
-    re-sharded copies that slip past compute_model_hash.
+    This records per-tensor hashes and the legacy combined content hash.
 
     Samples train-sensitive Quasar tensors first, then stable fallback tensors:
       - model.all_moe_bias / momentum / max_vio
       - dense early ffn tensors and later MoE router/expert tensors
       - embedding / norm fallback tensors
 
-    Stable fallback tensors add entropy but are not enough by themselves. If
-    too few train-sensitive tensors are found, returns None so precheck does
-    not disqualify distinct fine-tunes that merely share frozen base tensors.
-    Returns hex digest or None if unavailable.
+    Stable fallback tensors add entropy but are not enough by themselves. If too
+    few train-sensitive tensors are found, returns None so precheck does not
+    disqualify distinct fine-tunes that merely share frozen base tensors.
+
+    For train-sensitive tensors, also records private chunk hashes and numeric
+    value sketches derived from a validator-local salt. That makes the copy
+    check resistant to small checkpoint edits and to miners targeting a public,
+    fixed list of byte ranges.
     """
-    import struct
     try:
         from huggingface_hub import hf_hub_url
         info = model_info(model_repo, revision=revision, files_metadata=True)
@@ -499,12 +645,17 @@ def compute_content_hash(model_repo: str, revision: str = None, sample_tensors: 
         sample_tensors = max(1, int(sample_tensors or 1))
         train_targets = _CONTENT_HASH_TRAIN_TARGETS[:sample_tensors]
         sensitive_targets = _content_hash_sensitive_targets(sample_tensors)
+        signature_state_dir = Path(state_dir) if state_dir is not None else STATE_DIR
+        secret = _tensor_similarity_secret(signature_state_dir)
         targets = set(
             _CONTENT_HASH_CONTROL_TARGETS
             + tuple(train_targets)
             + _CONTENT_HASH_STABLE_TARGETS
         )
         tensor_hashes = []
+        tensor_numels = {}
+        tensor_chunk_hashes = {}
+        tensor_value_sketches = {}
         sensitive_found = set()
         with _requests.Session() as session:
             session.headers.update({'Accept-Encoding': 'identity'})
@@ -548,8 +699,14 @@ def compute_content_hash(model_repo: str, revision: str = None, sample_tensors: 
                         continue
                     th = hashlib.sha256(data).hexdigest()
                     tensor_hashes.append(f"{tname}:{th}")
+                    tensor_numels[tname] = _shape_numel(tinfo.get("shape"))
                     if tname in sensitive_targets:
                         sensitive_found.add(tname)
+                    if tname in train_targets:
+                        tensor_chunk_hashes.update(_tensor_chunk_hashes(tname, data, secret))
+                        tensor_value_sketches.update(
+                            _tensor_value_sketch(tname, tinfo, data, secret)
+                        )
                     targets.discard(tname)
         if not tensor_hashes:
             return None
@@ -561,10 +718,251 @@ def compute_content_hash(model_repo: str, revision: str = None, sample_tensors: 
             )
             return None
         tensor_hashes.sort()
-        return hashlib.sha256("\n".join(tensor_hashes).encode()).hexdigest()
+        tensor_hash_map = {}
+        for item in tensor_hashes:
+            name, digest = item.split(":", 1)
+            tensor_hash_map[name] = digest
+        return {
+            "version": 1,
+            "model": model_repo,
+            "revision": revision or "main",
+            "sample_tensors": sample_tensors,
+            "content_hash": hashlib.sha256("\n".join(tensor_hashes).encode()).hexdigest(),
+            "tensor_hashes": tensor_hash_map,
+            "tensor_numels": tensor_numels,
+            "tensor_chunk_hashes": tensor_chunk_hashes,
+            "tensor_value_sketches": tensor_value_sketches,
+            "sensitive_found": sorted(sensitive_found),
+            "sensitive_targets": sorted(sensitive_targets),
+            "near_copy_targets": sorted(train_targets),
+            "created": time.time(),
+        }
     except Exception as e:
-        logger.warning(f"Content hash failed for {model_repo}: {e}")
+        logger.warning(f"Content fingerprint failed for {model_repo}: {e}")
         return None
+
+
+def compute_content_hash(
+    model_repo: str,
+    revision: str = None,
+    sample_tensors: int = 16,
+    state_dir: Path | str | None = None,
+) -> Optional[str]:
+    """Backward-compatible exact content hash wrapper."""
+    fingerprint = compute_content_fingerprint(model_repo, revision, sample_tensors, state_dir)
+    if not fingerprint:
+        return None
+    return fingerprint.get("content_hash")
+
+
+def _signature_targets(incoming: dict, stored: dict) -> set[str]:
+    incoming_targets = (incoming or {}).get("near_copy_targets")
+    stored_targets = (stored or {}).get("near_copy_targets")
+    if incoming_targets or stored_targets:
+        return set(incoming_targets or []) | set(stored_targets or [])
+    sample_tensors = max(
+        int((incoming or {}).get("sample_tensors") or 16),
+        int((stored or {}).get("sample_tensors") or 16),
+    )
+    return set(_CONTENT_HASH_TRAIN_TARGETS[:sample_tensors])
+
+
+def _signature_key_tensor(key: str) -> str:
+    return str(key or "").split(":", 1)[0]
+
+
+def _filter_signature_map_by_targets(values: dict, targets: set[str]) -> dict:
+    return {
+        str(key): value
+        for key, value in dict(values or {}).items()
+        if _signature_key_tensor(str(key)) in targets
+    }
+
+
+def _chunk_signature_evidence(incoming: dict, stored: dict, targets: set[str]) -> dict:
+    incoming_chunks = _filter_signature_map_by_targets(
+        (incoming or {}).get("tensor_chunk_hashes") or {}, targets,
+    )
+    stored_chunks = _filter_signature_map_by_targets(
+        (stored or {}).get("tensor_chunk_hashes") or {}, targets,
+    )
+    common = sorted(set(incoming_chunks) & set(stored_chunks))
+    identical = [name for name in common if incoming_chunks.get(name) == stored_chunks.get(name)]
+    ratio = (len(identical) / len(common)) if common else 0.0
+    return {
+        "common_chunk_signatures": len(common),
+        "identical_chunk_signatures": len(identical),
+        "identical_chunk_ratio": ratio,
+        "identical_chunk_names": identical[:32],
+    }
+
+
+def _value_sketch_evidence(incoming: dict, stored: dict, targets: set[str]) -> dict:
+    incoming_values = _filter_signature_map_by_targets(
+        (incoming or {}).get("tensor_value_sketches") or {}, targets,
+    )
+    stored_values = _filter_signature_map_by_targets(
+        (stored or {}).get("tensor_value_sketches") or {}, targets,
+    )
+    common = sorted(set(incoming_values) & set(stored_values))
+    dot = norm_a = norm_b = diff2 = 0.0
+    usable = 0
+    for name in common:
+        try:
+            a = float(incoming_values[name])
+            b = float(stored_values[name])
+        except (TypeError, ValueError):
+            continue
+        if not (math.isfinite(a) and math.isfinite(b)):
+            continue
+        dot += a * b
+        norm_a += a * a
+        norm_b += b * b
+        diff = a - b
+        diff2 += diff * diff
+        usable += 1
+    cosine = 0.0
+    rel_l2 = float("inf")
+    if usable and norm_a > 0.0 and norm_b > 0.0:
+        cosine = dot / max(math.sqrt(norm_a) * math.sqrt(norm_b), 1e-30)
+        rel_l2 = math.sqrt(diff2 / max(norm_a, norm_b, 1e-30))
+    return {
+        "common_value_sketches": usable,
+        "value_sketch_cosine": cosine,
+        "value_sketch_rel_l2": rel_l2,
+    }
+
+
+def _tensor_signature_evidence(incoming: dict, stored: dict) -> dict:
+    incoming_hashes = dict((incoming or {}).get("tensor_hashes") or {})
+    stored_hashes = dict((stored or {}).get("tensor_hashes") or {})
+    sensitive = _signature_targets(incoming, stored)
+    common = sorted((set(incoming_hashes) & set(stored_hashes)) & sensitive)
+    identical = [name for name in common if incoming_hashes.get(name) == stored_hashes.get(name)]
+    ratio = (len(identical) / len(common)) if common else 0.0
+    return {
+        "common_sensitive_tensors": len(common),
+        "identical_sensitive_tensors": len(identical),
+        "identical_ratio": ratio,
+        "identical_tensor_names": identical,
+        **_chunk_signature_evidence(incoming, stored, sensitive),
+        **_value_sketch_evidence(incoming, stored, sensitive),
+    }
+
+
+def _is_tensor_near_copy_evidence(evidence: dict) -> bool:
+    common = int((evidence or {}).get("common_sensitive_tensors") or 0)
+    identical = int((evidence or {}).get("identical_sensitive_tensors") or 0)
+    ratio = float((evidence or {}).get("identical_ratio") or 0.0)
+    exact_tensor_copy = (
+        common >= TENSOR_NEAR_COPY_MIN_COMMON
+        and identical >= TENSOR_NEAR_COPY_MIN_IDENTICAL
+        and ratio >= TENSOR_NEAR_COPY_IDENTICAL_RATIO
+    )
+    common_chunks = int((evidence or {}).get("common_chunk_signatures") or 0)
+    identical_chunks = int((evidence or {}).get("identical_chunk_signatures") or 0)
+    chunk_ratio = float((evidence or {}).get("identical_chunk_ratio") or 0.0)
+    chunk_copy = (
+        common_chunks >= TENSOR_CHUNK_NEAR_COPY_MIN_COMMON
+        and identical_chunks >= TENSOR_CHUNK_NEAR_COPY_MIN_COMMON
+        and chunk_ratio >= TENSOR_CHUNK_NEAR_COPY_IDENTICAL_RATIO
+    )
+    common_values = int((evidence or {}).get("common_value_sketches") or 0)
+    value_cosine = float((evidence or {}).get("value_sketch_cosine") or 0.0)
+    value_rel_l2 = float((evidence or {}).get("value_sketch_rel_l2") or float("inf"))
+    value_copy = (
+        common_values >= TENSOR_VALUE_NEAR_COPY_MIN_COMMON
+        and value_cosine >= TENSOR_VALUE_NEAR_COPY_MIN_COSINE
+        and value_rel_l2 <= TENSOR_VALUE_NEAR_COPY_MAX_REL_L2
+    )
+    return exact_tensor_copy or chunk_copy or value_copy
+
+
+def duplicate_tensor_signature_matches(
+    fingerprint: dict,
+    miner_uid: int,
+    state_dir: Path = STATE_DIR,
+) -> list[dict]:
+    """Return stored UIDs with near-identical train-sensitive tensor hashes.
+
+    Unlike the exact content hash, this catches tiny checkpoint edits where a
+    copy changes a few auxiliary tensors to produce a different whole-model
+    digest while leaving nearly all learned tensors byte-identical.
+    """
+    f = state_dir / TENSOR_SIGNATURE_FILE
+    if not fingerprint or not f.exists():
+        return []
+    try:
+        stored = json.loads(f.read_text())
+    except Exception:
+        return []
+    matches = []
+    for uid_str, other in (stored or {}).items():
+        try:
+            uid = int(uid_str)
+        except (TypeError, ValueError):
+            continue
+        if uid == miner_uid:
+            continue
+        evidence = _tensor_signature_evidence(fingerprint, other)
+        if _is_tensor_near_copy_evidence(evidence):
+            matches.append({
+                "uid": uid,
+                "model": (other or {}).get("model"),
+                "revision": (other or {}).get("revision"),
+                "commit_block": (other or {}).get("commit_block"),
+                **evidence,
+            })
+    return matches
+
+
+def tensor_similarity_signature_needs_backfill(
+    miner_uid: int,
+    state_dir: Path = STATE_DIR,
+) -> bool:
+    """Return True when a UID lacks the current train-tensor copy signature."""
+    f = state_dir / TENSOR_SIGNATURE_FILE
+    if not f.exists():
+        return True
+    try:
+        stored = json.loads(f.read_text())
+    except Exception:
+        return True
+    rec = (stored or {}).get(str(miner_uid)) or {}
+    return not (
+        rec.get("tensor_hashes")
+        and rec.get("tensor_chunk_hashes")
+        and rec.get("tensor_value_sketches")
+    )
+
+
+def register_tensor_similarity_signature(
+    fingerprint: dict,
+    miner_uid: int,
+    state_dir: Path = STATE_DIR,
+    *,
+    model_repo: Optional[str] = None,
+    revision: Optional[str] = None,
+    commit_block=None,
+):
+    """Persist per-tensor hashes used by the partial-copy detector."""
+    if not fingerprint:
+        return
+    state_dir.mkdir(parents=True, exist_ok=True)
+    f = state_dir / TENSOR_SIGNATURE_FILE
+    data = {}
+    if f.exists():
+        try:
+            data = json.loads(f.read_text())
+        except Exception:
+            data = {}
+    rec = dict(fingerprint)
+    rec["model"] = model_repo or rec.get("model")
+    rec["revision"] = revision or rec.get("revision")
+    rec["commit_block"] = commit_block
+    rec["updated"] = time.time()
+    data[str(miner_uid)] = rec
+    f.write_text(json.dumps(data, indent=2))
 
 
 def compute_tensor_metadata_hash(model_repo: str, revision: str = None) -> Optional[str]:
