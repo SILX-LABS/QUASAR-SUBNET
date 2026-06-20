@@ -10,7 +10,7 @@
   },
   "student": {
     "baseModel": "silx-ai/Quasar-3B-A1B-Preview",
-    "revision": "main",
+    "revision": "42e20bd9a009c3c2d7c717ed2e10b34cb93be243",
     "architecture": "quasar",
     "totalParams": 3000000000,
     "activeParams": 1000000000,
