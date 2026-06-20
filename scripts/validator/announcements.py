@@ -67,10 +67,9 @@ def announce_new_king(new_uid, new_model, new_kl, old_uid, old_model, old_kl,
     prompt_line = f"🧪 Scored on {prompt_count} block-seeded prompts"
     n_axes, axis_list = _active_axis_summary()
     gate_explainer = (
-        f"Dethronement uses an absolute composite across {n_axes} weighted axes "
-        f"({axis_list}). Clear win on `worst` (>3% margin) takes the crown; "
-        f"the tied region falls back to `weighted` with the same margin. "
-        f"KL is a distillation axis, not the king-selection gate. "
+        f"Dethronement requires a paired KL win with >=3% lower KL, then "
+        f"composite quality across {n_axes} weighted axes ({axis_list}) must "
+        f"also hold within the 3% margin. "
         f"(composite schema v{COMPOSITE_SHADOW_VERSION})"
     )
     p_line = f" (p={p_value:.4f})" if isinstance(p_value, (int, float)) else ""

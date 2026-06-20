@@ -1214,6 +1214,7 @@ def _build_h2h_results(results, models_to_eval, king_uid, king_h2h_kl, king_per_
                 mean_d, se_d, lcb_d = _paired_delta_summary(deltas)
                 if n_paired > 1:
                     t_s, p_val, _ = _paired_t_stats(deltas)
+                    relative_improvement = pct / 100.0
                     t_test_info = {
                         "p": round(p_val, 6),
                         "t": round(t_s, 3),
@@ -1221,13 +1222,20 @@ def _build_h2h_results(results, models_to_eval, king_uid, king_h2h_kl, king_per_
                         "mean_delta": round(mean_d, 6),
                         "se": round(se_d, 6),
                         "lcb": round(lcb_d, 6),
+                        "king_kl": round(king_h2h_kl, 6),
+                        "epsilon": EPSILON,
+                        "relative_improvement": round(relative_improvement, 6),
+                        "required_delta": round(king_h2h_kl * EPSILON, 6),
                     }
                 else:
                     t_s, p_val = 0.0, 1.0
+                passes_epsilon = pct / 100.0 + 1e-12 >= EPSILON
                 if n_paired < MIN_PROMPTS_DETHRONE:
                     vs_king = f"-{pct:.3f}% ({n_paired}p, need {MIN_PROMPTS_DETHRONE}p)" if mean_d > 0 else "worse"
-                elif p_val < PAIRED_TEST_ALPHA and mean_d > 0:
+                elif p_val < PAIRED_TEST_ALPHA and mean_d > 0 and passes_epsilon:
                     vs_king = f"-{pct:.3f}% (p={p_val:.4f} dethroned)"
+                elif p_val < PAIRED_TEST_ALPHA and mean_d > 0:
+                    vs_king = f"-{pct:.3f}% (not enough, need >={EPSILON * 100:.0f}%)"
                 elif mean_d > 0:
                     vs_king = f"-{pct:.3f}% (p={p_val:.4f}, not significant)"
                 else:

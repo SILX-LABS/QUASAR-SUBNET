@@ -104,7 +104,7 @@ def compute_kl_from_logits(
 def generate_teacher_continuations(
     teacher_model,
     input_ids_list: list[torch.Tensor],
-    max_new_tokens: int = 512,
+    max_new_tokens: int = 1024,
     block_seed: Optional[int] = None,
     device: str = "cuda",
 ) -> list[dict]:

@@ -62,6 +62,7 @@ import subprocess
 import sys
 import threading
 import time
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
@@ -75,6 +76,20 @@ import torch.nn.functional as F
 # -- HF forward pass --
 HF_CHUNK_SIZE = 4096        # Chunk size for KV-cached forward on long sequences
 MIN_COMPLETION_TOKENS = 10  # Skip prompts producing fewer continuation tokens
+DEFAULT_MAX_NEW_TOKENS = 1024
+
+# -- Teacher continuation quality filter --
+TEACHER_CONTINUATION_QUALITY_VERSION = 1
+TEACHER_QUALITY_MAX_REGEN_ATTEMPTS = max(
+    1, int(os.environ.get("TEACHER_QUALITY_MAX_REGEN_ATTEMPTS", "3"))
+)
+TEACHER_QUALITY_MIN_UNIQUE_RATIO = float(
+    os.environ.get("TEACHER_QUALITY_MIN_UNIQUE_RATIO", "0.10")
+)
+TEACHER_QUALITY_MAX_NGRAM_REPEAT_RATIO = float(
+    os.environ.get("TEACHER_QUALITY_MAX_NGRAM_REPEAT_RATIO", "0.30")
+)
+TEACHER_QUALITY_MIN_WORDS_FOR_DIVERSITY = 12
 
 # -- KL computation --
 # Uses F.kl_div(log_target=True) which is mathematically identical to
@@ -100,6 +115,130 @@ VLLM_REQUEST_TIMEOUT = 300
 # ═══════════════════════════════════════════════════════════════════════════════
 # §3  GPU & Disk Utilities
 # ═══════════════════════════════════════════════════════════════════════════════
+
+def _word_tokens(text: str) -> list[str]:
+    return re.findall(r"[A-Za-z0-9_']+", (text or "").lower())
+
+
+def _max_run(items: list[str]) -> int:
+    if not items:
+        return 0
+    best = cur = 1
+    prev = items[0]
+    for item in items[1:]:
+        if item == prev:
+            cur += 1
+        else:
+            best = max(best, cur)
+            cur = 1
+            prev = item
+    return max(best, cur)
+
+
+def _max_ngram_repeat_ratio(words: list[str], n: int) -> tuple[float, int]:
+    if len(words) < n * 3:
+        return 0.0, 0
+    grams = [tuple(words[i:i + n]) for i in range(len(words) - n + 1)]
+    if not grams:
+        return 0.0, 0
+    counts = Counter(grams)
+    max_count = max(counts.values())
+    return max_count / len(grams), max_count
+
+
+def assess_teacher_continuation_quality(
+    text: str,
+    token_ids: list[int] | None = None,
+    *,
+    min_tokens: int = MIN_COMPLETION_TOKENS,
+) -> dict:
+    """Return quality metadata for a teacher continuation used as KL target."""
+    text = text or ""
+    token_count = len(token_ids) if token_ids is not None else 0
+    stripped = text.strip()
+    words = _word_tokens(text)
+    reasons: list[str] = []
+
+    if min_tokens > 0 and token_count < min_tokens:
+        reasons.append("short")
+    if not stripped:
+        reasons.append("empty")
+
+    alnum_chars = sum(ch.isalnum() for ch in text)
+    if stripped and alnum_chars < 4:
+        reasons.append("no_content")
+
+    max_word_run = _max_run(words)
+    unique_word_ratio = (len(set(words)) / len(words)) if words else 0.0
+    repeated_ngram = 0.0
+    repeated_ngram_n = 0
+    repeated_ngram_count = 0
+    for n in (2, 3, 4):
+        ratio, count = _max_ngram_repeat_ratio(words, n)
+        if ratio > repeated_ngram:
+            repeated_ngram = ratio
+            repeated_ngram_n = n
+            repeated_ngram_count = count
+
+    if len(words) >= 6 and max_word_run >= max(6, len(words) // 2):
+        reasons.append("word_loop")
+    if (
+        len(words) >= TEACHER_QUALITY_MIN_WORDS_FOR_DIVERSITY
+        and unique_word_ratio < TEACHER_QUALITY_MIN_UNIQUE_RATIO
+    ):
+        reasons.append("low_diversity")
+    if (
+        repeated_ngram_count >= 3
+        and repeated_ngram >= TEACHER_QUALITY_MAX_NGRAM_REPEAT_RATIO
+    ):
+        reasons.append(f"{repeated_ngram_n}gram_loop")
+
+    metrics = {
+        "chars": len(text),
+        "alnum_chars": alnum_chars,
+        "tokens": token_count,
+        "words": len(words),
+        "unique_word_ratio": round(unique_word_ratio, 4),
+        "max_word_run": max_word_run,
+        "max_ngram_repeat_ratio": round(repeated_ngram, 4),
+        "max_ngram_n": repeated_ngram_n,
+        "max_ngram_count": repeated_ngram_count,
+    }
+    return {
+        "ok": not reasons,
+        "reasons": reasons,
+        "metrics": metrics,
+        "version": TEACHER_CONTINUATION_QUALITY_VERSION,
+    }
+
+
+def _quality_reasons(quality: dict | None) -> list[str]:
+    if not quality:
+        return []
+    reasons = quality.get("reasons", [])
+    return reasons if isinstance(reasons, list) else [str(reasons)]
+
+
+def _quality_filter_summary(qualities: list[dict | None]) -> dict:
+    reason_counts = Counter()
+    regen_attempts = 0
+    rejected = 0
+    for quality in qualities:
+        if not quality:
+            continue
+        if quality.get("attempts", 1) > 1:
+            regen_attempts += int(quality.get("attempts", 1)) - 1
+        if not quality.get("ok", True):
+            rejected += 1
+        reason_counts.update(_quality_reasons(quality))
+    return {
+        "version": TEACHER_CONTINUATION_QUALITY_VERSION,
+        "checked": sum(1 for q in qualities if q is not None),
+        "rejected": rejected,
+        "regenerated_attempts": regen_attempts,
+        "reasons": dict(sorted(reason_counts.items())),
+    }
+
 
 def gpu_mem_str():
     """Return a human-readable string of current GPU memory usage."""
@@ -10189,51 +10328,71 @@ def _generate_single_prompt(idx, prompt_text, max_new_tokens, block_seed,
         "top_p": 0.9 if block_seed is not None else 1.0,
         # repetition_penalty removed — wrecks KL scores without stopping loops
     }
-    if block_seed is not None:
-        payload["seed"] = block_seed + idx
     if logprobs_k > 0:
         payload["logprobs"] = logprobs_k
         payload["prompt_logprobs"] = 0
 
-    for attempt in range(3):
-        try:
-            resp = requests.post(
-                f"{VLLM_URL}/v1/completions",
-                json=payload,
-                timeout=VLLM_REQUEST_TIMEOUT,
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            choice = data["choices"][0]
-            cont_text = choice["text"]
-            full_text = prompt_text + cont_text
-            full_ids = tokenizer(full_text, return_tensors="pt", truncation=False).input_ids
-            prompt_len = _align_prompt_boundary(
-                full_text, prompt_text, full_ids, tokenizer,
-            )
-            result = {
-                "full_ids": full_ids,
-                "prompt_len": prompt_len,
-                "gen_len": full_ids.shape[1] - prompt_len,
-            }
-            if logprobs_k > 0 and "logprobs" in choice and choice["logprobs"]:
-                lp_data = choice["logprobs"]
-                top_lp_list = lp_data.get("top_logprobs")
-                if top_lp_list and token_to_id is not None:
-                    result["sparse_logprobs"] = vllm_logprobs_to_sparse(
-                        top_lp_list, token_to_id, tokenizer, k=logprobs_k
-                    )
-            return idx, result
-        except Exception as e:
-            if attempt < 2:
-                print(
-                    f"  [vllm] Prompt {idx} attempt {attempt + 1} failed: "
-                    f"{type(e).__name__}: {e}",
-                    flush=True,
+    last_bad = None
+    for quality_attempt in range(TEACHER_QUALITY_MAX_REGEN_ATTEMPTS):
+        attempt_payload = dict(payload)
+        if block_seed is not None:
+            attempt_payload["seed"] = block_seed + idx + quality_attempt * 1_000_003
+
+        for attempt in range(3):
+            try:
+                resp = requests.post(
+                    f"{VLLM_URL}/v1/completions",
+                    json=attempt_payload,
+                    timeout=VLLM_REQUEST_TIMEOUT,
                 )
-                time.sleep(2)
-            else:
-                raise RuntimeError(f"vLLM generation failed for prompt {idx}: {e}")
+                resp.raise_for_status()
+                data = resp.json()
+                choice = data["choices"][0]
+                cont_text = choice["text"]
+                full_text = prompt_text + cont_text
+                full_ids = tokenizer(full_text, return_tensors="pt", truncation=False).input_ids
+                prompt_len = _align_prompt_boundary(
+                    full_text, prompt_text, full_ids, tokenizer,
+                )
+                continuation_ids = full_ids[0, prompt_len:].tolist()
+                quality = assess_teacher_continuation_quality(cont_text, continuation_ids)
+                quality["attempts"] = quality_attempt + 1
+                result = {
+                    "full_ids": full_ids,
+                    "prompt_len": prompt_len,
+                    "gen_len": len(continuation_ids),
+                    "quality": quality,
+                }
+                if logprobs_k > 0 and "logprobs" in choice and choice["logprobs"]:
+                    lp_data = choice["logprobs"]
+                    top_lp_list = lp_data.get("top_logprobs")
+                    if top_lp_list and token_to_id is not None:
+                        result["sparse_logprobs"] = vllm_logprobs_to_sparse(
+                            top_lp_list, token_to_id, tokenizer, k=logprobs_k
+                        )
+                if quality["ok"]:
+                    return idx, result
+                last_bad = (idx, result)
+                if quality_attempt < TEACHER_QUALITY_MAX_REGEN_ATTEMPTS - 1:
+                    print(
+                        f"  [vllm] Prompt {idx} rejected by teacher-quality filter "
+                        f"({','.join(_quality_reasons(quality))}); regenerating",
+                        flush=True,
+                    )
+                break
+            except Exception as e:
+                if attempt < 2:
+                    print(
+                        f"  [vllm] Prompt {idx} attempt {attempt + 1} failed: "
+                        f"{type(e).__name__}: {e}",
+                        flush=True,
+                    )
+                    time.sleep(2)
+                else:
+                    raise RuntimeError(f"vLLM generation failed for prompt {idx}: {e}")
+    if last_bad is not None:
+        return last_bad
+    raise RuntimeError(f"vLLM generation failed for prompt {idx}: no result")
 
 
 def generate_via_vllm(prompts, tokenizer, max_new_tokens, block_seed=None,
@@ -10591,7 +10750,7 @@ def main():
     parser.add_argument("--revisions", default=None, help="Comma-separated revisions matching --students order")
     parser.add_argument("--prompts", required=True, help="JSON file with prompt texts")
     parser.add_argument("--output", default="/home/eval_results.json")
-    parser.add_argument("--max-new-tokens", type=int, default=512)
+    parser.add_argument("--max-new-tokens", type=int, default=DEFAULT_MAX_NEW_TOKENS)
     parser.add_argument("--block-seed", type=int, default=None)
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--teacher-logits", default="/home/teacher_cache.pt")
@@ -10681,6 +10840,7 @@ def main():
     full_sequences = []
     teacher_logits_list = []
     prompt_lens = []
+    teacher_quality = []
     teacher_cache_loaded = False
 
     # Try loading from cache
@@ -10688,11 +10848,20 @@ def main():
         try:
             t0 = time.time()
             cache = torch.load(args.teacher_logits, map_location="cpu", weights_only=False)
-            if (len(cache.get("full_sequences", [])) == len(prompts)
-                and cache.get("prompts_hash") == prompts_hash):
+            stale_reasons = []
+            if len(cache.get("full_sequences", [])) != len(prompts):
+                stale_reasons.append("prompt_count")
+            if cache.get("prompts_hash") != prompts_hash:
+                stale_reasons.append("prompts_hash")
+            if cache.get("max_new_tokens") != args.max_new_tokens:
+                stale_reasons.append("max_new_tokens")
+            if cache.get("teacher_continuation_quality_version") != TEACHER_CONTINUATION_QUALITY_VERSION:
+                stale_reasons.append("quality_version")
+            if not stale_reasons:
                 full_sequences = [s.to(device) for s in cache["full_sequences"]]
                 teacher_logits_list = cache["teacher_logits"]  # keep on CPU
                 prompt_lens = cache["prompt_lens"]
+                teacher_quality = cache.get("teacher_quality", [])
                 if cache.get("teacher_probe_samples"):
                     globals()["_TEACHER_PROBE_SAMPLES"] = cache["teacher_probe_samples"]
                 cached_refs = cache.get("teacher_capability_refs")
@@ -10716,7 +10885,7 @@ def main():
                       f"probe_refs={'yes' if cache.get('teacher_probe_samples') else 'no'})", flush=True)
                 teacher_cache_loaded = True
             else:
-                print(f"[eval] ✗ Cache stale — regenerating", flush=True)
+                print(f"[eval] ✗ Cache stale ({','.join(stale_reasons)}) — regenerating", flush=True)
         except Exception as e:
             print(f"[eval] ✗ Cache failed: {e}", flush=True)
 
@@ -10799,6 +10968,7 @@ def main():
         if sequences_data:
             # Check if vLLM returned logprobs for all prompts
             has_vllm_logprobs = all("sparse_logprobs" in d for d in sequences_data)
+            teacher_quality = [d.get("quality") for d in sequences_data]
 
             if has_vllm_logprobs:
                 # ── vLLM logprobs path: skip Phase 1b entirely ──
@@ -10898,9 +11068,13 @@ def main():
                         "prompt_lens": prompt_lens,
                         "block_seed": args.block_seed,
                         "prompts_hash": prompts_hash,
+                        "max_new_tokens": args.max_new_tokens,
                         "generation_method": gen_method,
                         "logprobs_k": args.logprobs_k,
                         "sparse": any(_is_sparse_logits(tl) for tl in teacher_logits_list),
+                        "teacher_continuation_quality_version": TEACHER_CONTINUATION_QUALITY_VERSION,
+                        "teacher_quality": teacher_quality,
+                        "quality_filter": _quality_filter_summary(teacher_quality),
                         "teacher_probe_samples": globals().get("_TEACHER_PROBE_SAMPLES", []),
                         "teacher_capability_refs": globals().get("_TEACHER_CAPABILITY_REFS", {}),
                         "teacher_capability_block_seed": args.block_seed,
@@ -10941,22 +11115,43 @@ def main():
         with torch.no_grad():
             for i, ids in enumerate(input_ids_list):
                 prompt_len = ids.shape[1]
-                gen_kwargs = dict(max_new_tokens=args.max_new_tokens, use_cache=False)
-                if args.block_seed is not None:
-                    torch.manual_seed(args.block_seed + i)
-                    if torch.cuda.is_available():
-                        torch.cuda.manual_seed(args.block_seed + i)
-                    gen_kwargs.update(do_sample=True, temperature=0.7, top_p=0.9)
-                else:
-                    gen_kwargs.update(do_sample=False)
-                output_ids = teacher.generate(ids, **gen_kwargs)
-                gen_len = output_ids.shape[1] - prompt_len
-                hf_sequences_data.append({
-                    "full_ids": output_ids,
-                    "prompt_len": prompt_len,
-                    "gen_len": gen_len,
-                })
-                print(f"  Gen [{i+1}/{len(input_ids_list)}]: {prompt_len}+{gen_len} tokens, VRAM: {gpu_mem_str()}", flush=True)
+                best_data = None
+                for quality_attempt in range(TEACHER_QUALITY_MAX_REGEN_ATTEMPTS):
+                    gen_kwargs = dict(max_new_tokens=args.max_new_tokens, use_cache=False)
+                    if args.block_seed is not None:
+                        attempt_seed = args.block_seed + i + quality_attempt * 1_000_003
+                        torch.manual_seed(attempt_seed)
+                        if torch.cuda.is_available():
+                            torch.cuda.manual_seed(attempt_seed)
+                        gen_kwargs.update(do_sample=True, temperature=0.7, top_p=0.9)
+                    else:
+                        gen_kwargs.update(do_sample=False)
+                    output_ids = teacher.generate(ids, **gen_kwargs)
+                    gen_len = output_ids.shape[1] - prompt_len
+                    continuation_ids = output_ids[0, prompt_len:].tolist()
+                    continuation_text = tokenizer.decode(continuation_ids, skip_special_tokens=True)
+                    quality = assess_teacher_continuation_quality(
+                        continuation_text, continuation_ids
+                    )
+                    quality["attempts"] = quality_attempt + 1
+                    best_data = {
+                        "full_ids": output_ids,
+                        "prompt_len": prompt_len,
+                        "gen_len": gen_len,
+                        "quality": quality,
+                    }
+                    if quality["ok"]:
+                        break
+                    if quality_attempt < TEACHER_QUALITY_MAX_REGEN_ATTEMPTS - 1:
+                        print(
+                            f"  Gen [{i+1}/{len(input_ids_list)}] rejected by "
+                            f"teacher-quality filter ({','.join(_quality_reasons(quality))}); regenerating",
+                            flush=True,
+                        )
+                hf_sequences_data.append(best_data)
+                q = best_data.get("quality") or {}
+                q_note = "" if q.get("ok", True) else f" rejected={','.join(_quality_reasons(q))}"
+                print(f"  Gen [{i+1}/{len(input_ids_list)}]: {prompt_len}+{best_data['gen_len']} tokens{q_note}, VRAM: {gpu_mem_str()}", flush=True)
                 _write_phase(progress_path, students, "teacher_generation", teacher_done=i + 1, prompts_total=len(prompts))
         timings["teacher_generation"] = time.time() - t0
 
@@ -10980,6 +11175,7 @@ def main():
         timings["teacher_logits_pass"] = time.time() - t0_logits
         if n_chunked:
             print(f"[eval] Chunked forward pass used for {n_chunked}/{len(hf_sequences_data)} sequences", flush=True)
+        teacher_quality = [d.get("quality") for d in hf_sequences_data]
         del hf_sequences_data
 
         try:
@@ -11009,9 +11205,13 @@ def main():
             "prompt_lens": prompt_lens,
             "block_seed": args.block_seed,
             "prompts_hash": prompts_hash,
+            "max_new_tokens": args.max_new_tokens,
             "generation_method": "hf",
             "logprobs_k": args.logprobs_k,
             "sparse": any(_is_sparse_logits(tl) for tl in teacher_logits_list),
+            "teacher_continuation_quality_version": TEACHER_CONTINUATION_QUALITY_VERSION,
+            "teacher_quality": teacher_quality,
+            "quality_filter": _quality_filter_summary(teacher_quality),
             "teacher_probe_samples": globals().get("_TEACHER_PROBE_SAMPLES", []),
             "teacher_capability_refs": globals().get("_TEACHER_CAPABILITY_REFS", {}),
             "teacher_capability_block_seed": args.block_seed,
@@ -11034,30 +11234,72 @@ def main():
     teacher_probs = None
 
     # ═══════════════════════════════════════════════════════════════════
-    # PHASE 1d: Filter short completions & log completion lengths
+    # PHASE 1d: Filter unusable completions & log completion lengths
     # ═══════════════════════════════════════════════════════════════════
     completion_lens = [full_sequences[i].shape[1] - prompt_lens[i] for i in range(len(prompts))]
     min_cl, max_cl = min(completion_lens), max(completion_lens)
     avg_cl = sum(completion_lens) / len(completion_lens)
     print(f"[eval] Completion tokens: min={min_cl} max={max_cl} avg={avg_cl:.0f} across {len(prompts)} prompts", flush=True)
 
-    # Filter out prompts with fewer than MIN_COMPLETION_TOKENS
+    if len(teacher_quality) != len(prompts):
+        teacher_quality = []
+        for i in range(len(prompts)):
+            continuation_ids = full_sequences[i][0, prompt_lens[i]:].tolist()
+            continuation_text = tokenizer.decode(continuation_ids, skip_special_tokens=True)
+            quality = assess_teacher_continuation_quality(
+                continuation_text, continuation_ids
+            )
+            quality["attempts"] = 1
+            teacher_quality.append(quality)
+
+    quality_filter_stats = _quality_filter_summary(teacher_quality)
+
+    # Filter out prompts with short, empty, repetitive, or no-content completions.
     n_filtered = 0
-    if MIN_COMPLETION_TOKENS > 0:
-        keep_indices = [i for i, cl in enumerate(completion_lens) if cl >= MIN_COMPLETION_TOKENS]
-        n_filtered = len(prompts) - len(keep_indices)
-        if n_filtered > 0:
-            skipped_lens = [completion_lens[i] for i in range(len(prompts)) if i not in set(keep_indices)]
-            print(f"[eval] Filtered {n_filtered}/{len(prompts)} prompts with <{MIN_COMPLETION_TOKENS} completion tokens "
-                  f"(skipped lens: {skipped_lens})", flush=True)
-            full_sequences = [full_sequences[i] for i in keep_indices]
-            teacher_logits_list = [teacher_logits_list[i] for i in keep_indices]
-            prompt_lens = [prompt_lens[i] for i in keep_indices]
-            prompts = [prompts[i] for i in keep_indices]
-            completion_lens = [completion_lens[i] for i in keep_indices]
-            print(f"[eval] Remaining: {len(prompts)} prompts after filtering", flush=True)
+    keep_indices = []
+    skipped = []
+    dropped_reason_counts = Counter()
+    for i, cl in enumerate(completion_lens):
+        quality = teacher_quality[i] or {}
+        reasons = set(_quality_reasons(quality))
+        if MIN_COMPLETION_TOKENS > 0 and cl < MIN_COMPLETION_TOKENS:
+            reasons.add("short")
+        if reasons:
+            skipped.append((i, cl, sorted(reasons)))
+            dropped_reason_counts.update(reasons)
         else:
-            print(f"[eval] All {len(prompts)} prompts have >={MIN_COMPLETION_TOKENS} completion tokens — no filtering needed", flush=True)
+            keep_indices.append(i)
+
+    n_filtered = len(prompts) - len(keep_indices)
+    quality_filter_stats["dropped"] = n_filtered
+    quality_filter_stats["dropped_reasons"] = dict(sorted(dropped_reason_counts.items()))
+
+    if n_filtered > 0:
+        if not keep_indices:
+            raise RuntimeError(
+                "All teacher continuations failed the quality filter; "
+                f"reasons={quality_filter_stats['dropped_reasons']}"
+            )
+        preview = skipped[:10]
+        print(
+            f"[eval] Filtered {n_filtered}/{len(prompts)} teacher continuations "
+            f"before KL (reasons={quality_filter_stats['dropped_reasons']}, "
+            f"preview={preview})",
+            flush=True,
+        )
+        full_sequences = [full_sequences[i] for i in keep_indices]
+        teacher_logits_list = [teacher_logits_list[i] for i in keep_indices]
+        prompt_lens = [prompt_lens[i] for i in keep_indices]
+        teacher_quality = [teacher_quality[i] for i in keep_indices]
+        prompts = [prompts[i] for i in keep_indices]
+        completion_lens = [completion_lens[i] for i in keep_indices]
+        print(f"[eval] Remaining: {len(prompts)} prompts after quality filtering", flush=True)
+    else:
+        print(
+            f"[eval] All {len(prompts)} teacher continuations passed quality filter "
+            f"(regenerated_attempts={quality_filter_stats['regenerated_attempts']})",
+            flush=True,
+        )
 
     # ═══════════════════════════════════════════════════════════════════
     # PHASE 1e: Save eval data for reproducibility
@@ -11075,6 +11317,7 @@ def main():
                 "continuation": continuation_text,
                 "prompt_tokens": prompt_len,
                 "continuation_tokens": len(continuation_ids),
+                "teacher_quality": teacher_quality[i] if i < len(teacher_quality) else None,
             })
         with open(eval_data_path, "w") as f:
             json.dump({
@@ -11082,6 +11325,8 @@ def main():
                 "max_new_tokens": args.max_new_tokens,
                 "block_seed": args.block_seed,
                 "n_prompts": len(prompts),
+                "teacher_continuation_quality_version": TEACHER_CONTINUATION_QUALITY_VERSION,
+                "quality_filter": quality_filter_stats,
                 "data": eval_data,
             }, f, indent=2)
         print(f"[eval] Saved eval data ({len(prompts)} prompts) to {eval_data_path}", flush=True)
@@ -11118,6 +11363,8 @@ def main():
         "n_prompts": len(prompts),
         "n_prompts_filtered": n_filtered,
         "min_completion_tokens": MIN_COMPLETION_TOKENS,
+        "teacher_continuation_quality_version": TEACHER_CONTINUATION_QUALITY_VERSION,
+        "quality_filter": quality_filter_stats,
         "students": {},
     }
     for name, data in prior_results.items():

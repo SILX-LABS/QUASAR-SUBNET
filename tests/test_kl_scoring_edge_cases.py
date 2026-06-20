@@ -141,6 +141,43 @@ class TestKLDivergence(unittest.TestCase):
         self.assertEqual(result["n_positions"], 0)
 
 
+class TestTeacherContinuationQuality(unittest.TestCase):
+    """Test teacher continuation filtering before KL scoring."""
+
+    def test_rejects_repetitive_answer_loop(self):
+        from pod_eval_vllm import assess_teacher_continuation_quality
+
+        text = "answer: answer: answer: answer: answer: answer: answer: answer: answer: answer:"
+        result = assess_teacher_continuation_quality(text, list(range(32)))
+
+        self.assertFalse(result["ok"])
+        self.assertTrue({"word_loop", "low_diversity"} & set(result["reasons"]))
+
+    def test_rejects_ngram_loop(self):
+        from pod_eval_vllm import assess_teacher_continuation_quality
+
+        text = "red blue red blue red blue red blue red blue red blue"
+        result = assess_teacher_continuation_quality(text, list(range(32)))
+
+        self.assertFalse(result["ok"])
+        self.assertTrue(
+            any(reason.endswith("gram_loop") for reason in result["reasons"]),
+            result["reasons"],
+        )
+
+    def test_accepts_normal_explanatory_completion(self):
+        from pod_eval_vllm import assess_teacher_continuation_quality
+
+        text = (
+            "The solution is to compare each option against the constraint, "
+            "remove the impossible cases, and then verify the remaining value "
+            "with the original equation."
+        )
+        result = assess_teacher_continuation_quality(text, list(range(40)))
+
+        self.assertTrue(result["ok"], result["reasons"])
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # Early Stopping Tests
 # ═══════════════════════════════════════════════════════════════════════════════

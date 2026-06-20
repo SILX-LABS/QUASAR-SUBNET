@@ -36,6 +36,7 @@ from scripts.validator.challengers import (
     select_challengers,
 )
 from scripts.validator.config import (
+    EPSILON,
     EVAL_PROMPTS_FULL,
     EVAL_PROMPTS_H2H,
     MAX_KL_THRESHOLD,
@@ -174,14 +175,51 @@ def _composite_quality_score(record: dict | None) -> float | None:
     return composite_crown_quality_score(record)
 
 
-def _paired_kl_win(row: dict) -> bool:
+def _paired_kl_gate(row: dict, incumbent_row: dict | None) -> tuple[bool, dict]:
     tt = row.get("t_test") or {}
     p_val = _as_float(tt.get("p"))
     mean_delta = _as_float(tt.get("mean_delta"))
     lcb = _as_float(tt.get("lcb"), mean_delta)
+    challenger_kl = _as_float(row.get("kl"))
+    incumbent_kl = _as_float((incumbent_row or {}).get("kl"))
+    detail = {
+        "reason": "paired_kl_margin",
+        "alpha": PAIRED_TEST_ALPHA,
+        "epsilon": EPSILON,
+        "challenger_kl": challenger_kl,
+        "incumbent_kl": incumbent_kl,
+        "p": p_val,
+        "mean_delta": mean_delta,
+        "lcb": lcb,
+    }
     if p_val is None or mean_delta is None or lcb is None:
-        return False
-    return p_val < PAIRED_TEST_ALPHA and mean_delta > 0 and lcb > 0
+        detail["reason"] = "missing_paired_stats"
+        return False, detail
+    if incumbent_kl is None or incumbent_kl <= 0:
+        detail["reason"] = "missing_incumbent_kl"
+        return False, detail
+    if challenger_kl is None:
+        detail["reason"] = "missing_challenger_kl"
+        return False, detail
+    required_delta = incumbent_kl * max(0.0, float(EPSILON))
+    global_delta = incumbent_kl - challenger_kl
+    relative_improvement = global_delta / incumbent_kl if incumbent_kl > 0 else 0.0
+    detail.update({
+        "required_delta": required_delta,
+        "global_delta": global_delta,
+        "relative_improvement": relative_improvement,
+    })
+    if p_val >= PAIRED_TEST_ALPHA:
+        detail["reason"] = "paired_kl_not_significant"
+        return False, detail
+    if mean_delta <= 0 or lcb <= 0:
+        detail["reason"] = "paired_kl_not_positive"
+        return False, detail
+    if global_delta + 1e-12 < required_delta:
+        detail["reason"] = "kl_margin_not_met"
+        return False, detail
+    detail["reason"] = "paired_kl_margin_passed"
+    return True, detail
 
 
 def _composite_quality_allows_dethrone(
@@ -359,7 +397,8 @@ def _resolve_round_winner_with_commit_tiebreak(candidates: list[tuple]) -> dict:
 def _select_round_winner_with_kl_and_composite(h2h_results, king_uid, incumbent_record=None):
     """Return a challenger only when both production gates agree.
 
-    Gate 1: the challenger significantly beats the incumbent on paired KL.
+    Gate 1: the challenger significantly beats the incumbent on paired KL
+    and lowers the incumbent's round KL by at least ``EPSILON``.
     Gate 2: the challenger does not meaningfully regress on non-relative
     composite quality. Among challengers that pass both gates, rank by that
     quality score first and paired KL strength second.
@@ -384,10 +423,13 @@ def _select_round_winner_with_kl_and_composite(h2h_results, king_uid, incumbent_
             continue
         if not row.get("dethrone_eligible", True):
             continue
-        if not _paired_kl_win(row):
+        paired_ok, paired_detail = _paired_kl_gate(row, incumbent_row)
+        if not paired_ok:
+            row["selection_gate"] = paired_detail
             continue
         comp = row.get("composite") or {}
         allowed, detail = _composite_quality_allows_dethrone(comp, incumbent_comp)
+        detail["paired_kl"] = paired_detail
         row["selection_gate"] = detail
         if not allowed:
             row["composite_veto"] = detail

@@ -225,6 +225,61 @@ class TestSingleEvalCrownQuality(unittest.TestCase):
             _incumbent_can_hold([], 42, _record(0.35, weighted=0.35, worst=0.0))
         )
 
+    def test_live_selection_requires_three_percent_kl_margin(self):
+        from scripts.validator.service import _select_round_winner_with_kl_and_composite
+
+        king_comp = _record(0.45, weighted=0.45, worst=0.20)
+        challenger_comp = _record(0.45, weighted=0.50, worst=0.20)
+        h2h = [
+            {
+                "uid": 1,
+                "is_king": True,
+                "kl": 1.0,
+                "composite": king_comp,
+            },
+            {
+                "uid": 2,
+                "kl": 0.98,
+                "dethrone_eligible": True,
+                "t_test": {"p": 0.001, "mean_delta": 0.02, "lcb": 0.01},
+                "composite": challenger_comp,
+            },
+        ]
+
+        winner = _select_round_winner_with_kl_and_composite(h2h, 1)
+
+        self.assertIsNone(winner)
+        self.assertEqual(h2h[1]["selection_gate"]["reason"], "kl_margin_not_met")
+
+    def test_live_selection_allows_clear_kl_margin(self):
+        from scripts.validator.service import _select_round_winner_with_kl_and_composite
+
+        king_comp = _record(0.45, weighted=0.45, worst=0.20)
+        challenger_comp = _record(0.45, weighted=0.50, worst=0.20)
+        h2h = [
+            {
+                "uid": 1,
+                "is_king": True,
+                "kl": 1.0,
+                "composite": king_comp,
+            },
+            {
+                "uid": 2,
+                "kl": 0.96,
+                "dethrone_eligible": True,
+                "t_test": {"p": 0.001, "mean_delta": 0.04, "lcb": 0.03},
+                "composite": challenger_comp,
+            },
+        ]
+
+        winner = _select_round_winner_with_kl_and_composite(h2h, 1)
+
+        self.assertIs(winner, h2h[1])
+        self.assertEqual(
+            winner["selection_gate"]["paired_kl"]["reason"],
+            "paired_kl_margin_passed",
+        )
+
     def test_merge_dq_row_overwrites_stale_composite_record(self):
         from scripts.validator.single_eval import (
             merge_composite_scores,
