@@ -1,0 +1,116 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "quasar-incentive"
+version = "0.1.0"
+description = "Standalone validator/miner incentive mechanism for Quasar pretraining"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+dependencies = [
+    "boto3",
+    "numpy",
+    "python-dotenv>=1.0",
+    "pynacl",
+    "requests",
+]
+
+[project.optional-dependencies]
+subnet = [
+    "bittensor>=9.0.0",
+    "bittensor-cli>=9.0.0",
+    "bittensor-wallet @ git+https://github.com/latent-to/btwallet.git@feat/roman/add-ed25519-support",
+    "pynacl>=1.5",
+]
+data = [
+    "datasets>=3.3.0,<5.0.0",
+    "huggingface-hub",
+    "transformers>=4.53.0",
+]
+miner = [
+    "accelerate",
+    "bittensor>=9.0.0",
+    "bittensor-cli>=9.0.0",
+    "bittensor-wallet @ git+https://github.com/latent-to/btwallet.git@feat/roman/add-ed25519-support",
+    "datasets>=3.3.0,<5.0.0",
+    "einops",
+    "huggingface-hub",
+    "pynacl>=1.5",
+    "safetensors",
+    "sentencepiece",
+    "torch>=2.1",
+    "triton",
+    "transformers>=4.53.0",
+    "protobuf",
+    "wandb",
+]
+validator = [
+    "accelerate",
+    "bittensor>=9.0.0",
+    "bittensor-cli>=9.0.0",
+    "bittensor-wallet @ git+https://github.com/latent-to/btwallet.git@feat/roman/add-ed25519-support",
+    "datasets>=3.3.0,<5.0.0",
+    "einops",
+    "huggingface-hub",
+    "pynacl>=1.5",
+    "safetensors",
+    "sentencepiece",
+    "torch>=2.1",
+    "triton",
+    "transformers>=4.53.0",
+    "protobuf",
+]
+orchestrator = [
+    "accelerate",
+    "bittensor>=9.0.0",
+    "bittensor-cli>=9.0.0",
+    "bittensor-wallet @ git+https://github.com/latent-to/btwallet.git@feat/roman/add-ed25519-support",
+    "datasets>=3.3.0,<5.0.0",
+    "einops",
+    "huggingface-hub",
+    "pynacl>=1.5",
+    "safetensors",
+    "sentencepiece",
+    "torch>=2.1",
+    "triton",
+    "transformers>=4.53.0",
+    "protobuf",
+    "wandb",
+]
+prod = [
+    "accelerate",
+    "bittensor>=9.0.0",
+    "bittensor-cli>=9.0.0",
+    "bittensor-wallet @ git+https://github.com/latent-to/btwallet.git@feat/roman/add-ed25519-support",
+    "datasets>=3.3.0,<5.0.0",
+    "einops",
+    "huggingface-hub",
+    "pynacl>=1.5",
+    "safetensors",
+    "sentencepiece",
+    "torch>=2.1",
+    "triton",
+    "transformers>=4.53.0",
+    "protobuf",
+    "wandb",
+]
+telemetry = [
+    "wandb",
+]
+dev = [
+    "pytest",
+]
+
+[project.scripts]
+quasar-incentive = "incentive.cli:main"
+quasar-miner = "incentive.miner.neuron:main"
+quasar-validator = "incentive.validator.neuron:main"
+quasar-orchestrator = "incentive.orchestrator.neuron:main"
+quasar-incentive-train = "incentive.training.quasar_job:main"
+quasar-generate-ed25519-hotkey = "incentive.chain.ed25519_hotkey:main"
+quasar-dashboard-backend = "incentive.dashboard.backend:main"
+
+[tool.setuptools.packages.find]
+include = ["incentive*"]

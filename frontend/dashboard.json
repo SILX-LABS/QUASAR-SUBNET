@@ -1,0 +1,10 @@
+{
+  "schema_version": 1,
+  "generated_unix": 0,
+  "run_id": null,
+  "active_ranks": 0,
+  "miners": [],
+  "transfers": [],
+  "metrics": {},
+  "series": {}
+}

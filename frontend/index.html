@@ -1,0 +1,1233 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Quasar Mesh</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/d3@7/dist/d3.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/topojson-client@3/dist/topojson-client.min.js"></script>
+  <style>
+    @import url("https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@500;700&family=Inter:wght@900&display=swap");
+
+    :root {
+      --bg: #0e0f0d;
+      --panel: #151613;
+      --surface: #1d1d19;
+      --cyan: #e6decc;
+      --muted: #aaa18e;
+      --grid: #39382f;
+      --orange: #d99a2b;
+      --tooltip: #29271f;
+      --border: #5d5f4d;
+      --volt: #8fa16b;
+      --route: rgba(218, 214, 202, 0.58);
+      --node-stroke: #ffe0a3;
+      --miner: #ff9f2f;
+      --coordinator: #f4e7bf;
+    }
+
+    * { box-sizing: border-box; }
+    html, body { min-height: 100%; }
+
+    body {
+      margin: 0;
+      background:
+        linear-gradient(90deg, rgba(217, 154, 43, 0.035) 0 1px, transparent 1px 56px),
+        linear-gradient(180deg, #11120f, var(--bg) 320px);
+      color: var(--cyan);
+      font-family: "IBM Plex Mono", "Courier New", monospace;
+      overflow-x: hidden;
+    }
+
+    .page {
+      width: min(1920px, 100%);
+      margin: 0 auto;
+      padding: 8px 15px 18px;
+    }
+
+    .topbar {
+      min-height: 30px;
+      display: grid;
+      grid-template-columns: minmax(0, 1.35fr) auto minmax(0, 1fr);
+      align-items: center;
+      margin-bottom: 9px;
+      padding: 0 8px;
+      border: 1px solid rgba(93, 95, 77, 0.58);
+      background: rgba(21, 22, 19, 0.88);
+      color: var(--cyan);
+      font-size: 12px;
+      font-weight: 700;
+    }
+
+    .topbar-status {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      min-width: 0;
+      text-transform: uppercase;
+      white-space: nowrap;
+    }
+
+    .state-divider { color: var(--orange); }
+    .topbar-center {
+      color: var(--muted);
+      text-align: center;
+      text-transform: uppercase;
+      white-space: nowrap;
+    }
+
+    .topbar-right {
+      display: flex;
+      align-items: center;
+      justify-content: flex-end;
+      gap: 6px;
+    }
+
+    .mode-label {
+      margin-right: 4px;
+      color: var(--orange);
+      text-transform: uppercase;
+      white-space: nowrap;
+    }
+    .dash { letter-spacing: -0.08em; }
+
+    .social {
+      min-width: 20px;
+      height: 20px;
+      display: inline-grid;
+      place-items: center;
+      border: 1px solid var(--border);
+      border-radius: 2px;
+      background: #10110f;
+      color: inherit;
+      text-decoration: none;
+    }
+
+    .social.text-link {
+      padding: 0 7px;
+      font-size: 11px;
+      line-height: 20px;
+    }
+
+    .social svg {
+      width: 12px;
+      height: 12px;
+      fill: none;
+      stroke: currentColor;
+      stroke-width: 1.8;
+      stroke-linecap: round;
+      stroke-linejoin: round;
+    }
+
+    .panel {
+      position: relative;
+      border: 1px solid var(--border);
+      border-radius: 2px;
+      background:
+        linear-gradient(180deg, rgba(255, 255, 255, 0.018), transparent 120px),
+        var(--panel);
+    }
+
+    .panel-title {
+      position: absolute;
+      top: 0;
+      left: 0;
+      padding: 5px 10px 6px;
+      background: var(--surface);
+      border-right: 1px solid var(--border);
+      border-bottom: 1px solid var(--border);
+      color: var(--orange);
+      font-size: 12px;
+      font-weight: 700;
+      text-transform: uppercase;
+    }
+
+    .map-panel {
+      height: 540px;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+      padding: 38px 16px 16px;
+    }
+
+    .readiness-strip {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 10px;
+    }
+
+    .readiness-card {
+      min-height: 54px;
+      padding: 9px 10px;
+      border: 1px solid rgba(93, 95, 77, 0.72);
+      background: #10110f;
+    }
+
+    .readiness-card span {
+      display: block;
+      color: var(--muted);
+      font-size: 10px;
+      font-weight: 700;
+      text-transform: uppercase;
+    }
+
+    .readiness-card strong {
+      display: block;
+      margin-top: 5px;
+      color: var(--orange);
+      font-size: 13px;
+      font-weight: 700;
+      text-transform: uppercase;
+      white-space: nowrap;
+    }
+
+    #map {
+      position: relative;
+      width: 100%;
+      flex: 1;
+      min-height: 0;
+      height: auto;
+      border: 1px solid rgba(93, 95, 77, 0.9);
+      border-radius: 2px;
+      background:
+        linear-gradient(rgba(170, 161, 142, 0.06) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(170, 161, 142, 0.06) 1px, transparent 1px),
+        #10110f;
+      background-size: 100% 96px, 112px 100%, auto;
+      overflow: hidden;
+      cursor: grab;
+      touch-action: none;
+    }
+
+    #map.is-dragging { cursor: grabbing; }
+
+    #map svg {
+      width: 100%;
+      height: 100%;
+      display: block;
+    }
+
+    .land-outline {
+      fill: none;
+      stroke: var(--volt);
+      stroke-width: 1.8;
+      vector-effect: non-scaling-stroke;
+    }
+
+    .country-borders {
+      fill: none;
+      stroke: var(--volt);
+      stroke-width: 1.05;
+      opacity: 0.76;
+      vector-effect: non-scaling-stroke;
+    }
+
+    .mesh-route {
+      fill: none;
+      stroke: rgba(226, 222, 208, 0.48);
+      stroke-width: 1.05;
+      stroke-linecap: round;
+      stroke-linejoin: round;
+      vector-effect: non-scaling-stroke;
+      opacity: 0.72;
+    }
+
+    .mesh-route.assignment { stroke: rgba(244, 231, 191, 0.36); }
+    .mesh-route.fragment_upload { stroke: rgba(255, 159, 47, 0.72); }
+    .mesh-route.checkpoint_download { stroke: rgba(244, 231, 191, 0.56); }
+    .mesh-route.recovery { stroke: rgba(255, 159, 47, 0.46); stroke-dasharray: 9 7; }
+
+    .mesh-route.is-active {
+      opacity: 0.78;
+    }
+
+    .mesh-route.is-inactive {
+      opacity: 0.24;
+    }
+
+    .mesh-route.is-muted {
+      opacity: 0.12;
+    }
+
+    .mesh-route.is-related {
+      opacity: 0.95;
+    }
+
+    .mesh-route.is-transferring {
+      stroke-dasharray: 14 10;
+      animation: route-current var(--route-speed, 7s) linear infinite;
+    }
+
+    .mesh-route.flow-out {
+      marker-end: url("#route-arrow-out");
+    }
+
+    .mesh-route.flow-in {
+      marker-end: url("#route-arrow-in");
+    }
+
+    .mesh-route.is-related.is-transferring {
+      stroke-dasharray: 18 9;
+    }
+
+    @keyframes route-current {
+      to { stroke-dashoffset: -96; }
+    }
+
+    .mesh-node-hit {
+      fill: transparent;
+      cursor: pointer;
+    }
+
+    .mesh-node {
+      stroke: #10110f;
+      stroke-width: 1.6;
+      vector-effect: non-scaling-stroke;
+    }
+
+    .mesh-node.miner { fill: var(--miner); }
+    .mesh-node.coordinator { fill: var(--coordinator); }
+    .mesh-node.unknown { opacity: 0.55; }
+
+    .mesh-node.selected {
+      stroke: #fff5cf;
+      stroke-width: 2.4;
+    }
+
+    .map-graticule {
+      fill: none;
+      stroke: rgba(170, 161, 142, 0.18);
+      stroke-width: 0.8;
+      vector-effect: non-scaling-stroke;
+    }
+
+    .map-sphere {
+      fill: rgba(16, 17, 15, 0.88);
+      stroke: rgba(93, 95, 77, 0.8);
+      stroke-width: 1;
+      vector-effect: non-scaling-stroke;
+    }
+
+    .map-tooltip {
+      display: none;
+    }
+
+    .map-controls {
+      position: absolute;
+      top: 8px;
+      right: 8px;
+      z-index: 5;
+      display: grid;
+      grid-template-columns: repeat(3, 28px);
+      gap: 6px;
+      pointer-events: auto;
+    }
+
+    .map-control {
+      width: 28px;
+      height: 26px;
+      border: 1px solid rgba(93, 95, 77, 0.88);
+      border-radius: 2px;
+      background: rgba(16, 17, 15, 0.9);
+      color: var(--cyan);
+      font: 700 14px/1 "IBM Plex Mono", monospace;
+      cursor: pointer;
+    }
+
+    .map-control:hover, .map-control:focus-visible {
+      border-color: var(--orange);
+      color: var(--orange);
+      outline: none;
+    }
+
+    .node-inspector {
+      position: absolute;
+      left: 10px;
+      bottom: 10px;
+      z-index: 5;
+      width: min(310px, calc(100% - 20px));
+      border: 1px solid rgba(93, 95, 77, 0.9);
+      background: rgba(16, 17, 15, 0.94);
+      box-shadow: 0 10px 28px rgba(0, 0, 0, 0.32);
+      padding: 9px 10px 10px;
+      pointer-events: auto;
+    }
+
+    .node-inspector[data-open="false"] { display: none; }
+
+    .node-inspector-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      border-bottom: 1px solid rgba(170, 161, 142, 0.24);
+      padding-bottom: 7px;
+      margin-bottom: 7px;
+    }
+
+    .node-inspector-title {
+      color: var(--orange);
+      font-size: 12px;
+      font-weight: 700;
+      text-transform: uppercase;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .node-inspector-close {
+      width: 22px;
+      height: 20px;
+      border: 1px solid rgba(93, 95, 77, 0.88);
+      border-radius: 2px;
+      background: #10110f;
+      color: var(--muted);
+      cursor: pointer;
+      line-height: 16px;
+    }
+
+    .node-inspector-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 7px 12px;
+    }
+
+    .node-inspector-grid span {
+      display: block;
+      color: var(--muted);
+      font-size: 9px;
+      text-transform: uppercase;
+    }
+
+    .node-inspector-grid strong {
+      display: block;
+      margin-top: 3px;
+      color: var(--cyan);
+      font-size: 11px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .info-panel {
+      min-height: 288px;
+      margin-top: 14px;
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) 440px;
+      gap: 18px;
+      padding: 44px 18px 22px;
+    }
+
+    .brand-title span {
+      display: inline-block;
+      font-family: Inter, Arial, sans-serif;
+      font-size: clamp(42px, 4.8vw, 68px);
+      font-style: normal;
+      font-weight: 900;
+      line-height: 0.95;
+      letter-spacing: 0;
+      color: var(--cyan);
+      max-width: 720px;
+      text-transform: uppercase;
+    }
+
+    .kicker, .about h2, .metric span, .chart-head span {
+      margin: 0;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 700;
+      text-transform: uppercase;
+    }
+
+    .kicker { margin-top: 5px; }
+    .about { margin-top: 52px; max-width: 1080px; }
+
+    .about p {
+      margin: 8px 0 0;
+      color: var(--cyan);
+      font-size: 13px;
+      font-weight: 700;
+      line-height: 1.2;
+    }
+
+    .metrics {
+      display: grid;
+      align-content: center;
+      gap: 10px;
+      padding-top: 18px;
+    }
+
+    .metric {
+      min-height: 58px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 14px;
+      border-bottom: 1px solid rgba(170, 161, 142, 0.28);
+      font-weight: 700;
+    }
+
+    .metric strong {
+      color: var(--orange);
+      font-size: 16px;
+      white-space: nowrap;
+    }
+
+    .charts-panel {
+      margin-top: 14px;
+      padding: 38px 14px 15px;
+    }
+
+    .chart-grid {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 18px;
+    }
+
+    .bottom-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 16px;
+      margin-top: 14px;
+    }
+
+    .lower-panel {
+      min-height: 140px;
+      padding: 38px 14px 12px;
+    }
+
+    .lower-grid {
+      display: grid;
+      grid-template-columns: 0.92fr 1fr 1fr;
+      gap: 18px;
+      align-items: start;
+    }
+
+    .two-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 18px;
+    }
+
+    .chart-card {
+      min-width: 0;
+      height: 112px;
+      overflow: hidden;
+    }
+
+    .chart-head {
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: 10px;
+      color: var(--muted);
+    }
+
+    .chart-head strong {
+      color: var(--orange);
+      font-size: 12px;
+      font-weight: 700;
+    }
+
+    .chart-head.center { justify-content: center; }
+
+    .mini-plot {
+      width: 100%;
+      height: 92px !important;
+      max-height: 92px;
+      display: block;
+      margin-top: 3px;
+    }
+
+    .eta-box {
+      height: 48px;
+      margin: 10px 34px 0;
+      border: 1px solid var(--grid);
+      background: #10110f;
+    }
+
+    @media (max-width: 1180px) {
+      .info-panel, .bottom-grid { grid-template-columns: 1fr; }
+      .readiness-strip { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .chart-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    }
+
+    @media (max-width: 740px) {
+      .page { padding: 8px; }
+      .topbar { height: auto; grid-template-columns: 1fr; gap: 6px; }
+      .topbar-status { flex-wrap: wrap; white-space: normal; }
+      .topbar-center { text-align: left; }
+      .topbar-right { justify-content: flex-start; flex-wrap: wrap; }
+      .map-panel { height: 620px; }
+      .readiness-strip { grid-template-columns: 1fr; }
+      .brand-title span { font-size: 42px; white-space: normal; }
+      .chart-grid, .lower-grid, .two-grid { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <main class="page">
+    <header class="topbar">
+      <div class="topbar-status">
+        <span>Quasar Mesh</span>
+        <span class="state-divider">//</span>
+        <span id="top-run-state">Pre-Launch</span>
+        <span class="state-divider">//</span>
+        <span id="top-active-ranks">No Active Ranks</span>
+      </div>
+      <div class="topbar-center">Readiness Console</div>
+      <div class="topbar-right">
+        <span class="mode-label">configure mode</span>
+        <a class="social text-link" href="https://silxinc.com/" target="_blank" rel="noreferrer" aria-label="SilX website">WEB</a>
+        <a class="social" href="https://x.com/QuasarModels" target="_blank" rel="noreferrer" aria-label="QuasarModels on X"><svg viewBox="0 0 24 24"><path d="M4 4 20 20M20 4 4 20"></path></svg></a>
+        <a class="social text-link" href="https://huggingface.co/silx-ai/Quasar-Preview" target="_blank" rel="noreferrer" aria-label="Quasar Preview on Hugging Face">HF</a>
+      </div>
+    </header>
+
+    <section class="panel map-panel">
+      <div class="panel-title">Global Mesh Readiness</div>
+      <div class="readiness-strip" aria-label="Quasar Mesh pre-launch readiness status">
+        <div class="readiness-card"><span>Coordinator</span><strong id="coordinator-status">Offline</strong></div>
+        <div class="readiness-card"><span>Active Ranks</span><strong id="active-ranks">0</strong></div>
+        <div class="readiness-card"><span>Model</span><strong id="model-name">Quasar Preview</strong></div>
+        <div class="readiness-card"><span>Admission Queue</span><strong id="admission-queue">Closed</strong></div>
+      </div>
+      <div id="map" aria-label="Live Quasar mesh map">
+        <div class="map-controls" aria-label="Map controls">
+          <button class="map-control" type="button" data-map-action="zoom-in" aria-label="Zoom in">+</button>
+          <button class="map-control" type="button" data-map-action="zoom-out" aria-label="Zoom out">−</button>
+          <button class="map-control" type="button" data-map-action="reset" aria-label="Reset map">⌂</button>
+        </div>
+        <aside id="node-inspector" class="node-inspector" data-open="false" aria-live="polite">
+          <div class="node-inspector-head">
+            <div id="node-inspector-title" class="node-inspector-title">Node</div>
+            <button id="node-inspector-close" class="node-inspector-close" type="button" aria-label="Close node details">×</button>
+          </div>
+          <div class="node-inspector-grid">
+            <div><span>Role</span><strong id="node-role">-</strong></div>
+            <div><span>Status</span><strong id="node-status">-</strong></div>
+            <div><span>GPU</span><strong id="node-gpu">-</strong></div>
+            <div><span>Rate</span><strong id="node-rate">-</strong></div>
+            <div><span>Upload</span><strong id="node-upload">-</strong></div>
+            <div><span>Region</span><strong id="node-region">-</strong></div>
+          </div>
+        </aside>
+      </div>
+      <div class="map-tooltip" aria-hidden="true"></div>
+    </section>
+
+    <section class="panel info-panel">
+      <div>
+        <div class="brand-title" aria-label="Quasar Mesh"><span>Quasar Mesh</span></div>
+        <p class="kicker">ELASTIC FLOPS TRAINING</p>
+        <article class="about">
+          <h2>ABOUT QUASAR MESH:</h2>
+          <p>
+            The cluster will treat registered miners as elastic compute ranks. A coordinator keeps the base model,
+            optimizer state, and schedule; miners will receive bounded shards of work, return verified fragments,
+            and add usable FLOPs to the run. Slow, divergent, or unverifiable ranks are isolated before they can
+            perturb the global update.
+          </p>
+        </article>
+      </div>
+      <div class="metrics">
+        <div class="metric"><span id="metric-step">0</span><strong>STEP</strong></div>
+        <div class="metric"><span id="metric-complete">0.0%</span><strong>COMPLETE</strong></div>
+        <div class="metric"><span id="metric-standby">0 ranks</span><strong>STANDBY</strong></div>
+      </div>
+    </section>
+
+    <section class="panel charts-panel">
+      <div class="panel-title">CHECKPOINT EVALUATIONS</div>
+      <div class="chart-grid">
+        <article class="chart-card"><div class="chart-head"><span>ARC CHALLENGE:</span><strong>0.00%</strong></div><canvas class="mini-plot" data-chart="arcChallenge"></canvas></article>
+        <article class="chart-card"><div class="chart-head"><span>ARC EASY:</span><strong>0.00%</strong></div><canvas class="mini-plot" data-chart="arcEasy"></canvas></article>
+        <article class="chart-card"><div class="chart-head"><span>HELLASWAG:</span><strong>0.00%</strong></div><canvas class="mini-plot" data-chart="hellaswag"></canvas></article>
+        <article class="chart-card"><div class="chart-head"><span>MMLU:</span><strong>0.00%</strong></div><canvas class="mini-plot" data-chart="mmlu"></canvas></article>
+      </div>
+    </section>
+
+    <div class="bottom-grid">
+      <section class="panel lower-panel">
+        <div class="panel-title">MESH THROUGHPUT</div>
+        <div class="lower-grid">
+          <article><div class="chart-head center"><span>ESTIMATED TIME REMAINING</span></div><div class="eta-box"></div></article>
+          <article class="chart-card"><div class="chart-head"><span>TRAINING RATE:</span><strong>0 tok/s</strong></div><canvas class="mini-plot" data-chart="trainingRate"></canvas></article>
+          <article class="chart-card"><div class="chart-head"><span>BANDWIDTH:</span><strong>0.00 MB/s</strong></div><canvas class="mini-plot" data-chart="bandwidth"></canvas></article>
+        </div>
+      </section>
+      <section class="panel lower-panel">
+        <div class="panel-title" style="text-transform:none">Training State</div>
+        <div class="two-grid">
+          <article class="chart-card"><div class="chart-head"><span>CONFIDENCE:</span><strong>0.00%</strong></div><canvas class="mini-plot" data-chart="confidence"></canvas></article>
+          <article class="chart-card"><div class="chart-head"><span>LOSS:</span><strong>0.00</strong></div><canvas class="mini-plot" data-chart="loss"></canvas></article>
+        </div>
+      </section>
+    </div>
+  </main>
+
+  <script>
+    (function () {
+      const zeroPercent = { min: 0, max: 100, key: "accepted_updates", data: [0, 0], noise: 0 };
+      const zeroRate = { min: 0, max: 1, key: "training_rate_tps", data: [0, 0], noise: 0 };
+      const chartConfigs = {
+        arcChallenge: { ...zeroPercent, key: "accepted_updates" },
+        arcEasy: { ...zeroPercent, key: "fragments_synced" },
+        hellaswag: { ...zeroPercent, key: "receipt_count" },
+        mmlu: { ...zeroPercent, key: "active_learners" },
+        trainingRate: { min: 0, max: 1, key: "training_rate_tps", data: [0, 0], noise: 0 },
+        bandwidth: { min: 0, max: 1, key: "bandwidth_mib_s", data: [0, 0], noise: 0 },
+        confidence: { ...zeroPercent, key: "confidence_pct" },
+        loss: { min: 0, max: 1, key: "loss", data: [0, 0], noise: 0 }
+      };
+      const charts = {};
+      const mapState = {
+        world: null,
+        land: null,
+        borders: null,
+        graticule: d3.geoGraticule10(),
+        payload: null,
+        transform: d3.zoomIdentity,
+        zoomBehavior: null,
+        svg: null,
+        selectedNodeId: null
+      };
+
+      function seeded(index, seed) {
+        return Math.sin(index * 12.9898 + seed * 78.233) * 43758.5453 % 1;
+      }
+
+      function dense(config, count, seed) {
+        const output = [];
+        for (let index = 0; index < count; index += 1) {
+          const t = index / (count - 1);
+          const pos = t * (config.data.length - 1);
+          const left = Math.min(config.data.length - 2, Math.floor(pos));
+          const local = pos - left;
+          const base = config.data[left] + (config.data[left + 1] - config.data[left]) * local;
+          const rough = (seeded(index, seed) - 0.5) * (config.max - config.min) * config.noise;
+          output.push(Math.max(config.min, Math.min(config.max, base + rough)));
+        }
+        return output;
+      }
+
+      function drawChart(canvas, config, seed) {
+        canvas.width = Math.max(260, Math.round(canvas.getBoundingClientRect().width || 320));
+        canvas.height = 92;
+        const values = dense(config, 360, seed);
+        const chart = new Chart(canvas, {
+          type: "line",
+          data: { labels: values.map((_, index) => index), datasets: [{ data: values, borderColor: "#d8d2c0", borderWidth: 2, pointRadius: 0, tension: 0, fill: false }] },
+          options: {
+            responsive: false,
+            maintainAspectRatio: false,
+            animation: false,
+            devicePixelRatio: 1,
+            plugins: { legend: { display: false }, tooltip: { enabled: false } },
+            scales: {
+              x: { grid: { color: "#39382f", drawTicks: false }, border: { display: false }, ticks: { color: "#b5ad9c", font: { family: "IBM Plex Mono", size: 10, weight: "700" }, maxTicksLimit: 6 } },
+              y: { min: config.min, max: config.max, grid: { color: "#39382f", drawTicks: false }, border: { display: false }, ticks: { color: "#b5ad9c", font: { family: "IBM Plex Mono", size: 10, weight: "700" }, maxTicksLimit: 6 } }
+            }
+          }
+        });
+        charts[canvas.dataset.chart] = chart;
+      }
+
+      function compactNumber(value, suffix) {
+        const number = Number(value || 0);
+        if (!Number.isFinite(number)) return `0${suffix || ""}`;
+        if (Math.abs(number) >= 1e9) return `${(number / 1e9).toFixed(2)}B${suffix || ""}`;
+        if (Math.abs(number) >= 1e6) return `${(number / 1e6).toFixed(2)}M${suffix || ""}`;
+        if (Math.abs(number) >= 1e3) return `${(number / 1e3).toFixed(1)}K${suffix || ""}`;
+        return `${Math.round(number)}${suffix || ""}`;
+      }
+
+      function compactBytes(value) {
+        const bytes = Number(value || 0);
+        if (!Number.isFinite(bytes) || bytes <= 0) return "0 B";
+        const units = ["B", "KB", "MB", "GB", "TB"];
+        let size = bytes;
+        let unit = 0;
+        while (size >= 1024 && unit < units.length - 1) {
+          size /= 1024;
+          unit += 1;
+        }
+        return `${size >= 10 ? size.toFixed(1) : size.toFixed(2)} ${units[unit]}`;
+      }
+
+      function hashString(value) {
+        let hash = 2166136261;
+        const text = String(value || "");
+        for (let index = 0; index < text.length; index += 1) {
+          hash ^= text.charCodeAt(index);
+          hash = Math.imul(hash, 16777619);
+        }
+        return Math.abs(hash >>> 0);
+      }
+
+      function nodeTitle(node) {
+        return node.worker_id || node.hotkey_short || node.id || node.role;
+      }
+
+      function nodeRegion(node) {
+        return node.location?.label || node.location?.region || node.location?.city || node.location?.country || "unknown";
+      }
+
+      function routeActivity(route) {
+        return Math.max(1, Number(route.mib_s || 0), Number(route.tokens_per_second || 0) / 100, Number(route.bytes || 0) / 1048576);
+      }
+
+      function routeFlow(route) {
+        if (route.kind === "fragment_upload" || route.kind === "learner_metadata" || route.kind === "receipt_upload") return "in";
+        return "out";
+      }
+
+      function setText(id, value) {
+        const element = document.getElementById(id);
+        if (element) element.textContent = value;
+      }
+
+      function metricValue(payload, key, fallback) {
+        const value = payload && payload.metrics ? payload.metrics[key] : fallback;
+        const number = Number(value);
+        return Number.isFinite(number) ? number : Number(fallback || 0);
+      }
+
+      function updateReadout(payload) {
+        const active = Number(payload.active_ranks || payload.metrics?.active_learners || 0);
+        const runState = payload.run_id ? "Live Run" : "Pre-Launch";
+        setText("top-run-state", runState);
+        setText("top-active-ranks", active > 0 ? `${active} Active Ranks` : "No Active Ranks");
+        setText("coordinator-status", payload.coordinator?.status || (payload.run_id ? "Online" : "Offline"));
+        setText("active-ranks", String(active));
+        setText("model-name", payload.model || "Quasar Preview");
+        setText("admission-queue", payload.admission_queue || (payload.run_id ? "Open" : "Closed"));
+        setText("metric-step", compactNumber(metricValue(payload, "fragments_synced", 0)));
+        setText("metric-complete", `${Math.min(100, metricValue(payload, "confidence_pct", 0)).toFixed(1)}%`);
+        setText("metric-standby", `${metricValue(payload, "standby_learners", 0)} ranks`);
+        setChartHead("trainingRate", compactNumber(metricValue(payload, "training_rate_tps", 0), " tok/s"));
+        setChartHead("bandwidth", `${metricValue(payload, "bandwidth_mib_s", 0).toFixed(2)} MB/s`);
+        setChartHead("confidence", `${metricValue(payload, "confidence_pct", 0).toFixed(2)}%`);
+        setChartHead("loss", metricValue(payload, "loss", 0).toFixed(4));
+        setChartHead("arcChallenge", String(metricValue(payload, "accepted_updates", 0)));
+        setChartHead("arcEasy", String(metricValue(payload, "fragments_synced", 0)));
+        setChartHead("hellaswag", String(metricValue(payload, "receipt_count", 0)));
+        setChartHead("mmlu", String(metricValue(payload, "active_learners", 0)));
+      }
+
+      function setChartHead(name, value) {
+        const canvas = document.querySelector(`[data-chart="${name}"]`);
+        const strong = canvas && canvas.closest(".chart-card")?.querySelector(".chart-head strong");
+        if (strong) strong.textContent = value;
+      }
+
+      function seriesFor(payload, config) {
+        const raw = payload.series && Array.isArray(payload.series[config.key]) ? payload.series[config.key] : [];
+        const values = raw.length ? raw.map(Number).filter(Number.isFinite) : [metricValue(payload, config.key, 0)];
+        while (values.length < 2) values.unshift(values[0] || 0);
+        const maxObserved = Math.max(config.max, ...values) || config.max;
+        return { values, max: maxObserved };
+      }
+
+      function updateCharts(payload) {
+        Object.entries(charts).forEach(([name, chart]) => {
+          const config = chartConfigs[name];
+          const series = seriesFor(payload, config);
+          chart.options.scales.y.min = config.min;
+          chart.options.scales.y.max = series.max;
+          chart.data.labels = series.values.map((_, index) => index);
+          chart.data.datasets[0].data = series.values;
+          chart.update("none");
+        });
+      }
+
+      function locationPoint(projection, location) {
+        if (!location) return null;
+        const lat = Number(location.lat);
+        const lon = Number(location.lon);
+        if (!Number.isFinite(lat) || !Number.isFinite(lon)) return null;
+        return projection([lon, lat]);
+      }
+
+      function routePath(from, to, route, index) {
+        const dx = to[0] - from[0];
+        const dy = to[1] - from[1];
+        const distance = Math.sqrt(dx * dx + dy * dy) || 1;
+        const sign = routeFlow(route) === "in" ? -1 : 1;
+        const spread = 0.12 + (hashString(route.kind || route.id) % 5) * 0.025;
+        const closeBoost = distance < 42 ? 1.9 : 1;
+        const bend = sign * Math.min(104, Math.max(18, distance * spread * closeBoost));
+        const mx = (from[0] + to[0]) / 2 - (dy / distance) * bend;
+        const my = (from[1] + to[1]) / 2 + (dx / distance) * bend;
+        return `M${from[0].toFixed(2)},${from[1].toFixed(2)} Q${mx.toFixed(2)},${my.toFixed(2)} ${to[0].toFixed(2)},${to[1].toFixed(2)}`;
+      }
+
+      function layoutNodePoints(nodes) {
+        const buckets = new Map();
+        nodes.forEach((node) => {
+          const key = `${Math.round(node.point[0] / 10)}:${Math.round(node.point[1] / 10)}`;
+          if (!buckets.has(key)) buckets.set(key, []);
+          buckets.get(key).push(node);
+        });
+        buckets.forEach((bucket) => {
+          if (bucket.length < 2) return;
+          bucket.sort((left, right) => {
+            if (left.role === "coordinator") return -1;
+            if (right.role === "coordinator") return 1;
+            return String(nodeTitle(left)).localeCompare(String(nodeTitle(right)));
+          });
+          const anchor = bucket.find((node) => node.role === "coordinator") || bucket[0];
+          const [cx, cy] = anchor.point;
+          const miners = bucket.filter((node) => node !== anchor);
+          anchor.point = [cx, cy];
+          miners.forEach((node, index) => {
+            const radius = 32 + Math.floor(index / 6) * 14;
+            const angle = (-70 + index * 42) * (Math.PI / 180);
+            node.point = [
+              cx + Math.cos(angle) * radius,
+              cy + Math.sin(angle) * radius
+            ];
+            node.display_offset = true;
+          });
+        });
+        return nodes;
+      }
+
+      function nodeId(prefix, value, index) {
+        return `${prefix}-${String(value || index).replace(/[^a-zA-Z0-9_-]/g, "_")}`;
+      }
+
+      function nodesFromPayload(payload) {
+        const coordinator = payload.coordinator || {};
+        const nodes = [];
+        if (coordinator.location) {
+          nodes.push({ id: "orchestrator", role: "coordinator", location: coordinator.location, status: coordinator.status || "online" });
+        }
+        (payload.miners || []).forEach((miner, index) => {
+          if (miner.location) nodes.push({ ...miner, id: nodeId("miner", miner.worker_id || miner.hotkey_short, index), role: "miner" });
+        });
+        return nodes;
+      }
+
+      function routesFromPayload(payload, nodes) {
+        const routes = [];
+        const coordinator = nodes.find((node) => node.role === "coordinator");
+        const miners = nodes.filter((node) => node.role === "miner");
+        const seen = new Set();
+
+        function addRoute(route) {
+          if (!route.from || !route.to) return;
+          const key = [
+            route.kind,
+            route.from_node_id || Number(route.from.lat).toFixed(3),
+            route.from_node_id ? "" : Number(route.from.lon).toFixed(3),
+            route.to_node_id || Number(route.to.lat).toFixed(3),
+            route.to_node_id ? "" : Number(route.to.lon).toFixed(3)
+          ].join("|");
+          if (seen.has(key)) return;
+          seen.add(key);
+          routes.push(route);
+        }
+
+        function nodeForLocation(location) {
+          if (!location) return null;
+          const lat = Number(location.lat).toFixed(3);
+          const lon = Number(location.lon).toFixed(3);
+          return nodes.find((node) => Number(node.location?.lat).toFixed(3) === lat && Number(node.location?.lon).toFixed(3) === lon);
+        }
+
+        (payload.transfers || []).forEach((transfer, index) => {
+          const from = transfer.from?.location;
+          const to = transfer.to?.location;
+          if (from && to) {
+            const fromNode = nodeForLocation(from);
+            const toNode = nodeForLocation(to);
+            const allowedRoles = new Set(["coordinator", "miner"]);
+            const allowedKinds = new Set(["assignment", "checkpoint_download", "fragment_upload", "recovery"]);
+            if (!fromNode || !toNode || !allowedRoles.has(fromNode.role) || !allowedRoles.has(toNode.role)) return;
+            if (!allowedKinds.has(transfer.kind || "transfer")) return;
+            if (transfer.kind === "assignment" && (fromNode.role !== "coordinator" || toNode.role !== "miner")) return;
+            if (transfer.kind === "checkpoint_download" && (fromNode.role !== "coordinator" || toNode.role !== "miner")) return;
+            if (transfer.kind === "fragment_upload" && (fromNode.role !== "miner" || toNode.role !== "coordinator")) return;
+            addRoute({
+              id: `transfer-${index}`,
+              kind: transfer.kind || "transfer",
+              from_node_id: fromNode?.id,
+              to_node_id: toNode?.id,
+              from,
+              to,
+              active: true,
+              mib_s: transfer.mib_s,
+              bytes: transfer.bytes
+            });
+          }
+        });
+        if (coordinator) {
+          miners.forEach((node, index) => {
+            const status = String(node.status || "").toLowerCase();
+            const active = !["idle", "queue_idle", "standby", "offline"].includes(status);
+            if (active) {
+              addRoute({
+                id: `assignment-${index}`,
+                kind: "assignment",
+                from_node_id: coordinator.id,
+                to_node_id: node.id,
+                from: coordinator.location,
+                to: node.location,
+                active
+              });
+            }
+            if (active || Number(node.download_mib_s || 0) > 0) {
+              addRoute({
+                id: `checkpoint-${index}`,
+                kind: "checkpoint_download",
+                from_node_id: coordinator.id,
+                to_node_id: node.id,
+                from: coordinator.location,
+                to: node.location,
+                active,
+                mib_s: node.download_mib_s,
+                tokens_per_second: node.tokens_per_second
+              });
+            }
+            if (active || Number(node.upload_mib_s || 0) > 0 || Number(node.uploaded_bytes || 0) > 0) {
+              addRoute({
+                id: `fragment-${index}`,
+                kind: "fragment_upload",
+                from_node_id: node.id,
+                to_node_id: coordinator.id,
+                from: node.location,
+                to: coordinator.location,
+                active,
+                mib_s: node.upload_mib_s,
+                bytes: node.uploaded_bytes,
+                tokens_per_second: node.tokens_per_second
+              });
+            }
+          });
+        }
+        return routes;
+      }
+
+      function renderMap() {
+        const container = document.getElementById("map");
+        const payload = mapState.payload || { miners: [], transfers: [], metrics: {}, series: {}, coordinator: {} };
+        const width = container.clientWidth || 900;
+        const height = container.clientHeight || 420;
+        const projection = d3.geoNaturalEarth1()
+            .fitExtent([[18, 14], [width - 18, height - 14]], { type: "Sphere" })
+            .clipExtent([[0, 0], [width, height]]);
+        const path = d3.geoPath(projection);
+        d3.select(container).select("svg.mesh-map").remove();
+        const svg = d3.select(container)
+          .insert("svg", ":first-child")
+          .attr("class", "mesh-map")
+          .attr("viewBox", `0 0 ${width} ${height}`)
+          .attr("aria-hidden", "true");
+        const viewport = svg.append("g").attr("class", "mesh-viewport");
+
+        viewport.append("path").datum({ type: "Sphere" }).attr("class", "map-sphere").attr("d", path);
+        viewport.append("path").datum(mapState.graticule).attr("class", "map-graticule").attr("d", path);
+        if (mapState.land) viewport.append("path").datum(mapState.land).attr("class", "land-outline").attr("d", path);
+        if (mapState.borders) viewport.append("path").datum(mapState.borders).attr("class", "country-borders").attr("d", path);
+
+        const nodes = layoutNodePoints(nodesFromPayload(payload)
+          .map((node) => ({ ...node, point: locationPoint(projection, node.location) }))
+          .filter((node) => node.point));
+        const nodesById = new Map(nodes.map((node) => [node.id, node]));
+        const routes = routesFromPayload(payload, nodes)
+          .map((route) => ({
+            ...route,
+            fromPoint: nodesById.get(route.from_node_id)?.point || locationPoint(projection, route.from),
+            toPoint: nodesById.get(route.to_node_id)?.point || locationPoint(projection, route.to)
+          }))
+          .filter((route) => route.fromPoint && route.toPoint);
+        const defs = viewport.append("defs");
+        defs.append("marker")
+          .attr("id", "route-arrow-out")
+          .attr("viewBox", "0 0 10 10")
+          .attr("refX", 9)
+          .attr("refY", 5)
+          .attr("markerWidth", 5)
+          .attr("markerHeight", 5)
+          .attr("orient", "auto-start-reverse")
+          .append("path")
+          .attr("d", "M 0 0 L 10 5 L 0 10 z")
+          .attr("fill", "rgba(244, 231, 191, 0.82)");
+        defs.append("marker")
+          .attr("id", "route-arrow-in")
+          .attr("viewBox", "0 0 10 10")
+          .attr("refX", 9)
+          .attr("refY", 5)
+          .attr("markerWidth", 5)
+          .attr("markerHeight", 5)
+          .attr("orient", "auto-start-reverse")
+          .append("path")
+          .attr("d", "M 0 0 L 10 5 L 0 10 z")
+          .attr("fill", "rgba(255, 159, 47, 0.88)");
+
+        const routeLayer = viewport.append("g").attr("class", "route-layer");
+        routes.forEach((route, index) => {
+          const id = `mesh-route-${index}`;
+          const activity = routeActivity(route);
+          const widthBoost = Math.min(1.9, Math.log1p(activity) * 0.22);
+          const baseWidth = 0.72 + widthBoost;
+          const d = routePath(route.fromPoint, route.toPoint, route, index);
+          const selected = mapState.selectedNodeId;
+          const related = selected && (route.from_node_id === selected || route.to_node_id === selected);
+          const dataRoute = ["checkpoint_download", "fragment_upload", "recovery"].includes(route.kind);
+          const transferring = route.active && dataRoute && (
+            Number(route.mib_s || 0) > 0 ||
+            Number(route.bytes || 0) > 0
+          );
+          const routeClass = [
+            "mesh-route",
+            route.kind,
+            `flow-${routeFlow(route)}`,
+            route.active ? "is-active" : "is-inactive",
+            transferring ? "is-transferring" : "",
+            selected && !related ? "is-muted" : "",
+            related ? "is-related" : ""
+          ].filter(Boolean).join(" ");
+          routeLayer.append("path")
+            .attr("id", id)
+            .attr("class", routeClass)
+            .attr("stroke-width", related ? baseWidth + 0.65 : baseWidth)
+            .style("--route-speed", `${Math.max(2.8, 8.2 - Math.min(4.5, Math.log1p(activity) * 0.7)).toFixed(2)}s`)
+            .attr("d", d);
+        });
+
+        const nodeLayer = viewport.append("g").attr("class", "node-layer");
+        nodes.forEach((node) => {
+          const radius = node.role === "coordinator" ? 3.4 : 2.8;
+          const group = nodeLayer.append("g")
+            .attr("class", `mesh-node-group ${mapState.selectedNodeId === node.id ? "selected" : ""}`)
+            .attr("transform", `translate(${node.point[0]},${node.point[1]})`)
+            .on("click", (event) => {
+              event.stopPropagation();
+              mapState.selectedNodeId = node.id;
+              updateNodeInspector(node);
+              renderMap();
+            });
+          group.append("circle")
+            .attr("class", `mesh-node ${node.role} ${node.location?.unknown ? "unknown" : ""} ${mapState.selectedNodeId === node.id ? "selected" : ""}`)
+            .attr("r", radius);
+          group.append("circle")
+            .attr("class", "mesh-node-hit")
+            .attr("r", 12);
+        });
+        const selected = nodes.find((node) => node.id === mapState.selectedNodeId);
+        if (selected) updateNodeInspector(selected);
+
+        const zoomed = (event) => {
+          mapState.transform = event.transform;
+          viewport.attr("transform", event.transform);
+        };
+        const zoom = d3.zoom()
+          .scaleExtent([0.8, 7])
+          .filter((event) => !event.target.closest(".map-controls") && !event.target.closest(".node-inspector"))
+          .on("start", () => container.classList.add("is-dragging"))
+          .on("end", () => container.classList.remove("is-dragging"))
+          .on("zoom", zoomed);
+        mapState.svg = svg;
+        mapState.zoomBehavior = zoom;
+        svg.call(zoom).call(zoom.transform, mapState.transform || d3.zoomIdentity).on("dblclick.zoom", null);
+        svg.on("click", () => {
+          mapState.selectedNodeId = null;
+          closeNodeInspector();
+          renderMap();
+        });
+      }
+
+      function updateNodeInspector(node) {
+        const inspector = document.getElementById("node-inspector");
+        if (!inspector) return;
+        inspector.dataset.open = "true";
+        setText("node-inspector-title", nodeTitle(node));
+        setText("node-role", node.role || "-");
+        setText("node-status", node.status || "-");
+        setText("node-gpu", node.gpu_count ? `${node.gpu_count}` : "-");
+        setText("node-rate", node.tokens_per_second ? compactNumber(node.tokens_per_second, " tok/s") : "-");
+        setText("node-upload", node.uploaded_bytes ? compactBytes(node.uploaded_bytes) : (node.upload_mib_s ? `${Number(node.upload_mib_s).toFixed(1)} MiB/s` : "-"));
+        setText("node-region", nodeRegion(node));
+      }
+
+      function closeNodeInspector() {
+        const inspector = document.getElementById("node-inspector");
+        if (inspector) inspector.dataset.open = "false";
+      }
+
+      function initMapChrome() {
+        document.getElementById("node-inspector-close")?.addEventListener("click", (event) => {
+          event.stopPropagation();
+          mapState.selectedNodeId = null;
+          closeNodeInspector();
+          renderMap();
+        });
+        document.querySelectorAll("[data-map-action]").forEach((button) => {
+          button.addEventListener("click", (event) => {
+            event.stopPropagation();
+            if (!mapState.svg || !mapState.zoomBehavior) return;
+            const action = button.getAttribute("data-map-action");
+            if (action === "reset") {
+              mapState.svg.transition().duration(180).call(mapState.zoomBehavior.transform, d3.zoomIdentity);
+              return;
+            }
+            const scale = action === "zoom-in" ? 1.28 : 0.78;
+            mapState.svg.transition().duration(180).call(mapState.zoomBehavior.scaleBy, scale);
+          });
+        });
+      }
+
+      async function fetchJson(url) {
+        try {
+          const response = await fetch(`${url}${url.includes("?") ? "&" : "?"}t=${Date.now()}`, { cache: "no-store" });
+          if (!response.ok) return null;
+          return await response.json();
+        } catch (_error) {
+          return null;
+        }
+      }
+
+      async function loadWorld() {
+        try {
+          const world = await fetch("https://cdn.jsdelivr.net/npm/world-atlas@2/countries-50m.json").then((response) => response.json());
+          mapState.world = world;
+          mapState.land = topojson.feature(world, world.objects.land);
+          mapState.borders = topojson.mesh(world, world.objects.countries, (a, b) => a !== b);
+        } catch (_error) {
+          mapState.world = null;
+          mapState.land = null;
+          mapState.borders = null;
+        }
+        renderMap();
+      }
+
+      async function loadDashboard() {
+        const payload = await fetchJson("/dashboard.json") || {
+          schema_version: 1,
+          run_id: null,
+          active_ranks: 0,
+          miners: [],
+          transfers: [],
+          coordinator: { status: "offline", location: { lat: 39.0438, lon: -77.4874 } },
+          metrics: {},
+          series: {}
+        };
+        mapState.payload = payload;
+        updateReadout(payload);
+        updateCharts(payload);
+        renderMap();
+      }
+
+      document.querySelectorAll("[data-chart]").forEach((canvas, index) => drawChart(canvas, chartConfigs[canvas.dataset.chart], index + 1));
+      initMapChrome();
+      loadWorld();
+      loadDashboard();
+      window.addEventListener("resize", () => requestAnimationFrame(renderMap));
+      window.setInterval(loadDashboard, 1000);
+    })();
+  </script>
+</body>
+</html>
