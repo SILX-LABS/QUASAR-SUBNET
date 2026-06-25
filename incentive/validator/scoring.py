@@ -11,7 +11,7 @@ from incentive.bucket import paths
 from incentive.bucket.storage import ObjectStore
 from incentive.core.protocol import ValidatorVerdict
 from incentive.core.signatures import Signer, canonical_json, sign_dict, verify_identity_dict
-from .rewards import accepted_merge_events, accepted_units_by_hotkey_from_events, load_manifest_expected_units
+from .rewards import accepted_and_penalty_units_by_hotkey_from_events, accepted_merge_events, load_manifest_expected_units
 
 
 @dataclass
@@ -80,9 +80,15 @@ def summarize_score_window(
 ) -> ScoreWindow:
     failed: dict[str, float] = {}
     event_limit = _score_merge_event_window() if merge_event_window is None else merge_event_window
-    accepted = accepted_units_by_hotkey_from_events(
-        accepted_merge_events(bucket, netuid=netuid, run_id=run_id, limit=event_limit)
+    accepted, resource_penalties = accepted_and_penalty_units_by_hotkey_from_events(
+        accepted_merge_events(bucket, netuid=netuid, run_id=run_id, limit=event_limit),
+        bucket=bucket,
+        netuid=netuid,
+        run_id=run_id,
+        decay_half_life_events=_score_decay_half_life_events(),
     )
+    for hotkey, units in resource_penalties.items():
+        failed[hotkey] = failed.get(hotkey, 0.0) + max(0.0, float(units))
     prefix = bucket.uri_for_key(f"{paths.root_prefix(netuid)}/verdicts/{run_id}/")
     for uri in bucket.list(prefix):
         if not uri.endswith(".json"):
@@ -131,6 +137,15 @@ def _score_merge_event_window() -> int | None:
     except ValueError:
         return 256
     return value if value > 0 else None
+
+
+def _score_decay_half_life_events() -> float | None:
+    raw = os.environ.get("QUASAR_SCORE_DECAY_HALF_LIFE_EVENTS", "64")
+    try:
+        value = float(raw)
+    except ValueError:
+        return 64.0
+    return value if value > 0.0 else None
 
 
 def _verdict_units(bucket: ObjectStore, *, netuid: int, verdict: ValidatorVerdict) -> float:

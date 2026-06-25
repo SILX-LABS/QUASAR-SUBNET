@@ -431,9 +431,11 @@ class RunManager:
             self.queue.reconcile_from_bucket()
             queue_depth = self.queue.depth()
             validation_jobs = self._maybe_emit_validation_jobs()
-            recovery = self._maybe_coordinate_learner_recovery()
-            catchup = self._maybe_broadcast_fragment_catchup()
-            snapshot = self._maybe_initiate_chandy_lamport_snapshot(round_id=round_id)
+            run_state = self._load_state()
+            live_sync = run_state.get("live_sync") if isinstance(run_state.get("live_sync"), dict) else {}
+            recovery = {"enabled": True, "deferred": True, "reason": "scheduler_priority"}
+            catchup = {"enabled": True, "deferred": True, "reason": "scheduler_priority"}
+            snapshot = {"enabled": False, "deferred": True, "reason": "scheduler_priority"}
             finalization = self._maybe_finalize_pending_round(current_round=round_id, queue_depth=queue_depth)
             if finalization.get("finalized"):
                 previous_live_sync = self._load_state().get("live_sync")
@@ -453,7 +455,6 @@ class RunManager:
                 self._emit_event({"event": "round_finalized", "run_id": self.config.run_id, **finalization})
                 time.sleep(self.config.poll_interval_sec)
                 continue
-            live_sync = self._maybe_sync_live_fragment(round_id=round_id)
             if finalization.get("pending"):
                 miners = self.discover_workers()
                 eligible_miners = self._miners_with_capacity(miners)
@@ -549,6 +550,10 @@ class RunManager:
                     round_id += 1
                     time.sleep(self.config.poll_interval_sec)
                     continue
+                recovery = self._maybe_coordinate_learner_recovery()
+                catchup = self._maybe_broadcast_fragment_catchup()
+                snapshot = self._maybe_initiate_chandy_lamport_snapshot(round_id=round_id)
+                live_sync = self._maybe_sync_live_fragment(round_id=round_id)
                 self._save_state(
                     status="waiting_for_finalization",
                     current_round=round_id,
@@ -562,6 +567,45 @@ class RunManager:
                 self._emit_event({"event": "waiting_for_finalization", "run_id": self.config.run_id, **finalization})
                 time.sleep(self.config.poll_interval_sec)
                 continue
+
+            miners = self.discover_workers()
+            eligible_miners = self._miners_with_capacity(miners)
+            if eligible_miners and (not self.config.max_rounds or emitted_rounds < self.config.max_rounds):
+                jobs = self.emit_round(round_id=round_id, miners=eligible_miners)
+                emitted_rounds += 1
+                self._save_state(
+                    status="round_emitted",
+                    current_round=round_id + 1,
+                    emitted_rounds=emitted_rounds,
+                    queue_depth=self.queue.depth(),
+                    job_ids=[job.manifest.job_id for job in jobs],
+                    miners=[target.hotkey for target in eligible_miners],
+                    reconcile=reconcile,
+                    validation_jobs=validation_jobs,
+                    live_sync=live_sync,
+                    finalization=finalization,
+                    data_catalog=self._catalog_state(),
+                )
+                self._emit_event(
+                    {
+                        "event": "round_emitted",
+                        "run_id": self.config.run_id,
+                        "round_id": round_id,
+                        "jobs": len(jobs),
+                        "miners": [target.hotkey for target in eligible_miners],
+                        "queue_depth": self.queue.depth(),
+                        "finalization_pending": bool(finalization.get("pending")),
+                        "train_sources": summarize_shards(self.shards),
+                    }
+                )
+                round_id += 1
+                time.sleep(self.config.poll_interval_sec)
+                continue
+
+            recovery = self._maybe_coordinate_learner_recovery()
+            catchup = self._maybe_broadcast_fragment_catchup()
+            snapshot = self._maybe_initiate_chandy_lamport_snapshot(round_id=round_id)
+            live_sync = self._maybe_sync_live_fragment(round_id=round_id)
 
             release_work = self._maybe_process_pending_checkpoint_release(queue_depth=queue_depth)
             if release_work.get("processed") or release_work.get("reason") == "checkpoint_release_failed":

@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Any, Mapping
 
 from incentive.bucket import paths
 from incentive.bucket.storage import ObjectStore
-from incentive.core.protocol import TrainingJobManifest
+from incentive.core.protocol import MinerReceipt, TrainingJobManifest
+from .resource_sanity import validate_receipt_resource_claims
 
 
 @dataclass(frozen=True)
@@ -93,17 +95,73 @@ def accepted_merge_events(
 
 
 def accepted_units_by_hotkey_from_events(events: list[MergeAcceptedEvent]) -> dict[str, float]:
+    return accepted_units_by_hotkey_from_events_with_decay(events, decay_half_life_events=None)
+
+
+def accepted_units_by_hotkey_from_events_with_decay(
+    events: list[MergeAcceptedEvent],
+    *,
+    decay_half_life_events: float | None = None,
+) -> dict[str, float]:
     accepted: dict[str, float] = {}
-    for event in events:
+    event_count = len(events)
+    for index, event in enumerate(events):
+        decay = _event_decay_factor(index, event_count, decay_half_life_events)
         for update in event.accepted_updates:
             hotkey = _reward_hotkey(update.hotkey)
             if not hotkey:
                 continue
-            weight = _nonnegative_float(update.weight)
+            weight = _nonnegative_float(update.weight) * decay
             if weight <= 0.0:
                 continue
             accepted[hotkey] = accepted.get(hotkey, 0.0) + weight
     return accepted
+
+
+def accepted_and_penalty_units_by_hotkey_from_events(
+    events: list[MergeAcceptedEvent],
+    *,
+    bucket: ObjectStore,
+    netuid: int,
+    run_id: str,
+    decay_half_life_events: float | None = None,
+) -> tuple[dict[str, float], dict[str, float]]:
+    accepted: dict[str, float] = {}
+    penalties: dict[str, float] = {}
+    event_count = len(events)
+    for index, event in enumerate(events):
+        decay = _event_decay_factor(index, event_count, decay_half_life_events)
+        for update in event.accepted_updates:
+            hotkey = _reward_hotkey(update.hotkey)
+            if not hotkey:
+                continue
+            weight = _nonnegative_float(update.weight) * decay
+            if weight <= 0.0:
+                continue
+            ok, reason = _accepted_update_resource_sane(
+                bucket,
+                netuid=netuid,
+                run_id=run_id,
+                update=update,
+            )
+            if ok:
+                accepted[hotkey] = accepted.get(hotkey, 0.0) + weight
+            else:
+                penalties[hotkey] = penalties.get(hotkey, 0.0) + max(weight, 1.0)
+    return accepted, penalties
+
+
+def _event_decay_factor(index: int, event_count: int, half_life_events: float | None) -> float:
+    if half_life_events is None:
+        return 1.0
+    try:
+        half_life = float(half_life_events)
+    except (TypeError, ValueError):
+        return 1.0
+    if half_life <= 0.0:
+        return 1.0
+    age = max(0, int(event_count) - 1 - int(index))
+    return float(math.pow(0.5, float(age) / half_life))
 
 
 def quality_multiplier_from_summary(summary: Mapping[str, Any] | None) -> float:
@@ -196,6 +254,62 @@ def _accepted_merge_event_from_uri(bucket: ObjectStore, *, uri: str, source: str
         sort_index=(sort_step, sort_fragment, uri),
         accepted_updates=tuple(updates),
     )
+
+
+def _accepted_update_resource_sane(
+    bucket: ObjectStore,
+    *,
+    netuid: int,
+    run_id: str,
+    update: MergedAcceptedUpdate,
+) -> tuple[bool, str]:
+    if not update.job_id or not update.receipt_id or str(update.receipt_id).startswith("live:"):
+        return True, "not_receipt_backed"
+    hotkey = _reward_hotkey(update.hotkey)
+    if not hotkey:
+        return False, "missing_hotkey"
+    try:
+        manifest = TrainingJobManifest.from_dict(
+            bucket.get_json(bucket.uri_for_key(paths.job_manifest_key(netuid, run_id, update.job_id)))
+        )
+        receipt = _load_update_receipt(bucket, netuid=netuid, run_id=run_id, hotkey=hotkey, update=update)
+        report = validate_receipt_resource_claims(manifest, receipt)
+        return bool(report.ok), report.reason
+    except Exception as exc:
+        return False, f"resource sanity unavailable: {type(exc).__name__}: {exc}"
+
+
+def _load_update_receipt(
+    bucket: ObjectStore,
+    *,
+    netuid: int,
+    run_id: str,
+    hotkey: str,
+    update: MergedAcceptedUpdate,
+) -> MinerReceipt:
+    attempt = _attempt_from_receipt_id(update.receipt_id)
+    if attempt is not None:
+        uri = bucket.uri_for_key(paths.receipt_key(netuid, run_id, hotkey, update.job_id, attempt))
+        return MinerReceipt.from_dict(bucket.get_json(uri))
+    prefix = bucket.uri_for_key(f"{paths.receipts_prefix(netuid, run_id, hotkey)}/{update.job_id}/")
+    for uri in bucket.list(prefix):
+        if not uri.endswith(".json"):
+            continue
+        receipt = MinerReceipt.from_dict(bucket.get_json(uri))
+        if receipt.receipt_id == update.receipt_id:
+            return receipt
+    raise FileNotFoundError(f"receipt not found for accepted update: {update.receipt_id}")
+
+
+def _attempt_from_receipt_id(receipt_id: str) -> int | None:
+    marker = ":attempt="
+    if marker not in str(receipt_id):
+        return None
+    raw = str(receipt_id).rsplit(marker, 1)[-1]
+    try:
+        return int(raw)
+    except ValueError:
+        return None
 
 
 def _reward_hotkey(value: str) -> str:

@@ -9,8 +9,8 @@ from incentive.bucket import paths
 from incentive.bucket.storage import ObjectStore
 from incentive.core.protocol import MinerReceipt, ValidatorVerdict
 from .rewards import (
+    accepted_and_penalty_units_by_hotkey_from_events,
     accepted_merge_events,
-    accepted_units_by_hotkey_from_events,
     accepted_updates_by_receipt,
     load_manifest_expected_units,
 )
@@ -68,11 +68,22 @@ def summarize_ledger(
                 weight = 0.0
             if hotkey and weight > 0.0:
                 accepted_update_counts[hotkey] = accepted_update_counts.get(hotkey, 0) + 1
-    for hotkey, accepted_units in accepted_units_by_hotkey_from_events(events).items():
+    accepted_units_by_hotkey, resource_penalties = accepted_and_penalty_units_by_hotkey_from_events(
+        events,
+        bucket=bucket,
+        netuid=netuid,
+        run_id=run_id,
+    )
+    for hotkey, accepted_units in accepted_units_by_hotkey.items():
         row = out.by_hotkey.setdefault(hotkey, _empty_hotkey_row())
         row["accepted_units"] += max(0.0, float(accepted_units))
         row["accepted_updates"] += accepted_update_counts.get(hotkey, 0)
         out.accepted_units += max(0.0, float(accepted_units))
+    for hotkey, penalty_units in resource_penalties.items():
+        row = out.by_hotkey.setdefault(hotkey, _empty_hotkey_row())
+        failed_units = max(0.0, float(penalty_units))
+        row["failed_units"] += failed_units
+        out.failed_units += failed_units
     merged = accepted_updates_by_receipt(bucket, netuid=netuid, run_id=run_id)
     prefix = bucket.uri_for_key(f"{paths.root_prefix(netuid)}/verdicts/{run_id}/")
     for uri in bucket.list(prefix):

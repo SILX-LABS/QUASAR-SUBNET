@@ -10,8 +10,8 @@ from incentive.bucket import paths
 from incentive.bucket.storage import ObjectStore
 from incentive.core.protocol import ResourceRequirements, ValidatorVerdict
 from incentive.validator.rewards import (
+    accepted_and_penalty_units_by_hotkey_from_events,
     accepted_merge_events,
-    accepted_units_by_hotkey_from_events,
     accepted_updates_by_receipt,
 )
 from incentive.validator.service import MinerTarget
@@ -93,9 +93,18 @@ def load_accounts(
     allow = {item.strip() for item in validator_hotkeys if item.strip()}
     accounts: dict[str, MinerAccount] = {}
     events = accepted_merge_events(bucket, netuid=netuid, run_id=run_id, limit=None)
-    for hotkey, units in accepted_units_by_hotkey_from_events(events).items():
+    accepted_units, resource_penalties = accepted_and_penalty_units_by_hotkey_from_events(
+        events,
+        bucket=bucket,
+        netuid=netuid,
+        run_id=run_id,
+    )
+    for hotkey, units in accepted_units.items():
         account = accounts.setdefault(hotkey, MinerAccount(hotkey=hotkey))
         account.accepted_units += max(0.0, float(units))
+    for hotkey, units in resource_penalties.items():
+        account = accounts.setdefault(hotkey, MinerAccount(hotkey=hotkey))
+        account.failed_units += max(1.0, float(units))
     merged = accepted_updates_by_receipt(bucket, netuid=netuid, run_id=run_id)
     prefix = bucket.uri_for_key(f"{paths.root_prefix(netuid)}/verdicts/{run_id}/")
     for uri in bucket.list(prefix):

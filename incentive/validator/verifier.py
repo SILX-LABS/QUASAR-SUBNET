@@ -14,6 +14,7 @@ from incentive.core.protocol import ArtifactDigest, MinerReceipt, TrainingJobMan
 from incentive.core.signatures import Signer
 from incentive.fragments.artifacts import FragmentUpdateArtifact, load_fragment_update_artifact, load_safetensors_file, validate_fragment_state_tensors
 from .generalization import GeneralizationPolicy, evaluate_delta_generalization
+from .resource_sanity import trusted_tokens_per_step, validate_receipt_resource_claims
 from .rewards import expected_training_units_from_manifest, quality_multiplier_from_summary
 from typing import Any
 
@@ -154,6 +155,11 @@ class ValidatorVerifier:
         if not token_claim["ok"]:
             status = "fail"
             reasons.append(str(token_claim["reason"]))
+        resource_claim = validate_receipt_resource_claims(manifest, receipt)
+        summary["resource_sanity"] = resource_claim.to_dict()
+        if not resource_claim.ok:
+            status = "fail"
+            reasons.append(resource_claim.reason)
 
         accepted_update_weight = quality_multiplier_from_summary(summary) if status == "pass" else 0.0
         if status == "pass":
@@ -308,11 +314,7 @@ class ValidatorVerifier:
             planned_tokens = int(planned)
         except (TypeError, ValueError):
             return {"ok": True, "required": False}
-        tokens_per_step = receipt.metrics.get("tokens_per_step") if isinstance(receipt.metrics, dict) else None
-        try:
-            allowance = max(1, int(tokens_per_step or 0))
-        except (TypeError, ValueError):
-            allowance = 1
+        allowance = trusted_tokens_per_step(manifest)
         claimed = int(receipt.claimed_tokens or 0)
         limit = max(0, planned_tokens) + allowance
         return {

@@ -8,6 +8,7 @@ import os
 from incentive.bucket import paths
 from incentive.chain import BittensorAdapter
 from incentive.config import ChainConfig
+from incentive.core.protocol import json_safe
 from incentive.validator.scoring import ScoreWindow
 
 
@@ -47,6 +48,7 @@ def write_weight_publish_state(
     payload["run_id"] = run_id
     payload["validator_hotkey"] = validator_hotkey
     payload["updated_unix"] = float(now)
+    payload = json_safe(payload)
     bucket.put_json(uri, payload)
     return payload
 
