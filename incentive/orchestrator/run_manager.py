@@ -259,6 +259,8 @@ class RunConfig:
     sync_min_grace_sec: float = 0.0
     sync_max_grace_sec: float = 180.0
     sync_estimated_sync_sec: float = 0.0
+    round_merge_min_grace_sec: float = 900.0
+    round_merge_max_grace_sec: float = 1800.0
     release_every_n_rounds: int = 0
     training_command: str = "python3 -m incentive.training.quasar_job"
     training_model_id: str = ""
@@ -349,6 +351,8 @@ class RunConfig:
             sync_min_grace_sec=_env_float("QUASAR_SYNC_MIN_GRACE_SEC", 0.0),
             sync_max_grace_sec=_env_float("QUASAR_SYNC_MAX_GRACE_SEC", 180.0),
             sync_estimated_sync_sec=_env_float("QUASAR_SYNC_ESTIMATED_SYNC_SEC", 0.0),
+            round_merge_min_grace_sec=_env_float("QUASAR_ROUND_MERGE_MIN_GRACE_SEC", 900.0),
+            round_merge_max_grace_sec=_env_float("QUASAR_ROUND_MERGE_MAX_GRACE_SEC", 1800.0),
             release_every_n_rounds=_env_int("QUASAR_RELEASE_EVERY_N_ROUNDS", 0),
             training_command=os.environ.get("QUASAR_TRAINING_COMMAND", "python3 -m incentive.training.quasar_job"),
             training_model_id=os.environ.get("QUASAR_TRAINING_MODEL_ID", model.model_id),
@@ -2706,9 +2710,9 @@ class RunManager:
                 "missing_receipts": int(missing_receipts),
                 "accepted_quorum_receipts": int(accepted_quorum_receipts),
             }
-        max_grace = max(0.0, float(self.config.sync_max_grace_sec))
+        min_grace = max(0.0, float(self.config.round_merge_min_grace_sec))
+        max_grace = max(min_grace, float(self.config.round_merge_max_grace_sec))
         adaptive_grace = max(0.0, float(adaptive.get("grace_sec") or 0.0))
-        min_grace = max(0.0, float(self.config.sync_min_grace_sec))
         grace_cap = max_grace if max_grace > 0.0 else max(0.0, float(self.config.poll_interval_sec)) * 2.0
         grace = min(grace_cap, max(min_grace, adaptive_grace))
         if grace <= 0.0:
