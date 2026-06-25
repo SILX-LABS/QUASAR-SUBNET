@@ -6,13 +6,31 @@ import json
 import tempfile
 import time
 from dataclasses import dataclass, replace
+from math import ceil
 from pathlib import Path
 
 from incentive.bucket import paths
 from incentive.bucket.storage import ObjectStore
-from incentive.core.protocol import ArtifactDigest, MinerReceipt, TrainingJobManifest, ValidatorVerdict
+from incentive.coordination.mesh import BucketDilocoChannel
+from incentive.core.protocol import (
+    ArtifactDigest,
+    LiveFragmentClaim,
+    LiveFragmentVerdict,
+    MinerReceipt,
+    TrainingJobManifest,
+    ValidatorVerdict,
+    WorkerIdentity,
+)
 from incentive.core.signatures import Signer
-from incentive.fragments.artifacts import FragmentUpdateArtifact, load_fragment_update_artifact, load_safetensors_file, validate_fragment_state_tensors
+from incentive.fragments.artifacts import (
+    FRAGMENT_SYNC_FORMAT,
+    FragmentTensorSpec,
+    FragmentUpdateArtifact,
+    FragmentUpdateManifest,
+    load_fragment_update_artifact,
+    load_safetensors_file,
+    validate_fragment_state_tensors,
+)
 from .generalization import GeneralizationPolicy, evaluate_delta_generalization
 from .resource_sanity import trusted_tokens_per_step, validate_receipt_resource_claims
 from .rewards import expected_training_units_from_manifest, quality_multiplier_from_summary
@@ -33,12 +51,20 @@ class VerificationResult:
 
 
 @dataclass
+class LiveFragmentVerificationResult:
+    claim: LiveFragmentClaim
+    verdict: LiveFragmentVerdict
+    verdict_uri: str
+
+
+@dataclass
 class ValidatorVerifierConfig:
     netuid: int
     run_id: str
     validator_hotkey: str
     independent_quasar_eval: Any | None = None
     owner_identity: str = ""
+    allow_dev_signatures: bool = False
 
 
 class ValidatorVerifier:
@@ -70,7 +96,7 @@ class ValidatorVerifier:
             reasons.append("manifest hash mismatch")
         if self.config.owner_identity and not manifest.verify_signature(
             self.config.owner_identity,
-            allow_dev_hmac=False,
+            allow_dev_hmac=self.config.allow_dev_signatures,
         ):
             status = "fail"
             reasons.append("manifest owner signature failed")
@@ -79,7 +105,7 @@ class ValidatorVerifier:
             reasons.append("receipt hotkey mismatch")
         if not receipt.verify_signature(
             receipt.worker.hotkey_ss58,
-            allow_dev_hmac=False,
+            allow_dev_hmac=self.config.allow_dev_signatures,
         ):
             status = "fail"
             reasons.append("bad miner signature")
@@ -186,6 +212,382 @@ class ValidatorVerifier:
         )
         self.bucket.put_json(verdict_uri, verdict.to_dict())
         return VerificationResult(receipt=receipt, verdict=verdict, verdict_uri=verdict_uri)
+
+    def verify_live_fragment_claim_uri(self, claim_uri: str) -> LiveFragmentVerificationResult:
+        claim = LiveFragmentClaim.from_dict(self.bucket.get_json(claim_uri))
+        status = "pass"
+        reasons: list[str] = []
+        summary: dict[str, object] = {"claim_uri": claim_uri}
+        manifest: TrainingJobManifest | None = None
+        artifact: FragmentUpdateArtifact | None = None
+
+        def fail(reason: str) -> None:
+            nonlocal status
+            status = "fail"
+            reasons.append(reason)
+
+        if claim.run_id != self.config.run_id:
+            fail("claim run_id mismatch")
+        if not claim.miner_hotkey:
+            fail("claim missing miner hotkey")
+        elif not claim.verify_signature(claim.miner_hotkey, allow_dev_hmac=self.config.allow_dev_signatures):
+            fail("bad live claim miner signature")
+        if claim.learner_id and ":" in claim.learner_id:
+            learner_hotkey, learner_worker = claim.learner_id.split(":", 1)
+            if learner_hotkey != claim.miner_hotkey:
+                fail("claim learner hotkey mismatch")
+            if claim.worker_id and learner_worker != claim.worker_id:
+                fail("claim learner worker mismatch")
+        if claim.fragment_count <= 0 or not (0 <= claim.fragment_id < claim.fragment_count):
+            fail("claim fragment id/count mismatch")
+        if claim.local_step < claim.target_local_step:
+            fail("claim local step below frozen target")
+        if not claim.fragment_state_uri or not claim.fragment_state_sha256:
+            fail("claim missing learner fragment state")
+        if not claim.previous_fragment_state_uri or not claim.previous_fragment_state_sha256:
+            fail("claim missing frozen previous fragment state")
+        if not claim.job_id:
+            fail("claim missing job_id")
+
+        if claim.job_id:
+            try:
+                manifest = TrainingJobManifest.from_dict(
+                    self.bucket.get_json(self.bucket.uri_for_key(paths.job_manifest_key(self.config.netuid, claim.run_id, claim.job_id)))
+                )
+                summary["assignment"] = {
+                    "job_id": manifest.job_id,
+                    "round_id": int(manifest.round_id),
+                    "assigned_hotkey": manifest.assigned_hotkey,
+                }
+                if manifest.assigned_hotkey != claim.miner_hotkey:
+                    fail("claim miner hotkey does not match assignment")
+                if manifest.run_id != claim.run_id:
+                    fail("claim assignment run mismatch")
+            except Exception as exc:
+                fail(f"claim assignment unavailable: {type(exc).__name__}: {exc}")
+
+        request_payload = self._live_pull_request_payload(claim)
+        if request_payload is None:
+            fail("claim pull_fragment request unavailable")
+        else:
+            request_fragment_id = self._as_int(request_payload.get("fragment_id"), default=-1)
+            request_fragment_count = self._as_int(request_payload.get("fragment_count"), default=0)
+            request_global_step = self._as_int(request_payload.get("global_step"), default=0)
+            request_round_id = self._as_int(request_payload.get("round_id"), default=0)
+            request_target_local_step = self._as_int(request_payload.get("target_local_step"), default=0)
+            summary["pull_fragment_request"] = {
+                "request_id": str(request_payload.get("request_id") or ""),
+                "fragment_id": request_fragment_id,
+                "fragment_count": request_fragment_count,
+                "global_step": request_global_step,
+                "target_local_step": request_target_local_step,
+            }
+            if str(request_payload.get("request_id") or "") != claim.request_id:
+                fail("claim request_id not bound to pull_fragment")
+            if request_fragment_id != int(claim.fragment_id):
+                fail("claim fragment_id not bound to pull_fragment")
+            if request_fragment_count != int(claim.fragment_count):
+                fail("claim fragment_count not bound to pull_fragment")
+            if request_global_step != int(claim.global_step):
+                fail("claim global_step not bound to pull_fragment")
+            if request_round_id != int(claim.round_id):
+                fail("claim round_id not bound to pull_fragment")
+            if request_target_local_step != int(claim.target_local_step):
+                fail("claim target_local_step not bound to pull_fragment")
+            if str(request_payload.get("previous_fragment_state_uri") or "") != claim.previous_fragment_state_uri:
+                fail("claim previous fragment URI not bound to pull_fragment")
+            if str(request_payload.get("previous_fragment_state_sha256") or "") != claim.previous_fragment_state_sha256:
+                fail("claim previous fragment sha not bound to pull_fragment")
+
+        trusted_tokens, trusted_steps, work_summary = self._trusted_live_claim_work(claim, manifest)
+        summary["work"] = work_summary
+        if trusted_steps <= 0 or trusted_tokens <= 0:
+            fail("claim has no positive trusted fragment work")
+
+        if status == "pass":
+            try:
+                artifact, tensor_summary = self._live_claim_artifact(
+                    claim=claim,
+                    manifest=manifest,
+                    trusted_tokens=trusted_tokens,
+                    trusted_steps=trusted_steps,
+                )
+                summary["fragment_update"] = tensor_summary
+            except Exception as exc:
+                fail(f"live fragment tensor validation failed: {type(exc).__name__}: {exc}")
+                summary["fragment_update"] = {"status": "error", "error": str(exc)}
+
+        independent_eval_config = self._independent_eval_config(manifest) if manifest is not None else None
+        if status == "pass" and independent_eval_config is not None and artifact is not None and manifest is not None:
+            try:
+                synthetic_receipt = MinerReceipt(
+                    receipt_id=f"live:{claim.request_id}:{claim.learner_id}",
+                    manifest_hash=manifest.manifest_hash or manifest.compute_manifest_hash(),
+                    job_id=claim.job_id,
+                    run_id=claim.run_id,
+                    round_id=int(claim.round_id),
+                    global_step=int(claim.global_step),
+                    worker=WorkerIdentity(
+                        hotkey_ss58=claim.miner_hotkey,
+                        worker_id=claim.worker_id,
+                    ),
+                    input_digests=[],
+                    output_digests=[],
+                    started_unix=0.0,
+                    finished_unix=time.time(),
+                    compute_sec=0.0,
+                    claimed_tokens=trusted_tokens,
+                    claimed_local_steps=trusted_steps,
+                    claimed_bytes_read=0,
+                    claimed_bytes_written=0,
+                    metrics={
+                        "fragment_trained_tokens": trusted_tokens,
+                        "fragment_local_steps": trusted_steps,
+                    },
+                )
+                independent_report = evaluate_quasar_update_receipt(
+                    bucket=self.bucket,
+                    manifest=manifest,
+                    receipt=synthetic_receipt,
+                    config=independent_eval_config,
+                    artifact=artifact,
+                )
+                summary["independent_quasar_eval"] = independent_report.to_dict()
+                if independent_report.status == "fail":
+                    fail("; ".join(independent_report.reasons) or "independent Quasar eval failed")
+            except Exception as exc:
+                fail(f"independent Quasar eval failed: {type(exc).__name__}: {exc}")
+                summary["independent_quasar_eval"] = {"status": "error", "error": str(exc)}
+        elif status == "pass" and independent_eval_config is None:
+            fail("live fragment validation requires independent Quasar eval")
+            summary["independent_quasar_eval"] = {"status": "fail", "reason": "not configured"}
+
+        quality = quality_multiplier_from_summary(summary) if status == "pass" else 0.0
+        paper_weight = float(trusted_tokens) * (float(trusted_tokens) / float(max(1, trusted_steps))) if trusted_tokens > 0 else 0.0
+        accepted_weight = paper_weight * max(0.0, float(quality)) if status == "pass" else 0.0
+        if status == "pass":
+            summary["quality_multiplier"] = quality
+            summary["paper_weight"] = paper_weight
+
+        verdict = LiveFragmentVerdict(
+            verdict_id=f"{claim.request_id}:{claim.learner_id}:validator={self.config.validator_hotkey}",
+            run_id=claim.run_id,
+            request_id=claim.request_id,
+            learner_id=claim.learner_id,
+            miner_hotkey=claim.miner_hotkey,
+            validator_hotkey=self.config.validator_hotkey,
+            status=status,
+            reason="; ".join(reasons) if reasons else "ok",
+            fragment_id=claim.fragment_id,
+            fragment_count=claim.fragment_count,
+            global_step=claim.global_step,
+            claim_uri=claim_uri,
+            claim_digest=claim.digest(),
+            fragment_state_uri=claim.fragment_state_uri,
+            fragment_state_sha256=claim.fragment_state_sha256,
+            previous_fragment_state_uri=claim.previous_fragment_state_uri,
+            previous_fragment_state_sha256=claim.previous_fragment_state_sha256,
+            accepted_weight=accepted_weight,
+            trained_tokens=trusted_tokens if status == "pass" else 0,
+            local_steps=trusted_steps if status == "pass" else 0,
+            quality_multiplier=quality,
+            validation_summary=summary,
+            checked_unix=time.time(),
+        ).sign(self.signer)
+        verdict_uri = self.bucket.uri_for_key(
+            paths.live_fragment_verdict_key(
+                self.config.netuid,
+                claim.run_id,
+                self.config.validator_hotkey,
+                claim.request_id,
+                claim.learner_id,
+            )
+        )
+        self.bucket.put_json(verdict_uri, verdict.to_dict())
+        return LiveFragmentVerificationResult(claim=claim, verdict=verdict, verdict_uri=verdict_uri)
+
+    @staticmethod
+    def _claim_counter_value(claim: LiveFragmentClaim, name: str) -> int:
+        values = claim.counters.get(name)
+        if isinstance(values, list) and 0 <= int(claim.fragment_id) < len(values):
+            try:
+                return max(0, int(values[int(claim.fragment_id)]))
+            except (TypeError, ValueError):
+                return 0
+        return 0
+
+    def _live_pull_request_payload(self, claim: LiveFragmentClaim) -> dict[str, object] | None:
+        if not claim.learner_id or not claim.request_id:
+            return None
+        channel = BucketDilocoChannel(
+            self.bucket,
+            netuid=self.config.netuid,
+            run_id=claim.run_id,
+            sender="syncer",
+            receiver=claim.learner_id,
+        )
+        for message in channel.receive_after(0):
+            if message.kind != "pull_fragment":
+                continue
+            payload = dict(message.payload or {})
+            if str(payload.get("request_id") or "") == claim.request_id:
+                return payload
+        return None
+
+    def _trusted_live_claim_work(
+        self,
+        claim: LiveFragmentClaim,
+        manifest: TrainingJobManifest | None,
+    ) -> tuple[int, int, dict[str, object]]:
+        raw_tokens = max(0, int(claim.trained_tokens or self._claim_counter_value(claim, "tokens")))
+        raw_steps = max(0, int(claim.local_steps or self._claim_counter_value(claim, "steps")))
+        if manifest is None:
+            return raw_tokens, raw_steps, {
+                "tokens": raw_tokens,
+                "steps": raw_steps,
+                "capped": False,
+                "cap_available": False,
+            }
+        tokens_per_step = trusted_tokens_per_step(manifest)
+        step_cap = self._assigned_live_step_cap(manifest, tokens_per_step=tokens_per_step)
+        trusted_steps = min(raw_steps, step_cap) if step_cap > 0 else raw_steps
+        allowance = tokens_per_step
+        max_tokens = max(0, trusted_steps) * tokens_per_step + allowance
+        planned_tokens = self._assigned_live_token_cap(manifest)
+        if planned_tokens > 0:
+            max_tokens = min(max_tokens, planned_tokens + allowance)
+        trusted_tokens = min(raw_tokens, max_tokens)
+        return trusted_tokens, trusted_steps, {
+            "tokens": trusted_tokens,
+            "steps": trusted_steps,
+            "raw_tokens": raw_tokens,
+            "raw_steps": raw_steps,
+            "trusted_tokens_per_step": tokens_per_step,
+            "step_cap": step_cap,
+            "allowance": allowance,
+            "max_tokens": max_tokens,
+            "planned_token_cap": planned_tokens,
+            "capped": raw_tokens > max_tokens or trusted_steps < raw_steps,
+            "steps_capped": trusted_steps < raw_steps,
+            "tokens_capped": raw_tokens > max_tokens,
+        }
+
+    @staticmethod
+    def _assigned_live_token_cap(manifest: TrainingJobManifest) -> int:
+        params = dict(manifest.task_params or {})
+        env = dict(params.get("env") or {})
+        for value in (
+            params.get("planned_tokens"),
+            params.get("expected_training_units"),
+            env.get("QUASAR_ASSIGNED_TOKENS"),
+        ):
+            try:
+                parsed = int(float(value))
+            except (TypeError, ValueError):
+                continue
+            if parsed > 0:
+                return parsed
+        return 0
+
+    @classmethod
+    def _assigned_live_step_cap(cls, manifest: TrainingJobManifest, *, tokens_per_step: int) -> int:
+        params = dict(manifest.task_params or {})
+        env = dict(params.get("env") or {})
+        caps: list[int] = []
+        for value in (env.get("QUASAR_LOCAL_STEPS"), params.get("planned_local_steps")):
+            try:
+                parsed = int(float(value))
+            except (TypeError, ValueError):
+                continue
+            if parsed > 0:
+                caps.append(parsed)
+        token_cap = cls._assigned_live_token_cap(manifest)
+        if token_cap > 0:
+            caps.append(int(ceil(float(token_cap) / float(max(1, tokens_per_step)))))
+        if not caps:
+            return 0
+        return max(1, min(caps) + 1)
+
+    def _live_claim_artifact(
+        self,
+        *,
+        claim: LiveFragmentClaim,
+        manifest: TrainingJobManifest | None,
+        trusted_tokens: int,
+        trusted_steps: int,
+    ) -> tuple[FragmentUpdateArtifact, dict[str, object]]:
+        with tempfile.TemporaryDirectory(prefix="quasar-live-fragment-") as tmp:
+            tmpdir = Path(tmp)
+            previous_path = tmpdir / "previous.safetensors"
+            learner_path = tmpdir / "learner.safetensors"
+            previous_sha, _previous_size = self._materialize_object(
+                claim.previous_fragment_state_uri,
+                previous_path,
+                expected_sha256=claim.previous_fragment_state_sha256,
+            )
+            learner_sha, _learner_size = self._materialize_object(
+                claim.fragment_state_uri,
+                learner_path,
+                expected_sha256=claim.fragment_state_sha256,
+            )
+            previous = load_safetensors_file(previous_path)
+            learner = load_safetensors_file(learner_path)
+        expected_names = sorted(previous)
+        expected_shapes = {name: tuple(previous[name].shape) for name in expected_names}
+        validate_fragment_state_tensors(
+            expected_names=expected_names,
+            expected_shapes=expected_shapes,
+            tensors=previous,
+            artifact_name=f"{FRAGMENT_SYNC_FORMAT}:previous",
+        )
+        validate_fragment_state_tensors(
+            expected_names=expected_names,
+            expected_shapes=expected_shapes,
+            tensors=learner,
+            artifact_name=f"{FRAGMENT_SYNC_FORMAT}:learner",
+        )
+        delta = {
+            name: previous[name].detach().float().cpu() - learner[name].detach().float().cpu()
+            for name in expected_names
+        }
+        fragment_manifest = FragmentUpdateManifest(
+            run_id=claim.run_id,
+            job_id=claim.job_id,
+            round_id=int(claim.round_id),
+            global_step=int(claim.global_step),
+            fragment_id=int(claim.fragment_id),
+            fragment_count=int(claim.fragment_count),
+            miner_hotkey=claim.miner_hotkey,
+            base_checkpoint_uri=manifest.checkpoint_ref.uri if manifest is not None else claim.previous_fragment_state_uri,
+            base_checkpoint_sha256=manifest.checkpoint_ref.sha256 if manifest is not None else claim.previous_fragment_state_sha256,
+            trained_tokens=int(trusted_tokens),
+            local_steps=int(trusted_steps),
+            fragment_trained_tokens=int(trusted_tokens),
+            fragment_local_steps=int(trusted_steps),
+            tensors=tuple(FragmentTensorSpec.from_tensor(name, tensor) for name, tensor in delta.items()),
+            metadata={
+                "source": "live_fragment_claim",
+                "request_id": claim.request_id,
+                "previous_fragment_state_uri": claim.previous_fragment_state_uri,
+                "previous_fragment_state_sha256": previous_sha,
+                "learner_fragment_state_uri": claim.fragment_state_uri,
+                "learner_fragment_state_sha256": learner_sha,
+            },
+        )
+        artifact = FragmentUpdateArtifact(manifest=fragment_manifest, tensors=delta)
+        return artifact, {
+            "status": "ok",
+            "format": artifact.format,
+            "algorithm": artifact.algorithm,
+            "fragment_id": int(claim.fragment_id),
+            "fragment_count": int(claim.fragment_count),
+            "tensor_count": artifact.tensor_count(),
+            "numel": artifact.numel(),
+            "l2_norm": artifact.l2_norm(),
+            "component_l2": artifact.component_l2(),
+            "previous_fragment_state_sha256": previous_sha,
+            "learner_fragment_state_sha256": learner_sha,
+        }
 
     def _independent_eval_config(self, manifest: TrainingJobManifest) -> IndependentQuasarEvalConfig | None:
         data = manifest.validation_policy.get("independent_quasar_eval")

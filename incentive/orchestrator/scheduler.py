@@ -4,15 +4,13 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from typing import Any, Callable, Iterable
+from typing import Any, Callable
 
-from incentive.bucket import paths
 from incentive.bucket.storage import ObjectStore
-from incentive.core.protocol import ResourceRequirements, ValidatorVerdict
+from incentive.core.protocol import ResourceRequirements
 from incentive.validator.rewards import (
     accepted_and_penalty_units_by_hotkey_from_events,
     accepted_merge_events,
-    accepted_updates_by_receipt,
 )
 from incentive.validator.service import MinerTarget
 
@@ -88,9 +86,8 @@ def load_accounts(
     *,
     netuid: int,
     run_id: str,
-    validator_hotkeys: Iterable[str] = (),
+    validator_hotkeys=(),
 ) -> dict[str, MinerAccount]:
-    allow = {item.strip() for item in validator_hotkeys if item.strip()}
     accounts: dict[str, MinerAccount] = {}
     events = accepted_merge_events(bucket, netuid=netuid, run_id=run_id, limit=None)
     accepted_units, resource_penalties = accepted_and_penalty_units_by_hotkey_from_events(
@@ -105,31 +102,6 @@ def load_accounts(
     for hotkey, units in resource_penalties.items():
         account = accounts.setdefault(hotkey, MinerAccount(hotkey=hotkey))
         account.failed_units += max(1.0, float(units))
-    merged = accepted_updates_by_receipt(bucket, netuid=netuid, run_id=run_id)
-    prefix = bucket.uri_for_key(f"{paths.root_prefix(netuid)}/verdicts/{run_id}/")
-    for uri in bucket.list(prefix):
-        if not uri.endswith(".json"):
-            continue
-        try:
-            verdict = ValidatorVerdict.from_dict(bucket.get_json(uri))
-        except Exception:
-            continue
-        if verdict.run_id != run_id:
-            continue
-        if allow and verdict.validator_hotkey not in allow:
-            continue
-        if not verdict.verify_signature(verdict.validator_hotkey):
-            continue
-        account = accounts.setdefault(verdict.miner_hotkey, MinerAccount(hotkey=verdict.miner_hotkey))
-        account.verdicts += 1
-        if verdict.status == "fail":
-            accepted_update = merged.get(verdict.receipt_id)
-            units = (
-                max(0.0, float(accepted_update.weight))
-                if accepted_update is not None
-                else max(0.0, float(verdict.estimated_training_units))
-            )
-            account.failed_units += max(units, 1.0)
     return accounts
 
 

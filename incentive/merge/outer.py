@@ -500,6 +500,8 @@ def merge_live_learner_fragment_states(
     fragment_count: int,
     learner_fragments: list[Mapping[str, Any]],
     outer_lr: float,
+    previous_fragment_state_uri: str = "",
+    previous_fragment_state_sha256: str = "",
     outer_momentum: float = 0.9,
     outer_nesterov: bool = True,
     grant_broker: PresignedUrlBroker | None = None,
@@ -511,13 +513,20 @@ def merge_live_learner_fragment_states(
     learner_states: list[dict[str, Any]] = []
     merge_weights: list[float] = []
     accepted: list[AcceptedUpdate] = []
-    previous_state = _previous_or_base_fragment_state(
-        bucket,
-        netuid=netuid,
-        run_id=run_id,
-        fragment_id=fragment_id,
-        base_tensors=None,
-    )
+    if previous_fragment_state_uri:
+        previous_state = _load_safetensors_uri(
+            bucket,
+            str(previous_fragment_state_uri),
+            expected_sha256=str(previous_fragment_state_sha256 or "") or None,
+        )
+    else:
+        previous_state = _previous_or_base_fragment_state(
+            bucket,
+            netuid=netuid,
+            run_id=run_id,
+            fragment_id=fragment_id,
+            base_tensors=None,
+        )
     if previous_state is None:
         raise ValueError(f"previous fragment state is required for live fragment merge: fragment_id={fragment_id}")
     expected_names = sorted(previous_state)
@@ -529,6 +538,12 @@ def merge_live_learner_fragment_states(
         artifact_name=FRAGMENT_SYNC_FORMAT,
     )
     for item in learner_fragments:
+        item_previous_uri = str(item.get("previous_fragment_state_uri") or "")
+        item_previous_sha = str(item.get("previous_fragment_state_sha256") or "")
+        if previous_fragment_state_uri and item_previous_uri and item_previous_uri != str(previous_fragment_state_uri):
+            raise ValueError("learner fragment was produced against a different previous fragment state")
+        if previous_fragment_state_sha256 and item_previous_sha and item_previous_sha != str(previous_fragment_state_sha256):
+            raise ValueError("learner fragment previous state sha mismatch")
         fragment_state_uri = str(item["fragment_state_uri"])
         expected_sha = str(item.get("fragment_state_sha256") or "")
         state = _load_safetensors_uri(bucket, fragment_state_uri, expected_sha256=expected_sha or None)
@@ -558,7 +573,7 @@ def merge_live_learner_fragment_states(
                 worker_id=worker_id,
                 learner_id=learner_id,
                 job_id=str(item.get("job_id") or ""),
-                receipt_id=str(item.get("request_id") or f"live:{item.get('learner_id', '')}:{item.get('local_step', 0)}"),
+                receipt_id=f"live:{item.get('request_id') or global_step}:{learner_id}",
                 update_uri=str(item.get("fragment_state_uri") or ""),
                 update_sha256=str(item.get("fragment_state_sha256") or ""),
                 weight=weight,

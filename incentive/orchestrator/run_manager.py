@@ -30,7 +30,7 @@ from incentive.coordination.current_run import publish_current_run
 from incentive.coordination.live_control import fragment_pull_response_grants, fragment_state_get_grant
 from incentive.coordination.queue import OrchestratorQueue, scan_recent_receipt_job_ids
 from incentive.core.crypto import AssignmentEncryptor, Ed25519SealedBoxAssignmentCrypto
-from incentive.core.protocol import MinerReceipt, ResourceRequirements, TrainingJobManifest, ValidatorVerdict
+from incentive.core.protocol import LiveFragmentClaim, LiveFragmentVerdict, MinerReceipt, ResourceRequirements, TrainingJobManifest, ValidatorVerdict
 from incentive.core.runtime import (
     env_bool as _env_bool,
     env_csv as _env_csv,
@@ -98,6 +98,13 @@ def _dedupe_hotkeys(items: Iterable[str]) -> list[str]:
         seen.add(hotkey)
         out.append(hotkey)
     return out
+
+
+def _int_value(value: Any, *, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return int(default)
 
 
 def _wandb_project_from_env() -> str:
@@ -460,42 +467,26 @@ class RunManager:
                 time.sleep(self.config.poll_interval_sec)
                 continue
             if finalization.get("pending"):
-                miners = self.discover_workers()
-                eligible_miners = self._miners_with_capacity(miners)
-                if eligible_miners and finalization.get("reason") == "waiting_for_receipts":
-                    pending_round = int(finalization.get("round_id", round_id - 1))
-                    eligible_miners = self._without_round_active_assignments(
-                        round_id=pending_round,
-                        miners=eligible_miners,
-                    )
-                if eligible_miners and finalization.get("reason") == "waiting_for_receipts":
-                    jobs = self.emit_round(round_id=pending_round, miners=eligible_miners)
+                release_work = self._maybe_process_pending_checkpoint_release(queue_depth=queue_depth)
+                if release_work.get("processed") or release_work.get("reason") == "checkpoint_release_failed":
                     self._save_state(
-                        status="round_topped_up",
+                        status="checkpoint_release_processed" if release_work.get("processed") else "checkpoint_release_failed",
                         current_round=round_id,
                         emitted_rounds=emitted_rounds,
-                        queue_depth=self.queue.depth(),
-                        job_ids=[job.manifest.job_id for job in jobs],
-                        miners=[target.hotkey for target in eligible_miners],
+                        queue_depth=queue_depth,
                         reconcile=reconcile,
                         validation_jobs=validation_jobs,
                         live_sync=live_sync,
                         finalization=finalization,
-                        data_catalog=self._catalog_state(),
+                        checkpoint_release=release_work,
+                        latest_checkpoint_manifest_uri=self.checkpoint_manifest_uri,
+                        latest_global_step=self.checkpoint.global_step,
                     )
-                    self._emit_event(
-                        {
-                            "event": "round_topped_up",
-                            "run_id": self.config.run_id,
-                            "round_id": pending_round,
-                            "jobs": len(jobs),
-                            "miners": [target.hotkey for target in eligible_miners],
-                            "queue_depth": self.queue.depth(),
-                            "train_sources": summarize_shards(self.shards),
-                        }
-                    )
+                    self._emit_event({"event": "checkpoint_release", "run_id": self.config.run_id, **release_work})
                     time.sleep(self.config.poll_interval_sec)
                     continue
+                miners = self.discover_workers()
+                eligible_miners = self._miners_with_capacity(miners)
                 if (
                     finalization.get("reason") == "waiting_for_receipts"
                     and bool(finalization.get("all_jobs_terminal_without_receipts"))
@@ -536,6 +527,7 @@ class RunManager:
                         validation_jobs=validation_jobs,
                         live_sync=live_sync,
                         finalization=finalization,
+                        pending_round_assignment_policy="current_round_only",
                         data_catalog=self._catalog_state(),
                     )
                     self._emit_event(
@@ -548,6 +540,7 @@ class RunManager:
                             "queue_depth": self.queue.depth(),
                             "pending_round_id": finalization.get("round_id"),
                             "pending_reason": finalization.get("reason"),
+                            "pending_round_assignment_policy": "current_round_only",
                             "train_sources": summarize_shards(self.shards),
                         }
                     )
@@ -574,6 +567,25 @@ class RunManager:
 
             miners = self.discover_workers()
             eligible_miners = self._miners_with_capacity(miners)
+            release_work = self._maybe_process_pending_checkpoint_release(queue_depth=queue_depth)
+            if release_work.get("processed") or release_work.get("reason") == "checkpoint_release_failed":
+                self._save_state(
+                    status="checkpoint_release_processed" if release_work.get("processed") else "checkpoint_release_failed",
+                    current_round=round_id,
+                    emitted_rounds=emitted_rounds,
+                    queue_depth=queue_depth,
+                    miners=[target.hotkey for target in miners],
+                    reconcile=reconcile,
+                    validation_jobs=validation_jobs,
+                    live_sync=live_sync,
+                    finalization=finalization,
+                    checkpoint_release=release_work,
+                    latest_checkpoint_manifest_uri=self.checkpoint_manifest_uri,
+                    latest_global_step=self.checkpoint.global_step,
+                )
+                self._emit_event({"event": "checkpoint_release", "run_id": self.config.run_id, **release_work})
+                time.sleep(self.config.poll_interval_sec)
+                continue
             if eligible_miners and (not self.config.max_rounds or emitted_rounds < self.config.max_rounds):
                 jobs = self.emit_round(round_id=round_id, miners=eligible_miners)
                 emitted_rounds += 1
@@ -1655,6 +1667,11 @@ class RunManager:
         state = self._load_state()
         timing = self._update_live_sync_timing_metrics(state, progresses)
         requests = self._live_sync_requests_from_state(state)
+        request_attempts = {
+            str(step): max(0, int(attempt))
+            for step, attempt in dict(state.get("live_sync_request_attempts") or {}).items()
+            if str(step)
+        }
         metadata_by_learner = {item.learner_id: item for item in progresses}
         merged: list[dict[str, Any]] = []
         pending: list[dict[str, Any]] = []
@@ -1685,7 +1702,9 @@ class RunManager:
                     )
                 else:
                     failed.append(result)
-                    retry_steps.append(int(result.get("global_step") or 0))
+                    retry_step = int(result.get("global_step") or 0)
+                    retry_steps.append(retry_step)
+                    request_attempts[str(retry_step)] = max(0, int(request_attempts.get(str(retry_step), 0) or 0)) + 1
                 continue
             if status == "failed":
                 failed.append(result)
@@ -1730,6 +1749,7 @@ class RunManager:
                 active_requests=requests,
                 next_request_step=next_request_step,
                 max_merged_step=max_merged_step,
+                request_attempts=request_attempts,
             )
             if created.get("status") != "requested":
                 blocked = created
@@ -1738,6 +1758,15 @@ class RunManager:
             requests[str(request["request_id"])] = request
             requested.append(created)
             next_request_step += 1
+
+        live_attempts_next: dict[str, int] = {}
+        for step, attempt in request_attempts.items():
+            try:
+                if int(step) >= int(max_merged_step):
+                    live_attempts_next[str(step)] = max(0, int(attempt))
+            except (TypeError, ValueError):
+                continue
+        request_attempts = live_attempts_next
 
         reason = "live_sync_active"
         if merged:
@@ -1792,6 +1821,7 @@ class RunManager:
 
         self._save_state(
             live_sync_requests=requests,
+            live_sync_request_attempts=request_attempts,
             live_sync_next_request_step=next_request_step,
             live_sync_global_step=max_merged_step,
             live_sync_timing=timing,
@@ -1858,6 +1888,7 @@ class RunManager:
         active_requests: dict[str, dict[str, Any]] | None = None,
         next_request_step: int | None = None,
         max_merged_step: int | None = None,
+        request_attempts: dict[str, int] | None = None,
     ) -> dict[str, Any]:
         fragment_id = int(global_step) % max(1, int(fragment_count))
         candidates = [
@@ -1874,7 +1905,10 @@ class RunManager:
                 "learner_metadata_count": len(candidates),
                 "quorum": quorum,
             }
+        attempt = max(0, int(dict(request_attempts or {}).get(str(int(global_step)), 0) or 0))
         request_id = f"sync-step-{int(global_step)}-fragment-{fragment_id}"
+        if attempt > 0:
+            request_id = f"{request_id}-retry-{attempt}"
         targets: dict[str, int] = {}
         already_answered: set[str] = set()
         for item in candidates:
@@ -1934,6 +1968,17 @@ class RunManager:
                 "quorum": quorum,
                 "error": f"{type(exc).__name__}: {exc}",
             }
+        previous_fragment_state_uri = str(initial_state.get("fragment_state_uri") or "")
+        previous_fragment_state_sha256 = str(initial_state.get("fragment_state_sha256") or "")
+        if not previous_fragment_state_uri or not previous_fragment_state_sha256:
+            return {
+                "status": "blocked",
+                "reason": "initial_fragment_state_missing_uri_or_sha",
+                "fragment_id": fragment_id,
+                "global_step": int(global_step),
+                "learner_metadata_count": len(candidates),
+                "quorum": quorum,
+            }
 
         vector_clock = VectorClock({"syncer": int(global_step)}).to_dict()
         broker = self._live_grant_broker()
@@ -1949,6 +1994,7 @@ class RunManager:
                 learner_id=item.learner_id,
                 fragment_id=fragment_id,
                 local_step=target_step,
+                request_id=request_id,
                 expires_in=self.config.grant_ttl_sec,
             )
             request_fragment_pull(
@@ -1963,6 +2009,8 @@ class RunManager:
                 round_id=round_id,
                 request_id=request_id,
                 response_grants=response_grants,
+                previous_fragment_state_uri=previous_fragment_state_uri,
+                previous_fragment_state_sha256=previous_fragment_state_sha256,
             )
 
         request = {
@@ -1974,6 +2022,8 @@ class RunManager:
             "fragment_count": int(fragment_count),
             "round_id": int(round_id),
             "quorum": int(quorum),
+            "previous_fragment_state_uri": previous_fragment_state_uri,
+            "previous_fragment_state_sha256": previous_fragment_state_sha256,
             "vector_clock": vector_clock,
         }
         self._append_syncer_event(
@@ -1986,6 +2036,8 @@ class RunManager:
                 "round_id": int(round_id),
                 "targets": targets,
                 "quorum": int(quorum),
+                "previous_fragment_state_uri": previous_fragment_state_uri,
+                "previous_fragment_state_sha256": previous_fragment_state_sha256,
             },
             vector_clock,
         )
@@ -2062,7 +2114,11 @@ class RunManager:
 
         ready, too_old = self._ready_live_fragment_responses(
             request_id=request_id,
+            global_step=global_step,
             fragment_id=fragment_id,
+            fragment_count=fragment_count,
+            previous_fragment_state_uri=str(request.get("previous_fragment_state_uri") or ""),
+            previous_fragment_state_sha256=str(request.get("previous_fragment_state_sha256") or ""),
             active_targets=active_targets,
             metadata_by_learner=metadata_by_learner,
         )
@@ -2096,12 +2152,51 @@ class RunManager:
                 "request": request,
             }
 
+        accepted, pending_verdicts, failed_verdicts = self._accepted_live_fragment_responses(
+            ready,
+            validators=self._merge_validator_hotkeys(),
+            verdict_quorum=self._merge_verdict_quorum(self._merge_validator_hotkeys()),
+        )
+        if len(accepted) < quorum:
+            if request_age >= request_ttl:
+                return {
+                    "status": "expired",
+                    "reason": "live_fragment_request_expired_waiting_for_verdicts",
+                    "request_id": request_id,
+                    "fragment_id": fragment_id,
+                    "global_step": global_step,
+                    "request_age_sec": request_age,
+                    "request_ttl_sec": request_ttl,
+                    "ready_responses": len(ready),
+                    "accepted_live_verdicts": len(accepted),
+                    "pending_live_verdicts": pending_verdicts,
+                    "failed_live_verdicts": failed_verdicts,
+                    "target_learners": len(active_targets),
+                    "quorum": quorum,
+                    "dropped_targets": request.get("dropped_targets", []),
+                }
+            return {
+                "status": "pending",
+                "reason": "waiting_for_live_fragment_verdict_quorum",
+                "request_id": request_id,
+                "fragment_id": fragment_id,
+                "global_step": global_step,
+                "ready_responses": len(ready),
+                "accepted_live_verdicts": len(accepted),
+                "pending_live_verdicts": pending_verdicts,
+                "failed_live_verdicts": failed_verdicts,
+                "target_learners": len(active_targets),
+                "quorum": quorum,
+                "dropped_targets": request.get("dropped_targets", []),
+                "request": request,
+            }
+
         if "quorum_unix" not in request:
             request["quorum_unix"] = now
             request["xi_quorum_sec"] = max(0.0, now - float(request.get("requested_unix") or now))
             timing.update(self._record_live_sync_timing_sample(timing, "xi_quorum_sec", float(request["xi_quorum_sec"])))
         adaptive = self._live_sync_grace_window(request=request, timing=timing, now=now)
-        if len(ready) < len(active_targets) and not adaptive["grace_elapsed"]:
+        if len(accepted) < len(active_targets) and not adaptive["grace_elapsed"]:
             return {
                 "status": "pending",
                 "reason": "live_adaptive_grace_window",
@@ -2109,6 +2204,7 @@ class RunManager:
                 "fragment_id": fragment_id,
                 "global_step": global_step,
                 "ready_responses": len(ready),
+                "accepted_live_verdicts": len(accepted),
                 "target_learners": len(active_targets),
                 "quorum": quorum,
                 "too_old": too_old,
@@ -2126,8 +2222,10 @@ class RunManager:
                 global_step=global_step,
                 fragment_id=fragment_id,
                 fragment_count=fragment_count,
-                learner_fragments=ready,
+                learner_fragments=accepted,
                 outer_lr=float(self.config.merge_outer_lr),
+                previous_fragment_state_uri=str(request.get("previous_fragment_state_uri") or ""),
+                previous_fragment_state_sha256=str(request.get("previous_fragment_state_sha256") or ""),
                 grant_broker=self._live_grant_broker(),
                 grant_ttl_sec=self.config.grant_ttl_sec,
             )
@@ -2154,11 +2252,17 @@ class RunManager:
             "global_step": global_step,
             "next_global_step": next_global_step,
             "accepted_updates": len(getattr(manifest, "accepted_updates", []) or []),
+            "ready_responses": len(ready),
+            "accepted_live_verdicts": len(accepted),
             "fragment_state_uri": getattr(manifest, "fragment_state_uri", ""),
             "fragment_state_sha256": getattr(manifest, "fragment_state_sha256", ""),
             "sync_duration_sec": sync_duration,
             "adaptive_sync": adaptive,
         }
+        release_queued = self._maybe_queue_live_checkpoint_release(manifest)
+        if release_queued is not None:
+            result["checkpoint_release_pending"] = True
+            result["checkpoint_release"] = release_queued
         self._append_syncer_event("live_fragment_merged", result, request.get("vector_clock") or {"syncer": global_step})
         return result
 
@@ -2166,7 +2270,11 @@ class RunManager:
         self,
         *,
         request_id: str,
+        global_step: int,
         fragment_id: int,
+        fragment_count: int,
+        previous_fragment_state_uri: str,
+        previous_fragment_state_sha256: str,
         active_targets: dict[str, int],
         metadata_by_learner: dict[str, Any],
     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
@@ -2182,19 +2290,46 @@ class RunManager:
                 latest = dict(self.bucket.get_json(latest_uri))
             except Exception:
                 continue
-            if str(latest.get("request_id") or "") != request_id:
+            try:
+                claim = LiveFragmentClaim.from_dict(latest)
+            except Exception:
                 continue
-            local_step = int(latest.get("local_step") or 0)
-            target_step = int(latest.get("target_local_step") or frozen_target_step)
+            if not claim.verify_signature(claim.miner_hotkey, allow_dev_hmac=False):
+                continue
+            if claim.run_id != self.config.run_id or str(claim.request_id) != request_id:
+                continue
+            if str(claim.learner_id) != learner_id:
+                continue
+            if int(claim.fragment_id) != int(fragment_id):
+                continue
+            if int(claim.fragment_count) != int(fragment_count):
+                continue
+            if int(claim.global_step) != int(global_step):
+                continue
+            if str(claim.previous_fragment_state_uri or "") != str(previous_fragment_state_uri or ""):
+                continue
+            if str(claim.previous_fragment_state_sha256 or "") != str(previous_fragment_state_sha256 or ""):
+                continue
+            local_step = int(claim.local_step)
+            target_step = int(claim.target_local_step or frozen_target_step)
             if local_step < target_step:
                 too_old.append({"learner_id": learner_id, "local_step": local_step, "target_local_step": target_step})
                 continue
+            claim_uri = self.bucket.uri_for_key(
+                paths.learner_fragment_request_manifest_key(
+                    self.config.netuid,
+                    self.config.run_id,
+                    learner_id,
+                    fragment_id,
+                    request_id,
+                )
+            )
             metadata = metadata_by_learner.get(learner_id)
             counters = None
-            if isinstance(latest.get("counters"), dict):
+            if isinstance(claim.counters, dict):
                 counters = FragmentCounters.from_dict(
-                    latest.get("counters"),
-                    fragment_count=int(latest.get("fragment_count") or getattr(metadata, "fragment_count", fragment_id + 1)),
+                    claim.counters,
+                    fragment_count=int(claim.fragment_count or getattr(metadata, "fragment_count", fragment_id + 1)),
                 )
             elif metadata is not None:
                 counters = metadata.counters
@@ -2203,23 +2338,29 @@ class RunManager:
                 local_steps = int(counters.steps[fragment_id])
                 weight = counters.weight(fragment_id)
             else:
-                trained_tokens = int(latest.get("trained_tokens") or latest.get("tokens") or 0)
-                local_steps = int(latest.get("local_steps") or latest.get("steps") or 0)
+                trained_tokens = int(claim.trained_tokens or 0)
+                local_steps = int(claim.local_steps or 0)
                 weight = float(trained_tokens) * (float(trained_tokens) / float(max(1, local_steps))) if trained_tokens > 0 else 0.0
             if weight <= 0.0:
                 continue
-            hotkey = learner_id.split(":", 1)[0] if ":" in learner_id else learner_id
-            worker_id = learner_id.split(":", 1)[1] if ":" in learner_id else ""
             ready.append(
                 {
                     "learner_id": learner_id,
-                    "hotkey": hotkey,
-                    "worker_id": worker_id,
+                    "hotkey": claim.miner_hotkey,
+                    "worker_id": claim.worker_id,
+                    "job_id": claim.job_id,
                     "request_id": request_id,
+                    "global_step": int(claim.global_step),
+                    "fragment_id": int(claim.fragment_id),
+                    "fragment_count": int(claim.fragment_count),
                     "local_step": local_step,
-                    "fragment_state_uri": str(latest.get("fragment_state_uri") or ""),
-                    "fragment_state_sha256": str(latest.get("fragment_state_sha256") or ""),
-                    "manifest_uri": str(latest.get("manifest_uri") or ""),
+                    "fragment_state_uri": str(claim.fragment_state_uri or ""),
+                    "fragment_state_sha256": str(claim.fragment_state_sha256 or ""),
+                    "previous_fragment_state_uri": str(claim.previous_fragment_state_uri or ""),
+                    "previous_fragment_state_sha256": str(claim.previous_fragment_state_sha256 or ""),
+                    "claim_uri": claim_uri,
+                    "claim_digest": claim.digest(),
+                    "latest_claim_uri": latest_uri,
                     "weight": weight,
                     "trained_tokens": trained_tokens,
                     "local_steps": local_steps,
@@ -2227,6 +2368,93 @@ class RunManager:
                 }
             )
         return ready, too_old
+
+    def _accepted_live_fragment_responses(
+        self,
+        ready: list[dict[str, Any]],
+        *,
+        validators: list[str],
+        verdict_quorum: int,
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+        accepted: list[dict[str, Any]] = []
+        pending: list[dict[str, Any]] = []
+        failed: list[dict[str, Any]] = []
+        quorum = max(1, int(verdict_quorum))
+        for item in ready:
+            learner_id = str(item.get("learner_id") or "")
+            request_id = str(item.get("request_id") or "")
+            miner_hotkey = str(item.get("hotkey") or "")
+            fragment_id = _int_value(item.get("fragment_id"), default=-1)
+            fragment_count = _int_value(item.get("fragment_count"), default=0)
+            global_step = _int_value(item.get("global_step"), default=0)
+            claim_uri = str(item.get("claim_uri") or "")
+            claim_digest = str(item.get("claim_digest") or "")
+            fragment_state_uri = str(item.get("fragment_state_uri") or "")
+            fragment_state_sha256 = str(item.get("fragment_state_sha256") or "")
+            previous_fragment_state_uri = str(item.get("previous_fragment_state_uri") or "")
+            previous_fragment_state_sha256 = str(item.get("previous_fragment_state_sha256") or "")
+            passing: list[LiveFragmentVerdict] = []
+            failing: list[LiveFragmentVerdict] = []
+            seen = 0
+            for validator_hotkey in validators:
+                uri = self.bucket.uri_for_key(
+                    paths.live_fragment_verdict_key(
+                        self.config.netuid,
+                        self.config.run_id,
+                        validator_hotkey,
+                        request_id,
+                        learner_id,
+                    )
+                )
+                try:
+                    verdict = LiveFragmentVerdict.from_dict(self.bucket.get_json(uri))
+                except Exception:
+                    continue
+                if (
+                    verdict.run_id != self.config.run_id
+                    or verdict.request_id != request_id
+                    or verdict.learner_id != learner_id
+                    or verdict.miner_hotkey != miner_hotkey
+                    or int(verdict.fragment_id) != fragment_id
+                    or int(verdict.fragment_count) != fragment_count
+                    or int(verdict.global_step) != global_step
+                    or verdict.validator_hotkey != validator_hotkey
+                    or verdict.claim_uri != claim_uri
+                    or verdict.claim_digest != claim_digest
+                    or verdict.fragment_state_uri != fragment_state_uri
+                    or verdict.fragment_state_sha256 != fragment_state_sha256
+                    or verdict.previous_fragment_state_uri != previous_fragment_state_uri
+                    or verdict.previous_fragment_state_sha256 != previous_fragment_state_sha256
+                    or not verdict.verify_signature(validator_hotkey, allow_dev_hmac=False)
+                ):
+                    continue
+                seen += 1
+                if verdict.status == "pass":
+                    passing.append(verdict)
+                elif verdict.status == "fail":
+                    failing.append(verdict)
+            if self.config.merge_fail_veto and failing:
+                failed.append({"learner_id": learner_id, "request_id": request_id, "fail_count": len(failing)})
+                continue
+            if len(passing) < quorum:
+                pending.append(
+                    {
+                        "learner_id": learner_id,
+                        "request_id": request_id,
+                        "seen_verdicts": seen,
+                        "pass_count": len(passing),
+                        "fail_count": len(failing),
+                        "quorum": quorum,
+                    }
+                )
+                continue
+            merged = dict(item)
+            merged["weight"] = sum(float(verdict.accepted_weight or 0.0) for verdict in passing) / float(len(passing))
+            merged["trained_tokens"] = max(int(verdict.trained_tokens or 0) for verdict in passing)
+            merged["local_steps"] = max(int(verdict.local_steps or 0) for verdict in passing)
+            merged["live_verdicts"] = [verdict.to_dict() for verdict in passing]
+            accepted.append(merged)
+        return accepted, pending, failed
 
     def _update_live_sync_timing_metrics(self, state: dict[str, Any], progresses: list[Any]) -> dict[str, Any]:
         timing = dict(state.get("live_sync_timing") or {})
@@ -2854,52 +3082,18 @@ class RunManager:
         return total
 
     def _finalize_round(self, *, round_id: int) -> dict[str, Any]:
-        merge_uri = self.bucket.uri_for_key(paths.merge_manifest_key(self.config.netuid, self.config.run_id, round_id))
         try:
-            if self.bucket.exists(merge_uri):
-                from incentive.merge.outer import RoundMergeManifest
-
-                merge_manifest = RoundMergeManifest.from_dict(self.bucket.get_json(merge_uri))
-                if self._round_merge_is_stale(merge_manifest, round_id=round_id):
-                    merge_manifest = self._merge_ready_round(round_id=round_id, rebuild_current_round=True)
-                    merge_created = True
-                    merge_rebuilt = True
-                else:
-                    merge_created = False
-                    merge_rebuilt = False
-            else:
-                merge_manifest = self._merge_ready_round(round_id=round_id)
-                merge_created = True
-                merge_rebuilt = False
+            accepted_receipts = sorted(self._round_accepted_receipt_ids(round_id))
             removed_queue_jobs = self._remove_round_queue_entries(round_id)
             self._save_state(
-                status="merge_written",
+                status="round_receipt_telemetry_finalized",
                 current_round=max(int(self._load_state().get("current_round", round_id + 1)), int(round_id) + 1),
-                merge_phase={
+                receipt_telemetry_phase={
                     "round_id": int(round_id),
-                    "merge_manifest_uri": merge_uri,
-                    "accepted_updates": len(getattr(merge_manifest, "accepted_updates", []) or []),
+                    "accepted_receipts": len(accepted_receipts),
                     "removed_superseded_queue_jobs": removed_queue_jobs,
-                    "checkpoint_release_due": self._should_release_round_checkpoint(round_id),
-                    "merge_rebuilt": merge_rebuilt,
                 },
             )
-            release_queued = (
-                self._queue_checkpoint_release(merge_manifest) if self._should_release_round_checkpoint(round_id) else None
-            )
-        except ValueError as exc:
-            if "no passing verdicts" in str(exc):
-                return self._mark_round_finalized(
-                    round_id=round_id,
-                    status="skipped_no_accepted_updates",
-                    reason=str(exc),
-                )
-            return {
-                "enabled": True,
-                "pending": True,
-                "round_id": int(round_id),
-                "reason": f"{type(exc).__name__}: {exc}",
-            }
         except Exception as exc:
             return {
                 "enabled": True,
@@ -2913,16 +3107,12 @@ class RunManager:
             "pending": False,
             "finalized": True,
             "round_id": int(round_id),
-            "merge_created": merge_created,
-            "merge_rebuilt": merge_rebuilt,
-            "accepted_updates": len(getattr(merge_manifest, "accepted_updates", []) or []),
-            "merge_manifest_uri": merge_uri,
+            "status": "receipt_telemetry",
+            "accepted_receipts": len(accepted_receipts),
+            "accepted_updates": 0,
             "removed_superseded_queue_jobs": removed_queue_jobs,
         }
-        if release_queued is not None:
-            out["checkpoint_release_pending"] = True
-            out["checkpoint_release"] = release_queued
-        self._write_round_finalization(status="merged", round_id=round_id, payload=out)
+        self._write_round_finalization(status="receipt_telemetry", round_id=round_id, payload=out)
         self._clear_round_merge_cutoff(round_id)
         return out
 
@@ -3035,7 +3225,7 @@ class RunManager:
             rebuild_current_round=rebuild_current_round,
         )
 
-    def _queue_checkpoint_release(self, merge_manifest: Any) -> dict[str, Any]:
+    def _queue_checkpoint_release(self, merge_manifest: Any, *, key: str | None = None, source: str = "round") -> dict[str, Any]:
         state = self._load_state()
         requests = {
             str(key): dict(value)
@@ -3043,20 +3233,79 @@ class RunManager:
             if isinstance(value, dict)
         }
         round_id = int(merge_manifest.round_id)
-        key = str(round_id)
-        existing = dict(requests.get(key) or {})
+        request_key = key or str(round_id)
+        existing = dict(requests.get(request_key) or {})
         if existing.get("status") in {"pending", "running", "done"}:
             return existing
         request = {
             "round_id": round_id,
             "status": "pending",
+            "source": source,
             "requested_unix": time.time(),
             "merge_manifest_uri": getattr(merge_manifest, "manifest_uri", None)
             or self.bucket.uri_for_key(paths.merge_manifest_key(self.config.netuid, self.config.run_id, round_id)),
             "next_global_step": int(getattr(merge_manifest, "next_global_step", self.checkpoint.global_step + 1) or 0),
         }
-        requests[key] = request
+        requests[request_key] = request
         self._save_state(checkpoint_release_requests=requests)
+        return request
+
+    def _maybe_queue_live_checkpoint_release(self, merge_manifest: Any) -> dict[str, Any] | None:
+        if not self.config.auto_release_checkpoints:
+            return None
+        fragment_count = max(1, int(getattr(merge_manifest, "fragment_count", None) or self.config.fragment_count))
+        state = self._load_state()
+        last_release_step = int(state.get("last_live_checkpoint_release_step", self.checkpoint.global_step) or 0)
+        requests = {
+            str(key): dict(value)
+            for key, value in dict(state.get("checkpoint_release_requests") or {}).items()
+            if isinstance(value, dict)
+        }
+        for request in requests.values():
+            if str(request.get("source") or "") != "live_sync":
+                continue
+            if str(request.get("status") or "pending") not in {"pending", "running"}:
+                continue
+            if int(request.get("next_global_step") or 0) > last_release_step:
+                return None
+        from incentive.validator.rewards import accepted_merge_events
+
+        covered: set[int] = set()
+        for event in accepted_merge_events(self.bucket, netuid=self.config.netuid, run_id=self.config.run_id, limit=None):
+            if event.global_step is None or event.fragment_id is None:
+                continue
+            if int(event.global_step) <= last_release_step:
+                continue
+            if not event.accepted_updates:
+                continue
+            covered.add(int(event.fragment_id) % fragment_count)
+        if len(covered) < fragment_count:
+            return None
+        next_step = int(getattr(merge_manifest, "next_global_step", 0) or 0)
+        if next_step < last_release_step + fragment_count:
+            return None
+        request = self._queue_checkpoint_release(
+            merge_manifest,
+            key=f"live-step-{next_step}",
+            source="live_sync",
+        )
+        request["covered_fragments"] = sorted(covered)
+        request["fragment_count"] = fragment_count
+        release_state = self._load_state()
+        requests = {
+            str(key): dict(value)
+            for key, value in dict(release_state.get("checkpoint_release_requests") or {}).items()
+            if isinstance(value, dict)
+        }
+        request_key = f"live-step-{next_step}"
+        if request_key in requests:
+            requests[request_key].update(
+                {
+                    "covered_fragments": sorted(covered),
+                    "fragment_count": fragment_count,
+                }
+            )
+            self._save_state(checkpoint_release_requests=requests)
         return request
 
     def _maybe_process_pending_checkpoint_release(self, *, queue_depth: int) -> dict[str, Any]:
@@ -3068,6 +3317,28 @@ class RunManager:
             for key, value in dict(state.get("checkpoint_release_requests") or {}).items()
             if isinstance(value, dict)
         }
+        last_live_release_step = int(state.get("last_live_checkpoint_release_step", self.checkpoint.global_step) or 0)
+        superseded = False
+        for key, request in list(requests.items()):
+            if str(request.get("source") or "") != "live_sync":
+                continue
+            if str(request.get("status") or "pending") not in {"pending", "running"}:
+                continue
+            fragment_count = max(1, int(request.get("fragment_count") or self.config.fragment_count))
+            next_step = int(request.get("next_global_step") or 0)
+            if next_step < last_live_release_step + fragment_count:
+                request.update(
+                    {
+                        "status": "superseded",
+                        "finished_unix": time.time(),
+                        "reason": "live_checkpoint_release_cycle_already_covered",
+                        "last_live_checkpoint_release_step": last_live_release_step,
+                    }
+                )
+                requests[key] = request
+                superseded = True
+        if superseded:
+            self._save_state(checkpoint_release_requests=requests)
         pending = [
             (int(request.get("round_id") or key), key, request)
             for key, request in requests.items()
@@ -3134,7 +3405,10 @@ class RunManager:
             }
         )
         requests[key] = request
-        self._save_state(checkpoint_release_requests=requests)
+        state_update: dict[str, Any] = {"checkpoint_release_requests": requests}
+        if checkpoint_uri and str(request.get("source") or "") == "live_sync" and global_step is not None:
+            state_update["last_live_checkpoint_release_step"] = int(global_step)
+        self._save_state(**state_update)
         finalization_uri = self.bucket.uri_for_key(paths.round_finalization_key(self.config.netuid, self.config.run_id, round_id))
         if checkpoint_uri and self.bucket.exists(finalization_uri):
             finalization = dict(self.bucket.get_json(finalization_uri))

@@ -24,6 +24,8 @@ from incentive.coordination.queue import OrchestratorQueue, QueueEntry, QueueSta
 from incentive.core.protocol import (
     ArtifactRef,
     AssignmentGrant,
+    LiveFragmentClaim,
+    LiveFragmentVerdict,
     MinerReceipt,
     ResourceRequirements,
     TrainingJobManifest,
@@ -357,7 +359,7 @@ class ValidationJobManager:
             verdict.run_id == receipt.run_id
             and verdict.receipt_id == receipt.receipt_id
             and verdict.validator_hotkey == validator_hotkey
-            and verdict.verify_signature(validator_hotkey, allow_dev_hmac=False)
+            and verdict.verify_signature(validator_hotkey, allow_dev_hmac=self.config.allow_dev_signatures)
         )
 
     def find_manifest(self, receipt: MinerReceipt) -> TrainingJobManifest:
@@ -379,6 +381,7 @@ class ValidationWorkerConfig:
     worker_id: str
     owner_identity: str
     independent_quasar_eval: Any | None = None
+    allow_dev_signatures: bool = False
 
 
 class _GrantedValidationStore:
@@ -460,6 +463,11 @@ class ValidationJobWorker:
 
     def run_once(self, *, max_jobs: int | None = None) -> list[dict[str, Any]]:
         self.heartbeat()
+        checked: list[dict[str, Any]] = []
+        checked.extend(self.verify_live_fragment_claims(max_claims=max_jobs))
+        remaining = None if max_jobs is None else max(0, int(max_jobs) - len(checked))
+        if remaining == 0:
+            return checked
         state = read_queue(
             self.bucket,
             netuid=self.config.netuid,
@@ -473,11 +481,10 @@ class ValidationJobWorker:
             self._queue_etag = state.etag
             self._queue_state = state
         if state is None:
-            return []
+            return checked
 
-        checked: list[dict[str, Any]] = []
         for entry in state.filter_for_worker(hotkey=self.config.validator_hotkey, worker_id=self.config.worker_id):
-            if max_jobs is not None and len(checked) >= max_jobs:
+            if remaining is not None and len(checked) >= max_jobs:
                 break
             try:
                 _log_validation_job_event("start", job_id=entry.job_id, validator_hotkey=self.config.validator_hotkey)
@@ -489,7 +496,7 @@ class ValidationJobWorker:
                     raise ValueError("validation job assigned to a different hotkey")
                 if not manifest.verify_signature(
                     self.config.owner_identity,
-                    allow_dev_hmac=False,
+                    allow_dev_hmac=self.config.allow_dev_signatures,
                 ):
                     raise ValueError("validation job owner signature failed")
                 receipt_uri = str(manifest.task_params["receipt_uri"])
@@ -520,6 +527,7 @@ class ValidationJobWorker:
                         validator_hotkey=self.config.validator_hotkey,
                         independent_quasar_eval=self.config.independent_quasar_eval,
                         owner_identity=self.config.owner_identity,
+                        allow_dev_signatures=self.config.allow_dev_signatures,
                     ),
                 )
                 _log_validation_job_event("verifier_start", job_id=entry.job_id, receipt_uri=receipt_uri)
@@ -535,6 +543,90 @@ class ValidationJobWorker:
             except Exception as exc:
                 _log_validation_job_event("error", job_id=entry.job_id, error_type=type(exc).__name__, error=str(exc))
                 checked.append({"job_id": entry.job_id, "error": f"{type(exc).__name__}: {exc}"})
+        return checked
+
+    def verify_live_fragment_claims(self, *, max_claims: int | None = None) -> list[dict[str, Any]]:
+        checked: list[dict[str, Any]] = []
+        prefix = self.bucket.uri_for_key(f"{paths.mesh_root(self.config.netuid, self.config.run_id)}/learner_fragments/")
+        verifier = ValidatorVerifier(
+            bucket=self.bucket,
+            signer=self.signer,
+            config=ValidatorVerifierConfig(
+                netuid=self.config.netuid,
+                run_id=self.config.run_id,
+                validator_hotkey=self.config.validator_hotkey,
+                independent_quasar_eval=self.config.independent_quasar_eval,
+                owner_identity=self.config.owner_identity,
+                allow_dev_signatures=self.config.allow_dev_signatures,
+            ),
+        )
+        for uri in sorted(self.bucket.list(prefix)):
+            if max_claims is not None and len(checked) >= max_claims:
+                break
+            if not uri.endswith("/manifest.json"):
+                continue
+            try:
+                claim = LiveFragmentClaim.from_dict(self.bucket.get_json(uri))
+            except Exception:
+                continue
+            if claim.run_id != self.config.run_id:
+                continue
+            verdict_uri = self.bucket.uri_for_key(
+                paths.live_fragment_verdict_key(
+                    self.config.netuid,
+                    claim.run_id,
+                    self.config.validator_hotkey,
+                    claim.request_id,
+                    claim.learner_id,
+                )
+            )
+            try:
+                verdict = LiveFragmentVerdict.from_dict(self.bucket.get_json(verdict_uri))
+                if (
+                    verdict.run_id == claim.run_id
+                    and verdict.request_id == claim.request_id
+                    and verdict.learner_id == claim.learner_id
+                    and verdict.miner_hotkey == claim.miner_hotkey
+                    and int(verdict.fragment_id) == int(claim.fragment_id)
+                    and int(verdict.fragment_count) == int(claim.fragment_count)
+                    and int(verdict.global_step) == int(claim.global_step)
+                    and verdict.claim_uri == uri
+                    and verdict.claim_digest == claim.digest()
+                    and verdict.fragment_state_uri == claim.fragment_state_uri
+                    and verdict.fragment_state_sha256 == claim.fragment_state_sha256
+                    and verdict.previous_fragment_state_uri == claim.previous_fragment_state_uri
+                    and verdict.previous_fragment_state_sha256 == claim.previous_fragment_state_sha256
+                    and verdict.validator_hotkey == self.config.validator_hotkey
+                    and verdict.verify_signature(self.config.validator_hotkey, allow_dev_hmac=self.config.allow_dev_signatures)
+                ):
+                    continue
+            except Exception:
+                pass
+            try:
+                _log_validation_job_event(
+                    "live_fragment_start",
+                    request_id=claim.request_id,
+                    learner_id=claim.learner_id,
+                    fragment_id=claim.fragment_id,
+                )
+                result = verifier.verify_live_fragment_claim_uri(uri)
+                _log_validation_job_event(
+                    "live_fragment_verdict_written",
+                    request_id=claim.request_id,
+                    learner_id=claim.learner_id,
+                    status=result.verdict.status,
+                    verdict_uri=result.verdict_uri,
+                )
+                checked.append({"live_fragment_claim_uri": uri, "verdict": result.verdict.to_dict()})
+            except Exception as exc:
+                _log_validation_job_event(
+                    "live_fragment_error",
+                    request_id=claim.request_id,
+                    learner_id=claim.learner_id,
+                    error_type=type(exc).__name__,
+                    error=str(exc),
+                )
+                checked.append({"live_fragment_claim_uri": uri, "error": f"{type(exc).__name__}: {exc}"})
         return checked
 
     def _drop_cached_entry(self, job_id: str) -> None:
@@ -557,7 +649,7 @@ class ValidationJobWorker:
             verdict.run_id == manifest.run_id
             and verdict.receipt_id == receipt_id
             and verdict.validator_hotkey == self.config.validator_hotkey
-            and verdict.verify_signature(self.config.validator_hotkey, allow_dev_hmac=False)
+            and verdict.verify_signature(self.config.validator_hotkey, allow_dev_hmac=self.config.allow_dev_signatures)
         ):
             return uri
         return ""

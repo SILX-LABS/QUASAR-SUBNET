@@ -61,23 +61,42 @@ def fragment_pull_response_grants(
     learner_id: str,
     fragment_id: int,
     local_step: int,
+    request_id: str = "",
     expires_in: int,
 ) -> dict[str, Any]:
     if broker is None:
         return {}
+    if str(request_id or "").strip():
+        state_uri = bucket.uri_for_key(
+            paths.learner_fragment_request_state_key(netuid, run_id, learner_id, fragment_id, request_id)
+        )
+        base_state_uri = bucket.uri_for_key(
+            paths.learner_fragment_request_base_state_key(netuid, run_id, learner_id, fragment_id, request_id)
+        )
+        manifest_uri = bucket.uri_for_key(
+            paths.learner_fragment_request_manifest_key(netuid, run_id, learner_id, fragment_id, request_id)
+        )
+    else:
+        state_uri = bucket.uri_for_key(paths.learner_fragment_state_key(netuid, run_id, learner_id, fragment_id, local_step))
+        base_state_uri = bucket.uri_for_key(
+            paths.learner_fragment_base_state_key(netuid, run_id, learner_id, fragment_id, local_step)
+        )
+        manifest_uri = bucket.uri_for_key(
+            paths.learner_fragment_manifest_key(netuid, run_id, learner_id, fragment_id, local_step)
+        )
     return {
         "fragment_state_put": broker.put_grant(
-            bucket.uri_for_key(paths.learner_fragment_state_key(netuid, run_id, learner_id, fragment_id, local_step)),
+            state_uri,
             expires_in=expires_in,
             multipart=True,
         ).to_dict(),
         "base_fragment_state_put": broker.put_grant(
-            bucket.uri_for_key(paths.learner_fragment_base_state_key(netuid, run_id, learner_id, fragment_id, local_step)),
+            base_state_uri,
             expires_in=expires_in,
             multipart=True,
         ).to_dict(),
         "manifest_put": broker.put_grant(
-            bucket.uri_for_key(paths.learner_fragment_manifest_key(netuid, run_id, learner_id, fragment_id, local_step)),
+            manifest_uri,
             expires_in=expires_in,
         ).to_dict(),
         "latest_put": broker.put_grant(

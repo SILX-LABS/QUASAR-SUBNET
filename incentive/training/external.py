@@ -37,7 +37,7 @@ from incentive.coordination.mesh import (
     receive_messages_for_receiver,
     record_chandy_lamport_marker,
 )
-from incentive.core.protocol import ArtifactDigest, AssignmentGrant, MinerReceipt, PresignedUrlGrant, TrainingJobManifest, WorkerIdentity
+from incentive.core.protocol import ArtifactDigest, AssignmentGrant, LiveFragmentClaim, MinerReceipt, PresignedUrlGrant, TrainingJobManifest, WorkerIdentity
 from incentive.core.runtime import env_bool, file_sha256, read_json_file, safe_extract_tar, safe_segment, write_json_atomic
 
 
@@ -72,6 +72,7 @@ class ExternalQuasarTrainingExecutor:
     def __init__(self) -> None:
         self._services: dict[tuple[str, tuple[str, ...]], subprocess.Popen] = {}
         self._live_contexts: dict[str, dict[str, Any]] = {}
+        self._fragment_response_upload_lock = threading.Lock()
 
     @staticmethod
     def _project_root() -> Path:
@@ -1149,6 +1150,8 @@ class ExternalQuasarTrainingExecutor:
         *,
         manifest: TrainingJobManifest,
         transport: GrantTransport,
+        worker: WorkerIdentity,
+        signer,
         response_dir: Path,
         last_uploaded: dict[str, tuple[int, int]] | None,
     ) -> dict[str, tuple[int, int]]:
@@ -1169,6 +1172,11 @@ class ExternalQuasarTrainingExecutor:
             try:
                 payload = json.loads(response_path.read_text(encoding="utf-8"))
             except Exception:
+                continue
+            request_id = str(payload.get("request_id") or "").strip()
+            request_upload_key = f"request:{request_id}" if request_id else ""
+            if request_upload_key and request_upload_key in uploaded:
+                uploaded[key] = signature
                 continue
             learner_id = str(payload.get("learner_id") or "").strip()
             if not learner_id:
@@ -1199,6 +1207,8 @@ class ExternalQuasarTrainingExecutor:
                 ]
                 if missing_grants or expired_grants:
                     uploaded[key] = signature
+                    if request_upload_key:
+                        uploaded[request_upload_key] = signature
                     self._log(
                         "fragment_pull_response_stale",
                         learner_id=learner_id,
@@ -1226,13 +1236,21 @@ class ExternalQuasarTrainingExecutor:
                     published.pop("base_state_path", None)
                     manifest_put = grant_payloads["manifest_put"]
                     latest_put = grant_payloads["latest_put"]
-                    published_bytes = json.dumps(published, sort_keys=True, separators=(",", ":")).encode("utf-8")
+                    signed_claim = self._signed_live_fragment_claim(
+                        manifest=manifest,
+                        worker=worker,
+                        signer=signer,
+                        payload=published,
+                    )
+                    published_bytes = json.dumps(signed_claim, sort_keys=True, separators=(",", ":")).encode("utf-8")
                     transport.put(manifest_put, published_bytes, expected_uri=manifest_put.canonical_uri)
                     transport.put(latest_put, published_bytes, expected_uri=latest_put.canonical_uri)
                 except Exception as exc:
                     if not self._is_terminal_fragment_response_upload_error(exc):
                         raise
                     uploaded[key] = signature
+                    if request_upload_key:
+                        uploaded[request_upload_key] = signature
                     self._log(
                         "fragment_pull_response_stale",
                         learner_id=learner_id,
@@ -1245,28 +1263,45 @@ class ExternalQuasarTrainingExecutor:
                     continue
             elif bucket is not None and not bool(getattr(bucket, "anonymous", False)):
                 state_uri = bucket.uri_for_key(
-                    paths.learner_fragment_state_key(netuid, manifest.run_id, learner_id, fragment_id, local_step)
+                    paths.learner_fragment_request_state_key(netuid, manifest.run_id, learner_id, fragment_id, request_id)
+                    if request_id
+                    else paths.learner_fragment_state_key(netuid, manifest.run_id, learner_id, fragment_id, local_step)
                 )
                 bucket.put_file(state_uri, str(state_path))
                 published["fragment_state_uri"] = state_uri
+                published["fragment_state_sha256"] = str(payload.get("fragment_state_sha256") or file_sha256(state_path)[0])
                 if base_state_path_raw:
                     base_state_path = Path(base_state_path_raw).expanduser()
                     if base_state_path.is_file():
                         base_state_uri = bucket.uri_for_key(
-                            paths.learner_fragment_base_state_key(netuid, manifest.run_id, learner_id, fragment_id, local_step)
+                            paths.learner_fragment_request_base_state_key(
+                                netuid, manifest.run_id, learner_id, fragment_id, request_id
+                            )
+                            if request_id
+                            else paths.learner_fragment_base_state_key(netuid, manifest.run_id, learner_id, fragment_id, local_step)
                         )
                         bucket.put_file(base_state_uri, str(base_state_path))
                         published["base_fragment_state_uri"] = base_state_uri
                     published.pop("base_state_path", None)
                 manifest_uri = bucket.uri_for_key(
-                    paths.learner_fragment_manifest_key(netuid, manifest.run_id, learner_id, fragment_id, local_step)
+                    paths.learner_fragment_request_manifest_key(netuid, manifest.run_id, learner_id, fragment_id, request_id)
+                    if request_id
+                    else paths.learner_fragment_manifest_key(netuid, manifest.run_id, learner_id, fragment_id, local_step)
                 )
                 latest_uri = bucket.uri_for_key(paths.learner_fragment_latest_key(netuid, manifest.run_id, learner_id, fragment_id))
-                bucket.put_json(manifest_uri, published)
-                bucket.put_json(latest_uri, published)
+                signed_claim = self._signed_live_fragment_claim(
+                    manifest=manifest,
+                    worker=worker,
+                    signer=signer,
+                    payload=published,
+                )
+                bucket.put_json(manifest_uri, signed_claim)
+                bucket.put_json(latest_uri, signed_claim)
             else:
                 raise ValueError("fragment pull response upload requires presigned response grants for no-creds miners")
             uploaded[key] = signature
+            if request_upload_key:
+                uploaded[request_upload_key] = signature
             self._log(
                 "fragment_pull_response_uploaded",
                 learner_id=learner_id,
@@ -1276,25 +1311,80 @@ class ExternalQuasarTrainingExecutor:
             )
         return uploaded
 
+    @staticmethod
+    def _fragment_counter_value(counters: dict[str, Any], name: str, fragment_id: int) -> int:
+        values = counters.get(name)
+        if isinstance(values, list) and 0 <= int(fragment_id) < len(values):
+            try:
+                return max(0, int(values[int(fragment_id)]))
+            except (TypeError, ValueError):
+                return 0
+        return 0
+
+    def _signed_live_fragment_claim(
+        self,
+        *,
+        manifest: TrainingJobManifest,
+        worker: WorkerIdentity,
+        signer,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        fragment_id = int(payload.get("fragment_id") or 0)
+        counters = dict(payload.get("counters") or {})
+        trained_tokens = int(payload.get("trained_tokens") or self._fragment_counter_value(counters, "tokens", fragment_id))
+        local_steps = int(payload.get("local_steps") or self._fragment_counter_value(counters, "steps", fragment_id))
+        learner_id = str(payload.get("learner_id") or f"{worker.hotkey_ss58}:{worker.worker_id}")
+        claim = LiveFragmentClaim(
+            run_id=manifest.run_id,
+            request_id=str(payload.get("request_id") or ""),
+            learner_id=learner_id,
+            miner_hotkey=worker.hotkey_ss58,
+            worker_id=worker.worker_id,
+            job_id=manifest.job_id,
+            round_id=int(payload.get("round_id") or manifest.round_id),
+            global_step=int(payload.get("global_step") or manifest.global_step),
+            fragment_id=fragment_id,
+            fragment_count=int(payload.get("fragment_count") or manifest.task_params.get("fragment_count") or 1),
+            target_local_step=int(payload.get("target_local_step") or 0),
+            local_step=int(payload.get("local_step") or 0),
+            counters=counters,
+            fragment_state_uri=str(payload.get("fragment_state_uri") or ""),
+            fragment_state_sha256=str(payload.get("fragment_state_sha256") or ""),
+            previous_fragment_state_uri=str(payload.get("previous_fragment_state_uri") or ""),
+            previous_fragment_state_sha256=str(payload.get("previous_fragment_state_sha256") or ""),
+            trained_tokens=trained_tokens,
+            local_steps=local_steps,
+            created_unix=float(payload.get("created_unix") or time.time()),
+        ).sign(signer)
+        return claim.to_dict()
+
     def _upload_fragment_pull_responses_and_remember(
         self,
         *,
         manifest: TrainingJobManifest,
         transport: GrantTransport,
+        worker: WorkerIdentity,
+        signer,
         response_dir: Path,
         last_uploaded: dict[str, tuple[int, int]] | None,
     ) -> dict[str, tuple[int, int]]:
-        uploaded = self._upload_fragment_pull_responses_if_changed(
-            manifest=manifest,
-            transport=transport,
-            response_dir=response_dir,
-            last_uploaded=last_uploaded,
-        )
-        self._save_fragment_pull_upload_state(
-            self._fragment_pull_upload_state_path(response_dir),
-            uploaded,
-        )
-        return uploaded
+        with self._fragment_response_upload_lock:
+            disk_state = self._load_fragment_pull_upload_state(self._fragment_pull_upload_state_path(response_dir))
+            merged_state = dict(disk_state)
+            merged_state.update(dict(last_uploaded or {}))
+            uploaded = self._upload_fragment_pull_responses_if_changed(
+                manifest=manifest,
+                transport=transport,
+                worker=worker,
+                signer=signer,
+                response_dir=response_dir,
+                last_uploaded=merged_state,
+            )
+            self._save_fragment_pull_upload_state(
+                self._fragment_pull_upload_state_path(response_dir),
+                uploaded,
+            )
+            return uploaded
 
     def _run_persistent_training_service(
         self,
@@ -1310,6 +1400,8 @@ class ExternalQuasarTrainingExecutor:
         learner_metadata_path: Path,
         metadata_ref,
         metadata_put,
+        worker: WorkerIdentity,
+        signer,
         learner_progress_put: PresignedUrlGrant | None = None,
         live_control: dict[str, PresignedUrlGrant | None] | None = None,
     ) -> bool:
@@ -1354,6 +1446,8 @@ class ExternalQuasarTrainingExecutor:
             "transport": transport,
             "input_dir": input_dir,
             "env": env,
+            "worker": worker,
+            "signer": signer,
             "live_control": live_control,
             "fragment_pull_response_dir": fragment_pull_response_dir,
             "last_pull_responses": self._load_fragment_pull_upload_state(
@@ -1411,6 +1505,8 @@ class ExternalQuasarTrainingExecutor:
                 self._upload_fragment_pull_responses_and_remember,
                 manifest=manifest,
                 transport=transport,
+                worker=worker,
+                signer=signer,
                 response_dir=fragment_pull_response_dir,
                 last_uploaded=last_pull_responses,
             )
@@ -1454,6 +1550,8 @@ class ExternalQuasarTrainingExecutor:
                     self._upload_fragment_pull_responses_and_remember,
                     manifest=manifest,
                     transport=transport,
+                    worker=worker,
+                    signer=signer,
                     response_dir=fragment_pull_response_dir,
                     last_uploaded=last_pull_responses,
                 )
@@ -1478,7 +1576,16 @@ class ExternalQuasarTrainingExecutor:
             env = context.get("env")
             live_control = context.get("live_control")
             response_dir = context.get("fragment_pull_response_dir")
-            if not isinstance(manifest, TrainingJobManifest) or transport is None or not isinstance(input_dir, Path) or not isinstance(env, dict):
+            worker = context.get("worker")
+            signer = context.get("signer")
+            if (
+                not isinstance(manifest, TrainingJobManifest)
+                or transport is None
+                or not isinstance(input_dir, Path)
+                or not isinstance(env, dict)
+                or not isinstance(worker, WorkerIdentity)
+                or signer is None
+            ):
                 continue
             self._best_effort_call(
                 "mesh_idle_poll_failed",
@@ -1497,6 +1604,8 @@ class ExternalQuasarTrainingExecutor:
                 self._upload_fragment_pull_responses_and_remember,
                 manifest=manifest,
                 transport=transport,
+                worker=worker,
+                signer=signer,
                 response_dir=response_dir if isinstance(response_dir, Path) else self._required_live_control_dir(
                     env,
                     "QUASAR_FRAGMENT_PULL_RESPONSE_DIR",
@@ -1547,6 +1656,8 @@ class ExternalQuasarTrainingExecutor:
         transport: GrantTransport,
         input_dir: Path,
         learner_metadata_path: Path,
+        worker: WorkerIdentity,
+        signer,
         live_control: dict[str, PresignedUrlGrant | None] | None = None,
     ) -> None:
         output_by_name = {item.name: item for item in manifest.expected_outputs}
@@ -1576,6 +1687,8 @@ class ExternalQuasarTrainingExecutor:
             learner_metadata_path=learner_metadata_path,
             metadata_ref=metadata_ref,
             metadata_put=metadata_put,
+            worker=worker,
+            signer=signer,
             learner_progress_put=learner_progress_put,
             live_control=live_control,
         ):
@@ -1612,6 +1725,8 @@ class ExternalQuasarTrainingExecutor:
                     self._upload_fragment_pull_responses_and_remember,
                     manifest=manifest,
                     transport=transport,
+                    worker=worker,
+                    signer=signer,
                     response_dir=fragment_pull_response_dir,
                     last_uploaded=last_pull_responses,
                 )
@@ -1640,6 +1755,8 @@ class ExternalQuasarTrainingExecutor:
                 self._upload_fragment_pull_responses_and_remember,
                 manifest=manifest,
                 transport=transport,
+                worker=worker,
+                signer=signer,
                 response_dir=fragment_pull_response_dir,
                 last_uploaded=last_pull_responses,
             )
@@ -1781,6 +1898,8 @@ class ExternalQuasarTrainingExecutor:
                 transport=transport,
                 input_dir=input_dir,
                 learner_metadata_path=output_dir / "learner_metadata.jsonl",
+                worker=worker,
+                signer=signer,
                 live_control=live_control,
             )
             self._log("training_done")

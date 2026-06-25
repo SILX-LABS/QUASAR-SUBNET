@@ -18,9 +18,10 @@ The current base model is **Quasar Preview**:
 - Network: `finney`
 
 The orchestrator starts from a published Quasar Preview checkpoint manifest,
-splits the trainable model tensors into 24 fragments, assigns token shards to
-miners, merges accepted fragment work, and periodically releases updated Quasar
-checkpoints for future miners and restarts.
+splits the trainable model tensors into 24 fragments, assigns training leases to
+miners, pulls live fragment states during training, merges validator-approved
+live fragments, and periodically releases updated Quasar checkpoints for future
+miners and restarts.
 
 ## System Roles
 
@@ -35,14 +36,21 @@ Most participants run either a miner or a validator. The orchestrator is run by 
 ```text
 orchestrator publishes the active run and current Quasar checkpoint
 miners discover the run, download checkpoint/data through grants, and train
-miners report learner progress and answer live fragment pull requests
-orchestrator merges accepted fragment states and publishes updated fragments
-validators verify receipts/artifacts and write signed verdicts
-validators publish Bittensor weights from accepted merged work
-orchestrator releases full checkpoints from absolute fragment states
+syncer asks live miners for fragment_id = global_step % 24
+miners upload signed live fragment claims for their current fragment state
+validators verify live claims, tensor contracts, hashes, and eval quality
+orchestrator merges only validator-approved live fragments
+orchestrator immediately publishes the updated absolute fragment back to miners
+validators publish Bittensor weights from accepted live merge events
+after fragments 0..23 are covered, orchestrator releases a full checkpoint
 ```
 
-Miners do not evaluate themselves. Validators do not assign miner work, merge updates, or release checkpoints. Miners and validators use signed manifests plus scoped grants, not broad operator credentials.
+Rounds are assignment leases and audit windows. End-of-job receipts remain useful
+for telemetry and audit, but live validator-approved fragment merges are the
+authoritative training and scoring path. Miners do not evaluate themselves.
+Validators do not assign miner work, merge updates, or release checkpoints.
+Miners and validators use signed manifests plus scoped grants, not broad
+operator credentials.
 
 ## Model And Checkpoints
 
@@ -62,6 +70,8 @@ evaluation; the orchestrator coordinates tensor artifacts and checkpoint release
 Checkpoint release is assembled strictly from the latest absolute fragment
 states. Delta artifacts are kept for merge/debug visibility, but released
 checkpoints are built from absolute fragment state plus the base checkpoint tree.
+The main release is not partial: it requires live accepted coverage for all 24
+fragments since the previous release.
 
 ## Mainnet Defaults
 

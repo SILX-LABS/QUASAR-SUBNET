@@ -76,12 +76,16 @@ def accepted_merge_events(
     netuid: int,
     run_id: str,
     limit: int | None = None,
+    sources: tuple[str, ...] = ("live_sync",),
 ) -> list[MergeAcceptedEvent]:
     events: list[MergeAcceptedEvent] = []
+    enabled_sources = {str(item) for item in sources}
     for prefix, source in (
         (bucket.uri_for_key(f"{paths.root_prefix(netuid)}/merges/{run_id}/"), "round"),
         (bucket.uri_for_key(f"{paths.root_prefix(netuid)}/fragments/{run_id}/live_sync/"), "live_sync"),
     ):
+        if source not in enabled_sources:
+            continue
         for uri in bucket.list(prefix):
             if not uri.endswith("/accepted_updates.json"):
                 continue

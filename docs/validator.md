@@ -10,15 +10,21 @@ A validator:
 2. Polls validation jobs assigned to its hotkey.
 3. Verifies the orchestrator signature.
 4. Decrypts its validation grant.
-5. Downloads receipt and artifact inputs through presigned grants.
+5. Downloads live fragment claims, receipt records, and artifact inputs through presigned grants.
 6. Verifies miner signatures, hashes, fragment metadata, GPU proof, and checkpoint lineage.
-7. Runs independent Quasar evaluation.
-8. Writes a signed verdict.
-9. Scores accepted work and publishes Bittensor weights.
+7. Verifies live request binding to the frozen previous syncer fragment state.
+8. Runs independent Quasar evaluation.
+9. Writes a signed verdict bound to the exact claim and fragment hash.
+10. Scores accepted live merge events and publishes Bittensor weights.
 
 The validator does not schedule miner work, merge updates, or release checkpoints.
 Only the orchestrator/syncer merges accepted work. Validators validate assigned
 jobs, write verdicts, score accepted merge events, and publish Bittensor weights.
+
+Live fragment verdicts are bound to the exact claim digest, fragment state URI
+and hash, and frozen previous fragment state URI and hash. This prevents a
+response from validating one artifact and merging another artifact under the
+same request tuple.
 
 ## Quick Start
 
@@ -76,7 +82,8 @@ The loop:
 
 - consumes assigned validation jobs,
 - writes verdicts,
-- summarizes accepted work,
+- verifies live fragment claims and receipt telemetry,
+- summarizes accepted live merge events,
 - publishes changed positive weights immediately,
 - retries failed or rate-limited `set_weights` with backoff,
 - refreshes unchanged positive weights periodically,
@@ -86,12 +93,12 @@ The operator validation dispatcher assigns validation jobs. External validators 
 
 ## Weight Publication
 
-Validators publish weights only after accepted work exists. The validator does
-not publish fake or random miner weights before there is positive accepted
-score. If there is no accepted score to assign, the validator must publish
-self-fallback to its own registered validator hotkey. In the current operator
-deployment that is validator UID `155`. External validators use their own
-registered validator UID for the same self-fallback rule.
+Validators publish weights only after accepted live merge work exists. The
+validator does not publish fake or random miner weights before there is positive
+accepted score. If there is no accepted score to assign, the validator must
+publish self-fallback to its own registered validator hotkey. In the current
+operator deployment that is validator UID `155`. External validators use their
+own registered validator UID for the same self-fallback rule.
 
 Default behavior:
 

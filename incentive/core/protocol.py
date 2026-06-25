@@ -489,6 +489,212 @@ class MinerReceipt:
 
 
 @dataclass
+class LiveFragmentClaim:
+    run_id: str
+    request_id: str
+    learner_id: str
+    miner_hotkey: str
+    worker_id: str
+    job_id: str
+    round_id: int
+    global_step: int
+    fragment_id: int
+    fragment_count: int
+    target_local_step: int
+    local_step: int
+    counters: dict[str, Any]
+    fragment_state_uri: str
+    fragment_state_sha256: str
+    previous_fragment_state_uri: str
+    previous_fragment_state_sha256: str
+    trained_tokens: int = 0
+    local_steps: int = 0
+    created_unix: float = 0.0
+    schema_version: int = 1
+    miner_signature: str | None = None
+
+    def unsigned_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": int(self.schema_version),
+            "run_id": self.run_id,
+            "request_id": self.request_id,
+            "learner_id": self.learner_id,
+            "miner_hotkey": self.miner_hotkey,
+            "worker_id": self.worker_id,
+            "job_id": self.job_id,
+            "round_id": int(self.round_id),
+            "global_step": int(self.global_step),
+            "fragment_id": int(self.fragment_id),
+            "fragment_count": int(self.fragment_count),
+            "target_local_step": int(self.target_local_step),
+            "local_step": int(self.local_step),
+            "counters": json_safe(dict(self.counters)),
+            "fragment_state_uri": self.fragment_state_uri,
+            "fragment_state_sha256": self.fragment_state_sha256,
+            "previous_fragment_state_uri": self.previous_fragment_state_uri,
+            "previous_fragment_state_sha256": self.previous_fragment_state_sha256,
+            "trained_tokens": int(self.trained_tokens),
+            "local_steps": int(self.local_steps),
+            "created_unix": float(self.created_unix),
+        }
+
+    def digest(self) -> str:
+        return digest_dict(self.to_dict())
+
+    def sign(self, signer_or_secret: Any) -> "LiveFragmentClaim":
+        self.miner_signature = _sign_record(self.unsigned_dict(), signer_or_secret)
+        return self
+
+    def verify_signature(self, miner_identity: str | None = None, *, allow_dev_hmac: bool = True) -> bool:
+        if not self.miner_signature:
+            return False
+        return verify_identity_dict(
+            self.unsigned_dict(),
+            miner_identity or self.miner_hotkey,
+            self.miner_signature,
+            allow_dev_hmac=allow_dev_hmac,
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        out = self.unsigned_dict()
+        out["miner_signature"] = self.miner_signature
+        return out
+
+    @staticmethod
+    def from_dict(data: dict[str, Any]) -> "LiveFragmentClaim":
+        return LiveFragmentClaim(
+            schema_version=int(data.get("schema_version", 1)),
+            run_id=str(data["run_id"]),
+            request_id=str(data["request_id"]),
+            learner_id=str(data["learner_id"]),
+            miner_hotkey=str(data.get("miner_hotkey") or data.get("hotkey") or ""),
+            worker_id=str(data.get("worker_id") or ""),
+            job_id=str(data.get("job_id") or ""),
+            round_id=int(data.get("round_id") or 0),
+            global_step=int(data.get("global_step") or 0),
+            fragment_id=int(data.get("fragment_id") or 0),
+            fragment_count=int(data.get("fragment_count") or 1),
+            target_local_step=int(data.get("target_local_step") or 0),
+            local_step=int(data.get("local_step") or 0),
+            counters=dict(data.get("counters") or {}),
+            fragment_state_uri=str(data.get("fragment_state_uri") or ""),
+            fragment_state_sha256=str(data.get("fragment_state_sha256") or ""),
+            previous_fragment_state_uri=str(data.get("previous_fragment_state_uri") or ""),
+            previous_fragment_state_sha256=str(data.get("previous_fragment_state_sha256") or ""),
+            trained_tokens=int(data.get("trained_tokens") or 0),
+            local_steps=int(data.get("local_steps") or 0),
+            created_unix=float(data.get("created_unix") or 0.0),
+            miner_signature=data.get("miner_signature"),
+        )
+
+
+@dataclass
+class LiveFragmentVerdict:
+    verdict_id: str
+    run_id: str
+    request_id: str
+    learner_id: str
+    miner_hotkey: str
+    validator_hotkey: str
+    status: str
+    reason: str
+    fragment_id: int
+    fragment_count: int
+    global_step: int
+    claim_uri: str = ""
+    claim_digest: str = ""
+    fragment_state_uri: str = ""
+    fragment_state_sha256: str = ""
+    previous_fragment_state_uri: str = ""
+    previous_fragment_state_sha256: str = ""
+    accepted_weight: float = 0.0
+    trained_tokens: int = 0
+    local_steps: int = 0
+    quality_multiplier: float = 0.0
+    validation_summary: dict[str, Any] = field(default_factory=dict)
+    checked_unix: float = 0.0
+    schema_version: int = 1
+    validator_signature: str | None = None
+
+    def unsigned_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": int(self.schema_version),
+            "verdict_id": self.verdict_id,
+            "run_id": self.run_id,
+            "request_id": self.request_id,
+            "learner_id": self.learner_id,
+            "miner_hotkey": self.miner_hotkey,
+            "validator_hotkey": self.validator_hotkey,
+            "status": self.status,
+            "reason": self.reason,
+            "fragment_id": int(self.fragment_id),
+            "fragment_count": int(self.fragment_count),
+            "global_step": int(self.global_step),
+            "claim_uri": self.claim_uri,
+            "claim_digest": self.claim_digest,
+            "fragment_state_uri": self.fragment_state_uri,
+            "fragment_state_sha256": self.fragment_state_sha256,
+            "previous_fragment_state_uri": self.previous_fragment_state_uri,
+            "previous_fragment_state_sha256": self.previous_fragment_state_sha256,
+            "accepted_weight": float(self.accepted_weight),
+            "trained_tokens": int(self.trained_tokens),
+            "local_steps": int(self.local_steps),
+            "quality_multiplier": float(self.quality_multiplier),
+            "validation_summary": json_safe(dict(self.validation_summary)),
+            "checked_unix": float(self.checked_unix),
+        }
+
+    def sign(self, signer_or_secret: Any) -> "LiveFragmentVerdict":
+        self.validator_signature = _sign_record(self.unsigned_dict(), signer_or_secret)
+        return self
+
+    def verify_signature(self, validator_identity: str | None = None, *, allow_dev_hmac: bool = True) -> bool:
+        if not self.validator_signature:
+            return False
+        return verify_identity_dict(
+            self.unsigned_dict(),
+            validator_identity or self.validator_hotkey,
+            self.validator_signature,
+            allow_dev_hmac=allow_dev_hmac,
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        out = self.unsigned_dict()
+        out["validator_signature"] = self.validator_signature
+        return out
+
+    @staticmethod
+    def from_dict(data: dict[str, Any]) -> "LiveFragmentVerdict":
+        return LiveFragmentVerdict(
+            schema_version=int(data.get("schema_version", 1)),
+            verdict_id=str(data["verdict_id"]),
+            run_id=str(data["run_id"]),
+            request_id=str(data["request_id"]),
+            learner_id=str(data["learner_id"]),
+            miner_hotkey=str(data["miner_hotkey"]),
+            validator_hotkey=str(data["validator_hotkey"]),
+            status=str(data["status"]),
+            reason=str(data.get("reason") or ""),
+            fragment_id=int(data.get("fragment_id") or 0),
+            fragment_count=int(data.get("fragment_count") or 1),
+            global_step=int(data.get("global_step") or 0),
+            claim_uri=str(data.get("claim_uri") or ""),
+            claim_digest=str(data.get("claim_digest") or ""),
+            fragment_state_uri=str(data.get("fragment_state_uri") or ""),
+            fragment_state_sha256=str(data.get("fragment_state_sha256") or ""),
+            previous_fragment_state_uri=str(data.get("previous_fragment_state_uri") or ""),
+            previous_fragment_state_sha256=str(data.get("previous_fragment_state_sha256") or ""),
+            accepted_weight=float(data.get("accepted_weight") or 0.0),
+            trained_tokens=int(data.get("trained_tokens") or 0),
+            local_steps=int(data.get("local_steps") or 0),
+            quality_multiplier=float(data.get("quality_multiplier") or 0.0),
+            validation_summary=dict(data.get("validation_summary") or {}),
+            checked_unix=float(data.get("checked_unix") or 0.0),
+            validator_signature=data.get("validator_signature"),
+        )
+
+
+@dataclass
 class ValidatorVerdict:
     verdict_id: str
     receipt_id: str

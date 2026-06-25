@@ -569,6 +569,8 @@ def request_fragment_pull(
     round_id: int,
     request_id: str,
     response_grants: Mapping[str, Any] | None = None,
+    previous_fragment_state_uri: str = "",
+    previous_fragment_state_sha256: str = "",
 ) -> DilocoMessage:
     clock = VectorClock({"syncer": int(global_step)})
     payload = {
@@ -578,6 +580,8 @@ def request_fragment_pull(
         "target_local_step": int(target_local_step),
         "global_step": int(global_step),
         "round_id": int(round_id),
+        "previous_fragment_state_uri": str(previous_fragment_state_uri or ""),
+        "previous_fragment_state_sha256": str(previous_fragment_state_sha256 or ""),
     }
     if response_grants is not None:
         payload["response_grants"] = dict(response_grants)

@@ -16,6 +16,7 @@ from incentive.bucket import paths
 from incentive.bucket.storage import ObjectStore
 from incentive.coordination.current_run import read_current_run
 from incentive.coordination.discovery import list_heartbeats
+from incentive.validator.rewards import accepted_merge_events
 
 REGION_COORDS: dict[str, tuple[float, float]] = {
     "us-east-1": (39.0438, -77.4874),
@@ -65,6 +66,49 @@ def _number(value: Any, default: float = 0.0) -> float:
     except (TypeError, ValueError):
         return default
     return number if math.isfinite(number) else default
+
+
+def _first_number(mapping: Mapping[str, Any], *keys: str) -> float | None:
+    for key in keys:
+        value: Any = mapping
+        for part in key.split("."):
+            if not isinstance(value, Mapping):
+                value = None
+                break
+            value = value.get(part)
+        number = _number(value, float("nan"))
+        if math.isfinite(number) and number > 0.0:
+            return number
+    return None
+
+
+def _receipt_loss(metrics: Mapping[str, Any]) -> float | None:
+    return _first_number(
+        metrics,
+        "loss",
+        "train_loss",
+        "loss_last",
+        "train/loss_ema",
+        "train.loss_ema",
+        "train/loss",
+        "train.loss",
+    )
+
+
+def _verdict_loss(verdict: Mapping[str, Any]) -> float | None:
+    summary = verdict.get("validation_summary")
+    if not isinstance(summary, Mapping):
+        return None
+    return _first_number(
+        summary,
+        "independent_quasar_eval.metrics.heldout_loss_after",
+        "independent_quasar_eval.metrics.random_loss_after",
+        "independent_quasar_eval.metrics.train_loss_after",
+        "independent_quasar_eval.updated_random_loss",
+        "independent_quasar_eval.updated_train_loss",
+        "generalization.random_loss_after",
+        "generalization.train_loss_after",
+    )
 
 
 def _location_from_mapping(value: Any) -> dict[str, Any] | None:
@@ -277,15 +321,15 @@ def build_dashboard_payload(
 
     receipt_by_hotkey: dict[str, dict[str, Any]] = defaultdict(lambda: {"bytes": 0, "tokens": 0, "steps": 0, "tps": 0.0, "loss": 0.0})
     series: dict[str, list[float]] = defaultdict(list)
-    latest_loss = 0.0
+    latest_miner_loss = 0.0
     for receipt in receipts:
         hotkey = _receipt_hotkey(receipt)
         metrics = _receipt_metrics(receipt)
         trained_tokens = int(_number(metrics.get("trained_tokens", metrics.get("tokens", receipt.get("trained_tokens", 0))), 0))
         local_steps = int(_number(metrics.get("local_steps", metrics.get("steps", 0)), 0))
         tps = _number(metrics.get("tokens_per_second", metrics.get("tok_s", metrics.get("tokens_per_sec", 0))), 0)
-        loss = _number(metrics.get("loss", metrics.get("train_loss", 0)), 0)
-        latest_loss = loss or latest_loss
+        loss = _receipt_loss(metrics) or 0.0
+        latest_miner_loss = loss or latest_miner_loss
         entry = receipt_by_hotkey[hotkey]
         entry["bytes"] += _output_bytes(receipt)
         entry["tokens"] += trained_tokens
@@ -294,6 +338,7 @@ def build_dashboard_payload(
         entry["loss"] = loss or entry["loss"]
         _series_push(series, "training_rate_tps", tps)
         if loss:
+            _series_push(series, "miner_loss", loss)
             _series_push(series, "loss", loss)
 
     for miner in miners:
@@ -308,11 +353,29 @@ def build_dashboard_payload(
 
     accepted_updates = 0
     fragments_synced = 0
-    for item in merges:
-        accepted_updates += int(_number(item.get("accepted_updates", item.get("accepted_count", 0)), 0))
-        fragments_synced += int(_number(item.get("fragments_synced", item.get("sync_applied_count", 0)), 0))
+    try:
+        live_events = accepted_merge_events(bucket, netuid=netuid, run_id=active_run, limit=None) if active_run else []
+    except Exception:
+        live_events = []
+    if live_events:
+        accepted_updates = sum(len(event.accepted_updates) for event in live_events)
+        fragments_synced = sum(1 for event in live_events if event.fragment_id is not None)
+    else:
+        for item in merges:
+            accepted_updates += int(_number(item.get("accepted_updates", item.get("accepted_count", 0)), 0))
+            fragments_synced += int(_number(item.get("fragments_synced", item.get("sync_applied_count", 0)), 0))
     if not accepted_updates:
         accepted_updates = sum(1 for verdict in verdicts if str(verdict.get("status", verdict.get("decision", ""))).lower() in {"accepted", "pass", "passed"})
+
+    latest_validator_loss = 0.0
+    for verdict in sorted(verdicts, key=lambda item: _number(item.get("checked_unix"), 0)):
+        if str(verdict.get("status", verdict.get("decision", ""))).lower() not in {"accepted", "pass", "passed"}:
+            continue
+        loss = _verdict_loss(verdict)
+        if loss:
+            latest_validator_loss = loss
+            _series_push(series, "validator_loss", loss)
+            _series_push(series, "loss", loss)
 
     training_rate = sum(_number(miner.get("tokens_per_second"), 0) for miner in miners)
     bandwidth = sum(_number(miner.get("download_mib_s"), 0) + _number(miner.get("upload_mib_s"), 0) for miner in miners)
@@ -377,7 +440,9 @@ def build_dashboard_payload(
             "standby_learners": sum(1 for miner in miners if str(miner.get("status", "")).lower() in {"idle", "queue_idle", "waiting_for_orchestrator_jobs"}),
             "training_rate_tps": training_rate,
             "bandwidth_mib_s": bandwidth,
-            "loss": latest_loss,
+            "loss": latest_validator_loss or latest_miner_loss,
+            "miner_loss": latest_miner_loss,
+            "validator_loss": latest_validator_loss,
             "confidence_pct": 100.0 if accepted_updates else 0.0,
             "accepted_updates": accepted_updates,
             "fragments_synced": fragments_synced,

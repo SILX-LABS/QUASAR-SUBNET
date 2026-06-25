@@ -506,7 +506,7 @@
 
     .two-grid {
       display: grid;
-      grid-template-columns: repeat(2, minmax(0, 1fr));
+      grid-template-columns: repeat(3, minmax(0, 1fr));
       gap: 18px;
     }
 
@@ -661,7 +661,8 @@
         <div class="panel-title" style="text-transform:none">Training State</div>
         <div class="two-grid">
           <article class="chart-card"><div class="chart-head"><span>CONFIDENCE:</span><strong>0.00%</strong></div><canvas class="mini-plot" data-chart="confidence"></canvas></article>
-          <article class="chart-card"><div class="chart-head"><span>LOSS:</span><strong>0.00</strong></div><canvas class="mini-plot" data-chart="loss"></canvas></article>
+          <article class="chart-card"><div class="chart-head"><span>EVAL LOSS:</span><strong>0.0000</strong></div><canvas class="mini-plot" data-chart="validatorLoss"></canvas></article>
+          <article class="chart-card"><div class="chart-head"><span>TRAIN LOSS:</span><strong>0.0000</strong></div><canvas class="mini-plot" data-chart="minerLoss"></canvas></article>
         </div>
       </section>
     </div>
@@ -679,7 +680,9 @@
         trainingRate: { min: 0, max: 1, key: "training_rate_tps", data: [0, 0], noise: 0 },
         bandwidth: { min: 0, max: 1, key: "bandwidth_mib_s", data: [0, 0], noise: 0 },
         confidence: { ...zeroPercent, key: "confidence_pct" },
-        loss: { min: 0, max: 1, key: "loss", data: [0, 0], noise: 0 }
+        loss: { min: 0, max: 1, key: "loss", data: [0, 0], noise: 0 },
+        minerLoss: { min: 0, max: 1, key: "miner_loss", data: [0, 0], noise: 0 },
+        validatorLoss: { min: 0, max: 1, key: "validator_loss", data: [0, 0], noise: 0 }
       };
       const charts = {};
       const mapState = {
@@ -809,7 +812,8 @@
         setChartHead("trainingRate", compactNumber(metricValue(payload, "training_rate_tps", 0), " tok/s"));
         setChartHead("bandwidth", `${metricValue(payload, "bandwidth_mib_s", 0).toFixed(2)} MB/s`);
         setChartHead("confidence", `${metricValue(payload, "confidence_pct", 0).toFixed(2)}%`);
-        setChartHead("loss", metricValue(payload, "loss", 0).toFixed(4));
+        setChartHead("validatorLoss", metricValue(payload, "validator_loss", 0).toFixed(4));
+        setChartHead("minerLoss", metricValue(payload, "miner_loss", 0).toFixed(4));
         setChartHead("arcChallenge", String(metricValue(payload, "accepted_updates", 0)));
         setChartHead("arcEasy", String(metricValue(payload, "fragments_synced", 0)));
         setChartHead("hellaswag", String(metricValue(payload, "receipt_count", 0)));

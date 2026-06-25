@@ -1,4 +1,4 @@
-"""Score windows derived from validator verdicts."""
+"""Score windows derived from accepted live merge events."""
 
 from __future__ import annotations
 
@@ -9,9 +9,8 @@ from typing import Any
 
 from incentive.bucket import paths
 from incentive.bucket.storage import ObjectStore
-from incentive.core.protocol import ValidatorVerdict
 from incentive.core.signatures import Signer, canonical_json, sign_dict, verify_identity_dict
-from .rewards import accepted_and_penalty_units_by_hotkey_from_events, accepted_merge_events, load_manifest_expected_units
+from .rewards import accepted_and_penalty_units_by_hotkey_from_events, accepted_merge_events
 
 
 @dataclass
@@ -89,21 +88,6 @@ def summarize_score_window(
     )
     for hotkey, units in resource_penalties.items():
         failed[hotkey] = failed.get(hotkey, 0.0) + max(0.0, float(units))
-    prefix = bucket.uri_for_key(f"{paths.root_prefix(netuid)}/verdicts/{run_id}/")
-    for uri in bucket.list(prefix):
-        if not uri.endswith(".json"):
-            continue
-        try:
-            verdict = ValidatorVerdict.from_dict(bucket.get_json(uri))
-        except Exception:
-            continue
-        if verdict.validator_hotkey != validator_hotkey:
-            continue
-        if not verdict.verify_signature(validator_hotkey):
-            continue
-        if verdict.status == "fail":
-            units = _verdict_units(bucket, netuid=netuid, verdict=verdict)
-            failed[verdict.miner_hotkey] = failed.get(verdict.miner_hotkey, 0.0) + max(units, 1.0)
 
     hotkeys = set(accepted) | set(failed)
     raw = {
@@ -146,13 +130,3 @@ def _score_decay_half_life_events() -> float | None:
     except ValueError:
         return 64.0
     return value if value > 0.0 else None
-
-
-def _verdict_units(bucket: ObjectStore, *, netuid: int, verdict: ValidatorVerdict) -> float:
-    manifest_units = load_manifest_expected_units(
-        bucket,
-        netuid=netuid,
-        run_id=verdict.run_id,
-        job_id=verdict.job_id,
-    )
-    return max(manifest_units, float(verdict.estimated_training_units), 0.0)

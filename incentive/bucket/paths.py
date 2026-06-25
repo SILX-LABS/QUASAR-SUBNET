@@ -200,8 +200,42 @@ def learner_fragment_manifest_key(netuid: int, run_id: str, learner_id: str, fra
     return f"{learner_fragment_prefix(netuid, run_id, learner_id, fragment_id)}/local_step={int(local_step)}/manifest.json"
 
 
+def learner_fragment_request_prefix(netuid: int, run_id: str, learner_id: str, fragment_id: int, request_id: str) -> str:
+    return (
+        f"{learner_fragment_prefix(netuid, run_id, learner_id, fragment_id)}/"
+        f"request={_segment(request_id, name='request_id')}"
+    )
+
+
+def learner_fragment_request_state_key(netuid: int, run_id: str, learner_id: str, fragment_id: int, request_id: str) -> str:
+    return f"{learner_fragment_request_prefix(netuid, run_id, learner_id, fragment_id, request_id)}/fragment_state.safetensors"
+
+
+def learner_fragment_request_base_state_key(netuid: int, run_id: str, learner_id: str, fragment_id: int, request_id: str) -> str:
+    return f"{learner_fragment_request_prefix(netuid, run_id, learner_id, fragment_id, request_id)}/base_fragment_state.safetensors"
+
+
+def learner_fragment_request_manifest_key(netuid: int, run_id: str, learner_id: str, fragment_id: int, request_id: str) -> str:
+    return f"{learner_fragment_request_prefix(netuid, run_id, learner_id, fragment_id, request_id)}/manifest.json"
+
+
 def learner_fragment_latest_key(netuid: int, run_id: str, learner_id: str, fragment_id: int) -> str:
     return f"{learner_fragment_prefix(netuid, run_id, learner_id, fragment_id)}/latest.json"
+
+
+def live_fragment_verdict_prefix(netuid: int, run_id: str, validator_hotkey: str) -> str:
+    return (
+        f"{mesh_root(netuid, run_id)}/live_fragment_verdicts/"
+        f"validator={_segment(validator_hotkey, name='validator_hotkey')}/"
+    )
+
+
+def live_fragment_verdict_key(netuid: int, run_id: str, validator_hotkey: str, request_id: str, learner_id: str) -> str:
+    return (
+        f"{live_fragment_verdict_prefix(netuid, run_id, validator_hotkey)}"
+        f"request={_segment(request_id, name='request_id')}/"
+        f"learner={_segment(learner_id, name='learner_id')}.json"
+    )
 
 
 def learner_state_prefix(netuid: int, run_id: str, learner_id: str) -> str:

@@ -10,12 +10,14 @@ Do not run the orchestrator on third-party miner or validator machines.
 2. Publishes or references the current Quasar checkpoint.
 3. Maintains the approved data shard catalog.
 4. Discovers registered miner workers.
-5. Emits signed training jobs.
+5. Emits signed training leases.
 6. Creates encrypted assignment grants with presigned artifact access.
-7. Dispatches validator jobs to configured validation targets.
-8. Reconciles completed, skipped, and expired work.
-9. Merges accepted fragment updates.
-10. Releases updated checkpoints.
+7. Pulls live fragment states from active learners.
+8. Dispatches validator jobs to configured validation targets.
+9. Merges validator-approved live fragment claims.
+10. Publishes updated absolute fragments back to miners.
+11. Reconciles completed, skipped, and expired work as telemetry.
+12. Releases updated checkpoints after live fragment coverage.
 
 ## Install
 
@@ -95,7 +97,9 @@ quasar-incentive orchestrator prepare-shards \
 bash scripts/run_orchestrator.sh
 ```
 
-The loop keeps running. It emits miner jobs, dispatches validator jobs, finalizes rounds, merges accepted work, releases checkpoints, and advances the active run state.
+The loop keeps running. It emits miner leases, dispatches validator jobs, pulls
+live fragments, merges accepted live work, publishes synced fragments, records
+receipt telemetry, releases checkpoints, and advances the active run state.
 
 ## W&B Telemetry
 
@@ -127,7 +131,7 @@ bash scripts/run_validation_jobs.sh
 
 External validators run only `scripts/run_validator.sh`.
 
-## Merge And Release
+## Live Merge And Release
 
 Production defaults should keep automatic finalization enabled:
 
@@ -136,7 +140,20 @@ export QUASAR_AUTO_MERGE_RELEASE=1
 export QUASAR_AUTO_RELEASE_CHECKPOINTS=1
 ```
 
-The orchestrator merges only accepted validator verdicts. When a round finalizes, it records merge state, queues checkpoint release, updates active checkpoint metadata, and emits future work from the updated state.
+The orchestrator/syncer owns the global fragment states. For each live sync
+step it requests `fragment_id = global_step % 24`, freezes the previous
+syncer-owned fragment state in the request, waits for validator-approved live
+claims, merges accepted responses with the configured outer optimizer, and
+publishes the updated absolute fragment state back to miners.
+
+End-of-job receipts are still recorded and validated, but they are telemetry and
+audit records. They should not reopen old live merges or rebuild global
+fragment state after the sync step has moved on.
+
+Full checkpoint release is operational recovery infrastructure for late joiners
+and restarts. It is queued only after accepted live merge events cover all 24
+fragments since the previous release, then assembled from absolute fragment
+states rather than miner-provided deltas.
 
 ## Safety Rules
 

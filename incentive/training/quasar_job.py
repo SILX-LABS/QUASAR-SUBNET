@@ -1387,6 +1387,7 @@ def run(args: argparse.Namespace) -> None:
         for request_id, request_payload in pending_requests:
             request_fragment_id = int(request_payload.get("fragment_id") or 0) % max(1, fragment_count)
             target_local_step = int(request_payload.get("target_local_step") or 0)
+            request_global_step = int(request_payload.get("global_step") or learner_global_step)
             if learner_local_step < target_local_step:
                 continue
             request_fragment = fragment_plan.fragment(request_fragment_id)
@@ -1410,7 +1411,7 @@ def run(args: argparse.Namespace) -> None:
                     "learner_id": learner,
                     "request_id": request_id,
                     "local_step": learner_local_step,
-                    "global_step": learner_global_step,
+                    "global_step": request_global_step,
                     "round_id": int(request_payload.get("round_id") or 0),
                     "source": "learner_pull_response",
                 },
@@ -1424,11 +1425,13 @@ def run(args: argparse.Namespace) -> None:
                 "fragment_count": fragment_count,
                 "target_local_step": target_local_step,
                 "local_step": learner_local_step,
-                "global_step": learner_global_step,
+                "global_step": request_global_step,
                 "round_id": int(request_payload.get("round_id") or 0),
                 "state_path": str(state_path),
                 "fragment_state_sha256": state_sha256,
                 "fragment_state_size_bytes": state_size_bytes,
+                "previous_fragment_state_uri": str(request_payload.get("previous_fragment_state_uri") or ""),
+                "previous_fragment_state_sha256": str(request_payload.get("previous_fragment_state_sha256") or ""),
                 "vector_clock": vector_clock.to_dict(),
                 "counters": fragment_counters.to_dict(),
                 "created_unix": float(time.time()),

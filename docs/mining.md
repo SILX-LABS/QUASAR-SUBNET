@@ -13,10 +13,15 @@ A miner:
 5. Decrypts its assignment grant.
 6. Downloads checkpoint and data through presigned grants.
 7. Trains Quasar.
-8. Uploads training artifacts and a signed receipt.
-9. Continues polling for more work.
+8. Answers live fragment pull requests while training.
+9. Applies synced fragments published by the orchestrator.
+10. Uploads training artifacts and a signed receipt for audit.
+11. Continues polling for more work.
 
-The miner does not evaluate itself and does not need operator credentials. Private artifacts are downloaded and uploaded through scoped grants.
+The miner does not evaluate itself and does not need operator credentials.
+Private artifacts are downloaded and uploaded through scoped grants. Miner
+self-reported TPS, GPU details, and loss are telemetry only; rewards come from
+validator-approved live merge events.
 
 ## Install
 
@@ -80,9 +85,16 @@ Useful events:
 
 - `quasar_miner_training_start`
 - `quasar_parallel_mode`
+- `quasar_miner_mesh_pull_response_uploaded`
+- `quasar_miner_mesh_sync_received`
+- `quasar_miner_mesh_sync_applied`
 - `quasar_miner_upload_start`
 - `quasar_miner_receipt_upload_done`
 - `quasar_miner_job_skipped`
+
+`grant expired` during idle mailbox polling usually means an old scoped grant
+expired. If the miner is actively training, do not stop it for that line alone.
+New live-control grants are issued by the orchestrator as work advances.
 
 ## Troubleshooting
 

@@ -11,8 +11,6 @@ from incentive.core.protocol import MinerReceipt, ValidatorVerdict
 from .rewards import (
     accepted_and_penalty_units_by_hotkey_from_events,
     accepted_merge_events,
-    accepted_updates_by_receipt,
-    load_manifest_expected_units,
 )
 
 
@@ -84,7 +82,6 @@ def summarize_ledger(
         failed_units = max(0.0, float(penalty_units))
         row["failed_units"] += failed_units
         out.failed_units += failed_units
-    merged = accepted_updates_by_receipt(bucket, netuid=netuid, run_id=run_id)
     prefix = bucket.uri_for_key(f"{paths.root_prefix(netuid)}/verdicts/{run_id}/")
     for uri in bucket.list(prefix):
         if not uri.endswith(".json"):
@@ -102,26 +99,12 @@ def summarize_ledger(
         row = out.by_hotkey.setdefault(verdict.miner_hotkey, _empty_hotkey_row())
         out.verdicts += 1
         row["verdicts"] += 1
-        units = _verdict_units(bucket, netuid=netuid, verdict=verdict)
         if verdict.status == "pass":
             out.passed += 1
             row["passed"] += 1
-            accepted_update = merged.get(verdict.receipt_id)
-            if accepted_update is not None and (
-                not accepted_update.hotkey or accepted_update.hotkey == verdict.miner_hotkey
-            ) and (
-                not accepted_update.job_id or accepted_update.job_id == verdict.job_id
-            ):
-                pass
-            else:
-                out.pending_units += units
-                row["pending_units"] += units
         elif verdict.status == "fail":
             out.failed += 1
             row["failed"] += 1
-            failed_units = max(units, 1.0)
-            out.failed_units += failed_units
-            row["failed_units"] += failed_units
 
     for hotkey, receipts in _receipt_counts_by_hotkey(bucket, netuid=netuid, run_id=run_id).items():
         row = out.by_hotkey.setdefault(hotkey, _empty_hotkey_row())
@@ -182,16 +165,6 @@ def _receipt_counts_by_hotkey(bucket: ObjectStore, *, netuid: int, run_id: str) 
             continue
         counts[receipt.worker.hotkey_ss58] = counts.get(receipt.worker.hotkey_ss58, 0) + 1
     return counts
-
-
-def _verdict_units(bucket: ObjectStore, *, netuid: int, verdict: ValidatorVerdict) -> float:
-    manifest_units = load_manifest_expected_units(
-        bucket,
-        netuid=netuid,
-        run_id=verdict.run_id,
-        job_id=verdict.job_id,
-    )
-    return max(manifest_units, float(verdict.estimated_training_units), 0.0)
 
 
 def _hotkey_from_receipt_uri(uri: str) -> str | None:
