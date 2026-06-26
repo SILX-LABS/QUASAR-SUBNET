@@ -27,6 +27,7 @@ from incentive.core.protocol import (
     LiveFragmentClaim,
     LiveFragmentVerdict,
     MinerReceipt,
+    PresignedUrlGrant,
     ResourceRequirements,
     TrainingJobManifest,
     ValidatorVerdict,
@@ -73,6 +74,7 @@ class ValidationJobConfig:
     sample_rate: float = 1.0
     heartbeat_ttl_sec: int = 120
     allow_validator_heartbeat_discovery: bool = False
+    allow_dev_signatures: bool = False
 
 
 class ValidationJobManager:
@@ -382,6 +384,7 @@ class ValidationWorkerConfig:
     owner_identity: str
     independent_quasar_eval: Any | None = None
     allow_dev_signatures: bool = False
+    live_verdict_grant_min_remaining_sec: int = 120
 
 
 class _GrantedValidationStore:
@@ -464,7 +467,10 @@ class ValidationJobWorker:
     def run_once(self, *, max_jobs: int | None = None) -> list[dict[str, Any]]:
         self.heartbeat()
         checked: list[dict[str, Any]] = []
-        checked.extend(self.verify_live_fragment_claims(max_claims=max_jobs))
+        active_live_requests, live_state_exists = self._active_live_sync_requests_with_state_flag()
+        checked.extend(self.verify_live_fragment_claims(max_claims=max_jobs, active_requests=active_live_requests))
+        if live_state_exists:
+            return checked
         remaining = None if max_jobs is None else max(0, int(max_jobs) - len(checked))
         if remaining == 0:
             return checked
@@ -545,9 +551,13 @@ class ValidationJobWorker:
                 checked.append({"job_id": entry.job_id, "error": f"{type(exc).__name__}: {exc}"})
         return checked
 
-    def verify_live_fragment_claims(self, *, max_claims: int | None = None) -> list[dict[str, Any]]:
+    def verify_live_fragment_claims(
+        self,
+        *,
+        max_claims: int | None = None,
+        active_requests: dict[str, dict[str, Any]] | None = None,
+    ) -> list[dict[str, Any]]:
         checked: list[dict[str, Any]] = []
-        prefix = self.bucket.uri_for_key(f"{paths.mesh_root(self.config.netuid, self.config.run_id)}/learner_fragments/")
         verifier = ValidatorVerifier(
             bucket=self.bucket,
             signer=self.signer,
@@ -560,17 +570,59 @@ class ValidationJobWorker:
                 allow_dev_signatures=self.config.allow_dev_signatures,
             ),
         )
-        for uri in sorted(self.bucket.list(prefix)):
+        if active_requests is None:
+            active_requests, run_state_exists = self._active_live_sync_requests_with_state_flag()
+        else:
+            active_requests = dict(active_requests)
+            run_state_exists = True
+        claim_uris, active_request_ids = self._live_fragment_claim_uris_to_validate(
+            active_requests=active_requests,
+            allow_historical_fallback=not run_state_exists,
+        )
+        accepted_by_request: dict[str, set[str]] = {}
+
+        def _request_quorum(request_id: str) -> int:
+            request = dict(active_requests.get(str(request_id)) or {})
+            try:
+                return max(1, int(request.get("quorum") or 1))
+            except (TypeError, ValueError):
+                return 1
+
+        def _request_has_quorum(request_id: str) -> bool:
+            return len(accepted_by_request.get(str(request_id), set())) >= _request_quorum(str(request_id))
+
+        def _remember_accepted(verdict: LiveFragmentVerdict) -> None:
+            try:
+                accepted_weight = float(verdict.accepted_weight or 0.0)
+            except (TypeError, ValueError):
+                accepted_weight = 0.0
+            if verdict.status != "pass" or accepted_weight <= 0.0:
+                return
+            accepted_by_request.setdefault(str(verdict.request_id), set()).add(str(verdict.learner_id))
+
+        for uri in claim_uris:
             if max_claims is not None and len(checked) >= max_claims:
                 break
-            if not uri.endswith("/manifest.json"):
-                continue
             try:
                 claim = LiveFragmentClaim.from_dict(self.bucket.get_json(uri))
             except Exception:
                 continue
             if claim.run_id != self.config.run_id:
                 continue
+            if active_request_ids and claim.request_id not in active_request_ids:
+                continue
+            if run_state_exists and _request_has_quorum(claim.request_id):
+                break
+            if run_state_exists:
+                active_requests, still_has_state = self._active_live_sync_requests_with_state_flag()
+                if not still_has_state:
+                    continue
+                active_request_ids = set(active_requests)
+                active_request = dict(active_requests.get(str(claim.request_id)) or {})
+                if not active_request:
+                    continue
+                if str(claim.learner_id) not in {str(learner_id) for learner_id in dict(active_request.get("targets") or {})}:
+                    continue
             verdict_uri = self.bucket.uri_for_key(
                 paths.live_fragment_verdict_key(
                     self.config.netuid,
@@ -599,17 +651,62 @@ class ValidationJobWorker:
                     and verdict.validator_hotkey == self.config.validator_hotkey
                     and verdict.verify_signature(self.config.validator_hotkey, allow_dev_hmac=self.config.allow_dev_signatures)
                 ):
+                    _remember_accepted(verdict)
+                    if run_state_exists and _request_has_quorum(claim.request_id):
+                        break
                     continue
             except Exception:
                 pass
             try:
+                verdict_put_grant = self._live_verdict_put_grant_from_state(claim, active_requests)
+                if verdict_put_grant is None:
+                    request_payload = verifier._live_pull_request_payload(claim)
+                else:
+                    request_payload = None
+                if verdict_put_grant is None and request_payload is not None:
+                    grant_payload = dict(request_payload.get("verdict_grants") or {}).get(self.config.validator_hotkey)
+                    if isinstance(grant_payload, dict) and grant_payload:
+                        verdict_put_grant = PresignedUrlGrant.from_dict(grant_payload)
+                    elif dict(request_payload.get("response_grants") or {}):
+                        _log_validation_job_event(
+                            "live_fragment_missing_verdict_grant",
+                            request_id=claim.request_id,
+                            learner_id=claim.learner_id,
+                            fragment_id=claim.fragment_id,
+                        )
+                        continue
+                if verdict_put_grant is not None and not self._live_verdict_put_grant_is_fresh(verdict_put_grant):
+                    remaining_sec = int(verdict_put_grant.expires_unix or 0) - int(time.time())
+                    _log_validation_job_event(
+                        "live_fragment_expired_verdict_grant",
+                        request_id=claim.request_id,
+                        learner_id=claim.learner_id,
+                        fragment_id=claim.fragment_id,
+                        expires_unix=int(verdict_put_grant.expires_unix or 0),
+                        remaining_sec=remaining_sec,
+                        min_remaining_sec=max(0, int(self.config.live_verdict_grant_min_remaining_sec)),
+                    )
+                    if self._can_write_verdict_directly():
+                        _log_validation_job_event(
+                            "live_fragment_direct_verdict_write_fallback",
+                            request_id=claim.request_id,
+                            learner_id=claim.learner_id,
+                            fragment_id=claim.fragment_id,
+                        )
+                        verdict_put_grant = None
+                    else:
+                        continue
                 _log_validation_job_event(
                     "live_fragment_start",
                     request_id=claim.request_id,
                     learner_id=claim.learner_id,
                     fragment_id=claim.fragment_id,
                 )
-                result = verifier.verify_live_fragment_claim_uri(uri)
+                result = verifier.verify_live_fragment_claim_uri(
+                    uri,
+                    verdict_put_grant=verdict_put_grant,
+                    transport=self.transport,
+                )
                 _log_validation_job_event(
                     "live_fragment_verdict_written",
                     request_id=claim.request_id,
@@ -618,6 +715,9 @@ class ValidationJobWorker:
                     verdict_uri=result.verdict_uri,
                 )
                 checked.append({"live_fragment_claim_uri": uri, "verdict": result.verdict.to_dict()})
+                _remember_accepted(result.verdict)
+                if run_state_exists and _request_has_quorum(claim.request_id):
+                    break
             except Exception as exc:
                 _log_validation_job_event(
                     "live_fragment_error",
@@ -628,6 +728,150 @@ class ValidationJobWorker:
                 )
                 checked.append({"live_fragment_claim_uri": uri, "error": f"{type(exc).__name__}: {exc}"})
         return checked
+
+    def _live_fragment_claim_uris_to_validate(
+        self,
+        *,
+        active_requests: dict[str, dict[str, Any]] | None = None,
+        allow_historical_fallback: bool = True,
+    ) -> tuple[list[str], set[str]]:
+        """Return live claim manifests that can unblock current sync requests.
+
+        The validator must not spend its bounded pass budget on the full historical
+        learner_fragments tree. Live sync is driven by the syncer's active request
+        set, so those exact request targets are the authoritative validation queue.
+        Historical scanning is kept only as a compatibility fallback for local tests
+        or deployments that have not yet written live_sync_requests to state.
+        """
+
+        requests = dict(active_requests or {})
+        if requests:
+            out: list[str] = []
+            seen: set[str] = set()
+            active_request_ids = set(requests)
+            ordered = sorted(
+                requests.items(),
+                key=lambda item: (
+                    int(dict(item[1]).get("global_step") or 0),
+                    int(dict(item[1]).get("fragment_id") or 0),
+                    str(item[0]),
+                ),
+            )
+            for request_id, request in ordered:
+                request_dict = dict(request)
+                try:
+                    fragment_id = int(request_dict.get("fragment_id") or 0)
+                except (TypeError, ValueError):
+                    continue
+                targets = dict(request_dict.get("targets") or {})
+
+                def _target_order(item: tuple[Any, Any]) -> tuple[int, str]:
+                    learner_id, target_local_step = item
+                    try:
+                        target_step = int(target_local_step)
+                    except (TypeError, ValueError):
+                        target_step = 0
+                    return (-target_step, str(learner_id))
+
+                for learner_id, _target_local_step in sorted(targets.items(), key=_target_order):
+                    uri = self.bucket.uri_for_key(
+                        paths.learner_fragment_request_manifest_key(
+                            self.config.netuid,
+                            self.config.run_id,
+                            str(learner_id),
+                            fragment_id,
+                            str(request_id),
+                        )
+                    )
+                    if uri in seen:
+                        continue
+                    seen.add(uri)
+                    out.append(uri)
+            return out, active_request_ids
+
+        if not allow_historical_fallback:
+            return [], set()
+
+        prefix = self.bucket.uri_for_key(f"{paths.mesh_root(self.config.netuid, self.config.run_id)}/learner_fragments/")
+        return sorted((uri for uri in self.bucket.list(prefix) if uri.endswith("/manifest.json")), reverse=True), set()
+
+    def _active_live_sync_requests(self) -> dict[str, dict[str, Any]]:
+        requests, _state_exists = self._active_live_sync_requests_with_state_flag()
+        return requests
+
+    def _active_live_sync_requests_with_state_flag(self) -> tuple[dict[str, dict[str, Any]], bool]:
+        state_uri = self.bucket.uri_for_key(paths.run_state_key(self.config.netuid, self.config.run_id))
+        try:
+            state = dict(self.bucket.get_json(state_uri))
+        except Exception:
+            return {}, False
+        requests: dict[str, dict[str, Any]] = {}
+        terminal_statuses = {"broadcast", "expired", "failed", "merged"}
+        for request_id, request in dict(state.get("live_sync_requests") or {}).items():
+            if not str(request_id) or not isinstance(request, dict):
+                continue
+            request_dict = dict(request)
+            if str(request_dict.get("status") or "requested") in terminal_statuses:
+                continue
+            targets = dict(request_dict.get("targets") or {})
+            requests[str(request_id)] = request_dict
+        if len(requests) > 1:
+            def _request_step(payload: dict[str, Any]) -> int | None:
+                try:
+                    return int(payload.get("global_step") or 0)
+                except (TypeError, ValueError):
+                    return None
+
+            steps: list[int] = []
+            for request in requests.values():
+                step = _request_step(request)
+                if step is not None:
+                    steps.append(step)
+            if steps:
+                oldest_step = min(steps)
+                requests = {
+                    request_id: request
+                    for request_id, request in requests.items()
+                    if _request_step(request) == oldest_step
+                }
+        return requests, True
+
+    def _live_verdict_put_grant_from_state(
+        self,
+        claim: LiveFragmentClaim,
+        active_requests: dict[str, dict[str, Any]],
+    ) -> PresignedUrlGrant | None:
+        request = dict(active_requests.get(str(claim.request_id)) or {})
+        grants_by_learner = dict(request.get("verdict_grants") or {})
+        learner_grants = dict(grants_by_learner.get(str(claim.learner_id)) or {})
+        grant_payload = learner_grants.get(self.config.validator_hotkey)
+        if isinstance(grant_payload, dict) and grant_payload:
+            return PresignedUrlGrant.from_dict(grant_payload)
+        return None
+
+    def _live_request_target_has_fresh_verdict_grant(self, request: dict[str, Any], learner_id: str) -> bool:
+        grants_by_learner = request.get("verdict_grants")
+        if not isinstance(grants_by_learner, dict) or not grants_by_learner:
+            return True
+        learner_grants = dict(grants_by_learner.get(str(learner_id)) or {})
+        grant_payload = learner_grants.get(self.config.validator_hotkey)
+        if not isinstance(grant_payload, dict) or not grant_payload:
+            return False
+        try:
+            grant = PresignedUrlGrant.from_dict(grant_payload)
+        except Exception:
+            return False
+        return self._live_verdict_put_grant_is_fresh(grant)
+
+    def _live_verdict_put_grant_is_fresh(self, grant: PresignedUrlGrant) -> bool:
+        expires_unix = int(grant.expires_unix or 0)
+        if expires_unix <= 0:
+            return True
+        min_remaining_sec = max(0, int(self.config.live_verdict_grant_min_remaining_sec))
+        return expires_unix - int(time.time()) >= min_remaining_sec
+
+    def _can_write_verdict_directly(self) -> bool:
+        return not bool(getattr(self.bucket, "anonymous", False))
 
     def _drop_cached_entry(self, job_id: str) -> None:
         if self._queue_state is None:

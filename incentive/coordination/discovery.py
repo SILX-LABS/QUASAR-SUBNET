@@ -98,12 +98,16 @@ def list_heartbeats(
     now = int(time.time())
     out: list[WorkerHeartbeat] = []
     prefix_uri = bucket.uri_for_key(paths.heartbeats_prefix(netuid, role=role))
-    for uri in bucket.list(prefix_uri):
+    try:
+        heartbeat_uris = list(bucket.list(prefix_uri))
+    except Exception:
+        return []
+    for uri in heartbeat_uris:
         if not uri.endswith("/heartbeat.json"):
             continue
         try:
             heartbeat = WorkerHeartbeat.from_dict(bucket.get_json(uri))
-        except (KeyError, TypeError, ValueError):
+        except Exception:
             continue
         if max_age_sec is not None and now - heartbeat.last_seen_unix > int(max_age_sec):
             continue

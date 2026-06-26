@@ -23,6 +23,11 @@ Private artifacts are downloaded and uploaded through scoped grants. Miner
 self-reported TPS, GPU details, and loss are telemetry only; rewards come from
 validator-approved live merge events.
 
+Current protocol requires the latest miner code. Live fragment responses are
+uploaded as signed live claims and bound to the syncer's request id, fragment id,
+fragment hash, and previous global fragment state. Old miners may still poll or
+train, but they will not be reliable for the validator-gated live merge path.
+
 ## Install
 
 ```bash
@@ -58,6 +63,9 @@ export QUASAR_S3_ANONYMOUS=true
 ```
 
 Do not set `QUASAR_RUN_ID` for normal mining. The miner discovers the active run automatically.
+When switching machines or restarting after an old run, keep the wallet/hotkey
+the same only if you are intentionally moving that miner. Do not run the same
+hotkey on two machines at once.
 
 ## Run
 
@@ -78,6 +86,17 @@ quasar-incentive miner run \
 
 The miner publishes approximate datacenter-area location automatically from the
 server public IP. No manual location config is required.
+
+## Training And Sync Behavior
+
+Quasar mining is not winner-take-all. The orchestrator pulls live fragments from
+active learners while they train. A miner earns score only when its live fragment
+claim is validated and accepted into a live merge event. Final receipts are kept
+for audit and telemetry, but accepted live fragment merges are the reward path.
+
+The miner may receive synced fragments while training. Applying a synced
+fragment resets only that fragment's local counters; the learner keeps training
+instead of waiting for a full checkpoint release.
 
 ## Expected Logs
 
@@ -107,3 +126,10 @@ If the miner is idle:
 - confirm the orchestrator has an active run and assigned work.
 
 If anonymous public metadata access is denied, fix the public metadata policy. Do not add operator credentials to a miner.
+
+If a job OOMs:
+
+- restart the miner process after GPU memory is clear,
+- reduce `QUASAR_BATCH_SIZE` if you set it manually,
+- keep FSDP enabled on multi-GPU systems when supported,
+- do not keep retrying a configuration that repeatedly OOMs before serving live fragments.

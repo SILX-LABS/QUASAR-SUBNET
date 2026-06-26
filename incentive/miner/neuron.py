@@ -199,7 +199,7 @@ def _write_worker_heartbeat(*, bucket, worker: MinerWorker, capabilities: dict[s
             hotkey=worker.config.hotkey,
             worker_id=worker.config.worker_id,
             run_id=worker.config.run_id,
-            capabilities=capabilities,
+            capabilities=worker.heartbeat_capabilities(capabilities),
             status="running",
             role="miner",
         )

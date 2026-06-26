@@ -21,6 +21,7 @@ import sys
 import tarfile
 import threading
 import time
+import warnings
 from pathlib import Path
 from typing import Any
 
@@ -45,6 +46,12 @@ from incentive.training.moe_metrics import parameter_group_for_name
 
 
 _LEARNER_RUNTIME_CACHE: dict[str, dict[str, Any]] = {}
+
+warnings.filterwarnings(
+    "ignore",
+    category=FutureWarning,
+    module=r"transformers\.modeling_attn_mask_utils",
+)
 
 
 def _token_files(input_dir: Path) -> list[Path]:
@@ -751,6 +758,36 @@ def _load_learner_state(path: str, *, fragment_count: int, learner_id: str) -> d
     }
 
 
+def _checkpoint_ref_changed(learner_state: dict, checkpoint_ref: dict) -> bool:
+    current_uri = str(checkpoint_ref.get("uri") or "")
+    current_sha256 = str(checkpoint_ref.get("sha256") or "")
+    previous_uri = str(learner_state.get("base_checkpoint_uri") or "")
+    previous_sha256 = str(learner_state.get("base_checkpoint_sha256") or "")
+    if not previous_uri and not previous_sha256:
+        return False
+    if current_sha256 and previous_sha256 and current_sha256 != previous_sha256:
+        return True
+    if current_uri and previous_uri and current_uri != previous_uri:
+        return True
+    if current_sha256 and previous_uri and not previous_sha256 and current_uri and current_uri != previous_uri:
+        return True
+    return False
+
+
+def _reset_learner_state_for_checkpoint(*, fragment_count: int, learner_id: str) -> dict:
+    vector_clock = VectorClock()
+    vector_clock.observe(learner_id, 0)
+    return {
+        "local_step": 0,
+        "global_step": 0,
+        "counters": FragmentCounters.zeros(fragment_count),
+        "vector_clock": vector_clock,
+        "applied_sync_paths": set(),
+        "base_checkpoint_uri": "",
+        "base_checkpoint_sha256": "",
+    }
+
+
 def _save_learner_state(
     path: str,
     *,
@@ -1098,13 +1135,33 @@ def run(args: argparse.Namespace) -> None:
     output_update.parent.mkdir(parents=True, exist_ok=True)
     output_metrics.parent.mkdir(parents=True, exist_ok=True)
 
-    data = _load_token_matrix(input_dir, sequence_length=args.sequence_length, max_sequences=args.max_sequences)
+    serve_fragment_pulls_only = bool(getattr(args, "serve_fragment_pulls_only", False))
+    data = None if serve_fragment_pulls_only else _load_token_matrix(
+        input_dir,
+        sequence_length=args.sequence_length,
+        max_sequences=args.max_sequences,
+    )
     device = args.device
     if distributed and device.startswith("cuda") and torch.cuda.is_available():
         torch.cuda.set_device(local_rank)
         device = f"cuda:{local_rank}"
     dtype = torch.bfloat16 if args.dtype == "bfloat16" else torch.float16 if args.dtype == "float16" else torch.float32
     manifest = _manifest_context()
+    run_id = str(manifest.get("run_id") or os.environ.get("QUASAR_RUN_ID") or "")
+    learner = str(args.learner_id or "").strip() or _learner_id(manifest)
+    checkpoint_ref = manifest.get("checkpoint_ref") if isinstance(manifest.get("checkpoint_ref"), dict) else {}
+    persisted_learner_state = _load_learner_state(
+        args.learner_state_path,
+        fragment_count=max(1, int(args.fragment_count)),
+        learner_id=learner,
+    )
+    checkpoint_changed = _checkpoint_ref_changed(persisted_learner_state, checkpoint_ref)
+    if checkpoint_changed:
+        args.load_persistent_states = False
+        persisted_learner_state = _reset_learner_state_for_checkpoint(
+            fragment_count=max(1, int(args.fragment_count)),
+            learner_id=learner,
+        )
     if distributed and rank != 0:
         args.wandb_project = ""
         args.wandb_run_name = ""
@@ -1277,6 +1334,12 @@ def run(args: argparse.Namespace) -> None:
         runtime_cache_hit=bool(runtime_cache is not None),
     )
     fragment_count = int(fragment_plan.fragment_count)
+    if len(persisted_learner_state["counters"].steps) != fragment_count:
+        persisted_learner_state = (
+            _reset_learner_state_for_checkpoint(fragment_count=fragment_count, learner_id=learner)
+            if checkpoint_changed
+            else _load_learner_state(args.learner_state_path, fragment_count=fragment_count, learner_id=learner)
+        )
     configured_fragment_id = int(args.fragment_id)
     fragment_id = configured_fragment_id if configured_fragment_id >= 0 else int(manifest.get("round_id") or 0) % fragment_count
     fragment_id = int(fragment_id % fragment_count)
@@ -1292,7 +1355,6 @@ def run(args: argparse.Namespace) -> None:
         ]
     sync_fragment_stats: dict[str, object] = {}
     losses: list[float] = []
-    tensors = torch.tensor(data, dtype=torch.long, device=device)
     batch_size = max(1, int(args.batch_size))
     steps = max(1, int(args.steps))
     completed_steps = 0
@@ -1304,14 +1366,17 @@ def run(args: argparse.Namespace) -> None:
     tokens_per_step = int(batch_size * args.sequence_length)
     gpu_count = int(torch.cuda.device_count()) if torch.cuda.is_available() else 0
     tokens_per_global_step = int(tokens_per_step * world_size)
-    row_count = int(tensors.shape[0])
+    tensors = None if data is None else torch.tensor(data, dtype=torch.long, device=device)
+    row_count = 0 if tensors is None else int(tensors.shape[0])
     row_order_np = np.arange(row_count, dtype=np.int64)
-    if args.shuffle_train:
+    if row_count > 0 and args.shuffle_train:
         rng = np.random.default_rng(int(args.train_seed))
         rng.shuffle(row_order_np)
     row_order = torch.as_tensor(row_order_np, dtype=torch.long, device=device)
 
     def train_batch_for_step(step_index: int):
+        if tensors is None:
+            raise RuntimeError("training data is unavailable in fragment-pull serving mode")
         start = (int(step_index) * batch_size * world_size + rank * batch_size) % max(1, row_count)
         if start + batch_size <= row_count:
             rows = row_order[start : start + batch_size]
@@ -1320,9 +1385,7 @@ def run(args: argparse.Namespace) -> None:
             rows = row_order[offsets]
         return tensors.index_select(0, rows)
 
-    learner = str(args.learner_id or "").strip() or _learner_id(manifest)
-    run_id = str(manifest.get("run_id") or os.environ.get("QUASAR_RUN_ID") or "")
-    learner_state = _load_learner_state(args.learner_state_path, fragment_count=fragment_count, learner_id=learner)
+    learner_state = persisted_learner_state
     learner_local_step = int(learner_state["local_step"])
     learner_global_step = max(int(learner_state["global_step"]), int(manifest.get("global_step") or 0))
     fragment_counters: FragmentCounters = learner_state["counters"]
@@ -1467,6 +1530,39 @@ def run(args: argparse.Namespace) -> None:
             served_fragment_pull_requests.add(request_id)
             served += 1
         return served
+
+    if bool(getattr(args, "serve_fragment_pulls_only", False)):
+        served = _serve_fragment_pull_requests()
+        _save_learner_state(
+            args.learner_state_path,
+            run_id=run_id,
+            learner_id=learner,
+            local_step=learner_local_step,
+            global_step=learner_global_step,
+            counters=fragment_counters,
+            vector_clock=vector_clock,
+            applied_sync_paths=applied_sync_paths,
+            base_checkpoint_uri=str(checkpoint_ref.get("uri") or ""),
+            base_checkpoint_sha256=checkpoint_ref.get("sha256"),
+        )
+        if rank == 0 and args.metrics_path:
+            Path(args.metrics_path).write_text(
+                json.dumps(
+                    {
+                        "serve_fragment_pulls_only": True,
+                        "served_fragment_pull_requests": int(served),
+                        "learner_id": learner,
+                        "learner_local_step": int(learner_local_step),
+                        "learner_global_step": int(learner_global_step),
+                        "per_fragment_steps": list(fragment_counters.steps),
+                        "per_fragment_tokens": list(fragment_counters.tokens),
+                        **sync_fragment_stats,
+                    },
+                    sort_keys=True,
+                ),
+                encoding="utf-8",
+            )
+        return
 
     if wandb_run is not None:
         wandb_run.log(
@@ -1699,18 +1795,19 @@ def run(args: argparse.Namespace) -> None:
             losses.append(interval_loss_mean)
             if grad_clip_norm <= 0.0:
                 last_grad_norm = None
-            print(
-                "[train] "
-                f"step={update_step}/{steps} "
-                f"loss={interval_loss_mean:.6f} "
-                f"loss_ema={loss_ema:.6f} "
-                f"tok/s={total_tps:.2f} "
-                f"tok/s/gpu={last_logged_tps_per_gpu:.2f} "
-                f"step_tok/s={step_tps:.2f} "
-                f"lr={lr_value:.3e} "
-                f"elapsed={elapsed_sec:.1f}s",
-                flush=True,
-            )
+            if rank == 0:
+                print(
+                    "[train] "
+                    f"step={update_step}/{steps} "
+                    f"loss={interval_loss_mean:.6f} "
+                    f"loss_ema={loss_ema:.6f} "
+                    f"tok/s={total_tps:.2f} "
+                    f"tok/s/gpu={last_logged_tps_per_gpu:.2f} "
+                    f"step_tok/s={step_tps:.2f} "
+                    f"lr={lr_value:.3e} "
+                    f"elapsed={elapsed_sec:.1f}s",
+                    flush=True,
+                )
             if wandb_run is not None:
                 warmup_frac = float(min(1.0, update_step / max(1, warmup_steps))) if warmup_steps else 1.0
                 interval_timing_per_step = {
@@ -1827,7 +1924,6 @@ def run(args: argparse.Namespace) -> None:
     if not fragment_deltas:
         raise ValueError(f"fragment_id={fragment_id} produced no fragment deltas")
 
-    checkpoint_ref = manifest.get("checkpoint_ref") if isinstance(manifest.get("checkpoint_ref"), dict) else {}
     artifact = write_fragment_update(
         update_path=output_update,
         manifest_path=output_fragment_manifest,
@@ -1941,6 +2037,7 @@ def run(args: argparse.Namespace) -> None:
         "gradient_checkpointing": gradient_checkpointing_enabled,
         **trainable_stats,
         **assigned_weight_stats,
+        "checkpoint_fingerprint_changed": bool(checkpoint_changed),
         **persistent_model_stats,
         **persistent_optimizer_stats,
         **sync_fragment_stats,
@@ -2016,6 +2113,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--service-poll-interval-sec",
         type=float,
         default=float(os.environ.get("QUASAR_PERSISTENT_LEARNER_SERVICE_POLL_INTERVAL_SEC", "0.2")),
+    )
+    parser.add_argument(
+        "--serve-fragment-pulls-only",
+        action="store_true",
+        default=env_bool("QUASAR_SERVE_FRAGMENT_PULLS_ONLY", False),
     )
     parser.add_argument("--model-id", default=os.environ.get("QUASAR_MODEL_ID", "silx-ai/Quasar-Preview"))
     parser.add_argument("--revision", default=os.environ.get("QUASAR_MODEL_REVISION", "main"))
@@ -2165,6 +2267,11 @@ def run_service(args: argparse.Namespace) -> None:
                     os.chdir(workdir)
                     job_args = build_parser().parse_args(job_argv)
                     job_args.service = False
+                    if payload.get("kind") == "serve_fragment_pulls":
+                        job_args.serve_fragment_pulls_only = True
+                        job_args.metrics_path = str(done_dir / f"{request_id}.metrics.json")
+                        job_args.wandb_project = ""
+                        job_args.wandb_run_name = ""
                     run(job_args)
                 finally:
                     os.chdir(previous_cwd)

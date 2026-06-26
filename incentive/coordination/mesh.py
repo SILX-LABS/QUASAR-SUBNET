@@ -569,6 +569,7 @@ def request_fragment_pull(
     round_id: int,
     request_id: str,
     response_grants: Mapping[str, Any] | None = None,
+    verdict_grants: Mapping[str, Any] | None = None,
     previous_fragment_state_uri: str = "",
     previous_fragment_state_sha256: str = "",
 ) -> DilocoMessage:
@@ -585,6 +586,8 @@ def request_fragment_pull(
     }
     if response_grants is not None:
         payload["response_grants"] = dict(response_grants)
+    if verdict_grants is not None:
+        payload["verdict_grants"] = dict(verdict_grants)
     channel = BucketDilocoChannel(bucket, netuid=netuid, run_id=run_id, sender="syncer", receiver=str(learner_id))
     message = channel.send(kind="pull_fragment", payload=payload, vector_clock=clock)
     append_mailbox_message(bucket, netuid=netuid, message=message)

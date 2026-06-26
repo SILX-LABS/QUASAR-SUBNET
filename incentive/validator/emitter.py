@@ -98,8 +98,8 @@ class ValidatorJobEmitter:
     ) -> EmittedJob:
         created_unix = int(now if now is not None else time.time())
         job_ttl = max(1, int(job_ttl_sec or self.config.job_ttl_sec))
-        grant_ttl = max(1, int(grant_ttl_sec or self.config.grant_ttl_sec))
         deadline_unix = created_unix + job_ttl
+        grant_ttl = max(1, int(grant_ttl_sec or self.config.grant_ttl_sec), job_ttl + 600)
 
         manifest = TrainingJobManifest(
             job_id=job_id,
@@ -192,8 +192,10 @@ class ValidatorJobEmitter:
         grant_ttl_sec: int | None = None,
     ) -> AssignmentGrant:
         broker = self.config.grant_broker
-        grant_ttl = max(1, int(grant_ttl_sec or self.config.grant_ttl_sec))
-        expires_unix = int(time.time()) + grant_ttl
+        now = int(time.time())
+        deadline_ttl = max(1, int(manifest.deadline_unix) - now + 600)
+        grant_ttl = max(1, int(grant_ttl_sec or self.config.grant_ttl_sec), deadline_ttl)
+        expires_unix = now + grant_ttl
         if broker is None:
             input_gets = []
             output_puts = []
@@ -241,6 +243,6 @@ class ValidatorJobEmitter:
             input_gets=input_gets,
             output_puts=output_puts,
             receipt_put=receipt_put,
-            created_unix=int(time.time()),
+            created_unix=now,
             expires_unix=expires_unix,
         )

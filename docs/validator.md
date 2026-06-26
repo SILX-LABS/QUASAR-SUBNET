@@ -26,6 +26,10 @@ and hash, and frozen previous fragment state URI and hash. This prevents a
 response from validating one artifact and merging another artifact under the
 same request tuple.
 
+The validator should treat live sync requests from run state as the active work
+queue. Historical claims and expired grant records are compatibility/audit data;
+they must not starve validation of current grant-backed live claims.
+
 ## Quick Start
 
 ```bash
@@ -43,9 +47,9 @@ Create `.env`:
 cat > .env <<'EOF'
 QUASAR_NETWORK=finney
 QUASAR_NETUID=24
-export QUASAR_WALLET_PATH=~/.bittensor/wallets
-export QUASAR_WALLET_NAME=<validator-wallet>
-export QUASAR_HOTKEY_NAME=<validator-hotkey>
+QUASAR_WALLET_PATH=~/.bittensor/wallets
+QUASAR_WALLET_NAME=<validator-wallet>
+QUASAR_HOTKEY_NAME=<validator-hotkey>
 QUASAR_S3_BUCKET=quasar-incentive-sn24-529337356998-us-east-1
 QUASAR_S3_REGION=us-east-1
 QUASAR_S3_ANONYMOUS=true
@@ -109,6 +113,11 @@ Default behavior:
 - empty accepted-score windows publish self-fallback to the validator hotkey,
 - unchanged positive scores refresh every `QUASAR_WEIGHT_REFRESH_SEC`,
 - default refresh interval is `1800` seconds.
+
+Scores are summarized from accepted live merge events. The default score window
+uses recent merge events with decay, so miners must continue contributing valid
+live fragments to keep weight. Miner-reported TPS, loss, GPU names, and final
+receipt claims are not direct payout inputs.
 
 ## Troubleshooting
 

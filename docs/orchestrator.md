@@ -136,7 +136,7 @@ External validators run only `scripts/run_validator.sh`.
 Production defaults should keep automatic finalization enabled:
 
 ```bash
-export QUASAR_AUTO_MERGE_RELEASE=1
+export QUASAR_AUTO_FINALIZE_ASSIGNMENTS=1
 export QUASAR_AUTO_RELEASE_CHECKPOINTS=1
 ```
 
@@ -154,6 +154,26 @@ Full checkpoint release is operational recovery infrastructure for late joiners
 and restarts. It is queued only after accepted live merge events cover all 24
 fragments since the previous release, then assembled from absolute fragment
 states rather than miner-provided deltas.
+
+Checkpoint release should not block live training longer than necessary. If the
+orchestrator is actively serving miners, release may be deferred until the run is
+idle enough to assemble and publish the full checkpoint. The live fragment loop
+remains the primary training path while release is pending.
+
+## Scoring
+
+Validator weights are derived from accepted live merge events. The orchestrator
+and validator share the same event ledger, with recent events weighted more than
+stale history. Production defaults are intentionally short enough that miners
+who stop contributing decay out of the positive weight set:
+
+```bash
+export QUASAR_SCORE_MERGE_EVENT_WINDOW=48
+export QUASAR_SCORE_DECAY_HALF_LIFE_EVENTS=24
+```
+
+Miner self-reported TPS, GPU labels, and loss are dashboard telemetry. They can
+be sanity-checked, but they are not trusted payout inputs.
 
 ## Safety Rules
 

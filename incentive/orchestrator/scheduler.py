@@ -12,6 +12,7 @@ from incentive.validator.rewards import (
     accepted_and_penalty_units_by_hotkey_from_events,
     accepted_merge_events,
 )
+from incentive.validator.scoring import score_decay_half_life_events, score_merge_event_window
 from incentive.validator.service import MinerTarget
 
 
@@ -89,12 +90,13 @@ def load_accounts(
     validator_hotkeys=(),
 ) -> dict[str, MinerAccount]:
     accounts: dict[str, MinerAccount] = {}
-    events = accepted_merge_events(bucket, netuid=netuid, run_id=run_id, limit=None)
+    events = accepted_merge_events(bucket, netuid=netuid, run_id=run_id, limit=score_merge_event_window())
     accepted_units, resource_penalties = accepted_and_penalty_units_by_hotkey_from_events(
         events,
         bucket=bucket,
         netuid=netuid,
         run_id=run_id,
+        decay_half_life_events=score_decay_half_life_events(),
     )
     for hotkey, units in accepted_units.items():
         account = accounts.setdefault(hotkey, MinerAccount(hotkey=hotkey))

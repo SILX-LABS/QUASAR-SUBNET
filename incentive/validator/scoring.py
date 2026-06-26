@@ -13,6 +13,10 @@ from incentive.core.signatures import Signer, canonical_json, sign_dict, verify_
 from .rewards import accepted_and_penalty_units_by_hotkey_from_events, accepted_merge_events
 
 
+DEFAULT_SCORE_MERGE_EVENT_WINDOW = 48
+DEFAULT_SCORE_DECAY_HALF_LIFE_EVENTS = 24.0
+
+
 @dataclass
 class ScoreWindow:
     window_id: str
@@ -78,13 +82,13 @@ def summarize_score_window(
     merge_event_window: int | None = None,
 ) -> ScoreWindow:
     failed: dict[str, float] = {}
-    event_limit = _score_merge_event_window() if merge_event_window is None else merge_event_window
+    event_limit = score_merge_event_window() if merge_event_window is None else merge_event_window
     accepted, resource_penalties = accepted_and_penalty_units_by_hotkey_from_events(
         accepted_merge_events(bucket, netuid=netuid, run_id=run_id, limit=event_limit),
         bucket=bucket,
         netuid=netuid,
         run_id=run_id,
-        decay_half_life_events=_score_decay_half_life_events(),
+        decay_half_life_events=score_decay_half_life_events(),
     )
     for hotkey, units in resource_penalties.items():
         failed[hotkey] = failed.get(hotkey, 0.0) + max(0.0, float(units))
@@ -114,19 +118,27 @@ def summarize_score_window(
     return window
 
 
-def _score_merge_event_window() -> int | None:
-    raw = os.environ.get("QUASAR_SCORE_MERGE_EVENT_WINDOW", "256")
+def score_merge_event_window() -> int | None:
+    raw = os.environ.get("QUASAR_SCORE_MERGE_EVENT_WINDOW", str(DEFAULT_SCORE_MERGE_EVENT_WINDOW))
     try:
         value = int(raw)
     except ValueError:
-        return 256
+        return DEFAULT_SCORE_MERGE_EVENT_WINDOW
     return value if value > 0 else None
 
 
-def _score_decay_half_life_events() -> float | None:
-    raw = os.environ.get("QUASAR_SCORE_DECAY_HALF_LIFE_EVENTS", "64")
+def score_decay_half_life_events() -> float | None:
+    raw = os.environ.get("QUASAR_SCORE_DECAY_HALF_LIFE_EVENTS", str(DEFAULT_SCORE_DECAY_HALF_LIFE_EVENTS))
     try:
         value = float(raw)
     except ValueError:
-        return 64.0
+        return DEFAULT_SCORE_DECAY_HALF_LIFE_EVENTS
     return value if value > 0.0 else None
+
+
+def _score_merge_event_window() -> int | None:
+    return score_merge_event_window()
+
+
+def _score_decay_half_life_events() -> float | None:
+    return score_decay_half_life_events()

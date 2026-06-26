@@ -1,5 +1,19 @@
 # Changelog
 
+## 2026-06-26
+
+### Production Documentation Cleanup
+
+- Clarified that accepted live merge events, not final receipts or miner
+  self-reports, are the authoritative scoring path.
+- Documented validator score decay and the recent-event scoring window.
+- Documented checkpoint release as operational recovery infrastructure for late
+  joiners and restarts, while live fragment sync remains the training hot path.
+- Updated miner guidance for latest-code live claims, automatic run discovery,
+  OOM recovery, and avoiding duplicate hotkey use across machines.
+- Updated validator guidance for active live request validation, self-fallback,
+  and rate-limited weight refresh behavior.
+
 ## 2026-06-25
 
 ### Live Sync And Merge

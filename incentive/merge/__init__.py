@@ -5,7 +5,6 @@ from .outer import (
     RoundMergeManifest,
     apply_outer_update,
     merge_live_learner_fragment_states,
-    merge_round_fragment_updates,
     write_merge_artifacts,
 )
 
@@ -14,6 +13,5 @@ __all__ = [
     "RoundMergeManifest",
     "apply_outer_update",
     "merge_live_learner_fragment_states",
-    "merge_round_fragment_updates",
     "write_merge_artifacts",
 ]

@@ -30,6 +30,7 @@ from incentive.config import DEFAULT_MODEL_ID
 from incentive.coordination.discovery import write_heartbeat
 from incentive.coordination.mesh import (
     DilocoMessage,
+    FragmentCounters,
     LearnerProgressMetadata,
     VectorClock,
     append_event_tape,
@@ -103,6 +104,11 @@ class ExternalQuasarTrainingExecutor:
             return default
         return str(raw).strip().lower() in {"1", "true", "yes", "on"}
 
+    @staticmethod
+    def _path_from_env(env: dict[str, str], name: str) -> Path | None:
+        value = str(env.get(name) or "").strip()
+        return Path(value).expanduser() if value else None
+
     @contextmanager
     def _training_workdir(self):
         path = Path(tempfile.mkdtemp(prefix="quasar-train-"))
@@ -165,6 +171,49 @@ class ExternalQuasarTrainingExecutor:
         if state_path:
             return Path(state_path).expanduser().parent / "quasar_job_service"
         return Path(tempfile.gettempdir()) / "quasar_job_service"
+
+    @staticmethod
+    def _worker_state_dir(*, run_id: str, hotkey: str, worker_id: str) -> Path:
+        configured_root = os.environ.get("QUASAR_LEARNER_STATE_DIR")
+        cache_root = os.environ.get("QUASAR_MINER_CACHE_DIR")
+        root = Path(configured_root or cache_root or (Path.home() / ".quasar-incentive" / "cache"))
+        return (
+            root
+            / "learners"
+            / ExternalQuasarTrainingExecutor._safe_segment(run_id)
+            / ExternalQuasarTrainingExecutor._safe_segment(hotkey)
+            / ExternalQuasarTrainingExecutor._safe_segment(worker_id)
+        )
+
+    @staticmethod
+    def _live_context_path(service_dir: Path) -> Path:
+        return service_dir / "live_context" / "context.json"
+
+    @staticmethod
+    def _grant_payload(grant: PresignedUrlGrant | None) -> dict[str, Any] | None:
+        return grant.to_dict() if grant is not None else None
+
+    @staticmethod
+    def _grant_from_payload(payload: Any) -> PresignedUrlGrant | None:
+        if not isinstance(payload, dict):
+            return None
+        try:
+            return PresignedUrlGrant.from_dict(payload)
+        except Exception:
+            return None
+
+    @classmethod
+    def _serialize_live_control(
+        cls,
+        live_control: dict[str, PresignedUrlGrant | None] | None,
+    ) -> dict[str, dict[str, Any] | None]:
+        return {str(key): cls._grant_payload(value) for key, value in dict(live_control or {}).items()}
+
+    @classmethod
+    def _deserialize_live_control(cls, payload: Any) -> dict[str, PresignedUrlGrant | None]:
+        if not isinstance(payload, dict):
+            return {}
+        return {str(key): cls._grant_from_payload(value) for key, value in payload.items()}
 
     def _persistent_checkpoint_cache_root(self, env: dict[str, str]) -> Path:
         configured = env.get("QUASAR_PERSISTENT_LEARNER_CACHE_DIR") or os.environ.get("QUASAR_PERSISTENT_LEARNER_CACHE_DIR")
@@ -875,19 +924,23 @@ class ExternalQuasarTrainingExecutor:
         manifest: TrainingJobManifest,
         transport: GrantTransport,
         metadata_path: Path,
+        learner_state_path: Path | None = None,
         learner_progress_put: PresignedUrlGrant | None = None,
         recovery_state: dict[str, Any] | None = None,
     ) -> None:
         bucket = getattr(transport, "bucket", None)
         netuid = self._netuid(manifest)
-        if netuid <= 0 or not metadata_path.exists():
+        if netuid <= 0:
             return
         try:
-            lines = [line for line in metadata_path.read_text(encoding="utf-8").splitlines() if line.strip()]
-            if not lines:
-                return
-            metadata = LearnerProgressMetadata.from_dict(json.loads(lines[-1]))
+            metadata = self._latest_learner_progress_metadata(
+                manifest=manifest,
+                metadata_path=metadata_path,
+                learner_state_path=learner_state_path,
+            )
         except Exception:
+            return
+        if metadata is None:
             return
         payload = metadata.to_dict()
         for key, value in dict(recovery_state or {}).items():
@@ -909,6 +962,45 @@ class ExternalQuasarTrainingExecutor:
             return
         if bucket is not None and not bool(getattr(bucket, "anonymous", False)):
             bucket.put_json(bucket.uri_for_key(paths.learner_progress_key(netuid, metadata.run_id, metadata.learner_id)), payload)
+
+    def _latest_learner_progress_metadata(
+        self,
+        *,
+        manifest: TrainingJobManifest,
+        metadata_path: Path,
+        learner_state_path: Path | None = None,
+    ) -> LearnerProgressMetadata | None:
+        if metadata_path.exists():
+            lines = [line for line in metadata_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+            if lines:
+                return LearnerProgressMetadata.from_dict(json.loads(lines[-1]))
+        if learner_state_path is None or not learner_state_path.exists():
+            return None
+        state = read_json_file(learner_state_path, default={})
+        if not isinstance(state, dict):
+            return None
+        counters_raw = dict(state.get("counters") or {})
+        counter_lengths = [
+            len(values)
+            for values in (
+                counters_raw.get("steps"),
+                counters_raw.get("tokens"),
+                counters_raw.get("last_sync_global_step"),
+            )
+            if isinstance(values, list)
+        ]
+        fragment_count = int(manifest.task_params.get("fragment_count") or max(counter_lengths or [1]))
+        learner_id = str(state.get("learner_id") or os.environ.get("QUASAR_LEARNER_ID") or manifest.assigned_hotkey)
+        return LearnerProgressMetadata(
+            run_id=str(state.get("run_id") or manifest.run_id),
+            learner_id=learner_id,
+            local_step=int(state.get("local_step") or 0),
+            global_step=int(state.get("global_step") or manifest.global_step or 0),
+            fragment_count=fragment_count,
+            counters=FragmentCounters.from_dict(counters_raw, fragment_count=fragment_count),
+            vector_clock=VectorClock.from_dict(state.get("vector_clock")),
+            created_unix=float(state.get("updated_unix") or time.time()),
+        )
 
     def _publish_recovery_state_uris(
         self,
@@ -989,6 +1081,7 @@ class ExternalQuasarTrainingExecutor:
                 manifest=manifest,
                 transport=transport,
                 metadata_path=learner_metadata_path,
+                learner_state_path=self._path_from_env(env, "QUASAR_LEARNER_STATE_PATH"),
                 learner_progress_put=progress_put,
                 recovery_state=state,
             )
@@ -1111,6 +1204,100 @@ class ExternalQuasarTrainingExecutor:
         self._services[key] = process
         return key, process
 
+    def _write_live_context(self, context: dict[str, Any]) -> None:
+        manifest = context.get("manifest")
+        service_dir = context.get("service_dir")
+        if not isinstance(manifest, TrainingJobManifest) or not isinstance(service_dir, Path):
+            return
+        payload = {
+            "schema_version": 1,
+            "learner_id": str(context.get("learner_id") or ""),
+            "manifest": manifest.to_dict(),
+            "env": {str(k): str(v) for k, v in dict(context.get("env") or {}).items()},
+            "input_dir": str(context.get("input_dir") or ""),
+            "workdir": str(context.get("workdir") or ""),
+            "service_dir": str(service_dir),
+            "service_argv": [str(item) for item in context.get("service_argv") or []],
+            "job_argv": [str(item) for item in context.get("job_argv") or []],
+            "fragment_pull_response_dir": str(context.get("fragment_pull_response_dir") or ""),
+            "live_control": self._serialize_live_control(context.get("live_control")),
+            "updated_unix": time.time(),
+        }
+        self._atomic_write_json(self._live_context_path(service_dir), payload)
+
+    def _live_context_candidates(self, *, worker: WorkerIdentity, config: Any | None) -> list[Path]:
+        run_id = str(getattr(config, "run_id", "") or "")
+        paths_out: list[Path] = []
+        configured_service_dir = os.environ.get("QUASAR_PERSISTENT_LEARNER_SERVICE_DIR", "").strip()
+        if configured_service_dir:
+            paths_out.append(self._live_context_path(Path(configured_service_dir).expanduser()))
+        if run_id:
+            state_dir = self._worker_state_dir(run_id=run_id, hotkey=worker.hotkey_ss58, worker_id=worker.worker_id)
+            paths_out.append(self._live_context_path(state_dir / "quasar_job_service"))
+        seen: set[str] = set()
+        unique: list[Path] = []
+        for path in paths_out:
+            key = str(path)
+            if key not in seen:
+                unique.append(path)
+                seen.add(key)
+        return unique
+
+    def _restore_live_contexts(
+        self,
+        *,
+        worker: WorkerIdentity | None,
+        signer,
+        transport: GrantTransport | None,
+        config: Any | None,
+    ) -> None:
+        if worker is None or signer is None or transport is None:
+            return
+        for path in self._live_context_candidates(worker=worker, config=config):
+            if not path.exists():
+                continue
+            try:
+                payload = read_json_file(path, default={})
+                manifest = TrainingJobManifest.from_dict(dict(payload.get("manifest") or {}))
+            except Exception as exc:
+                self._log("live_context_restore_failed", path=str(path), error_type=type(exc).__name__, error=str(exc))
+                continue
+            if manifest.assigned_hotkey != worker.hotkey_ss58:
+                continue
+            run_id = str(getattr(config, "run_id", "") or manifest.run_id)
+            if run_id and manifest.run_id != run_id:
+                continue
+            env = {str(k): str(v) for k, v in dict(payload.get("env") or {}).items()}
+            learner_id = str(payload.get("learner_id") or env.get("QUASAR_LEARNER_ID") or f"{worker.hotkey_ss58}:{worker.worker_id}")
+            if learner_id in self._live_contexts:
+                continue
+            service_dir = Path(str(payload.get("service_dir") or path.parent.parent)).expanduser()
+            response_dir_raw = str(payload.get("fragment_pull_response_dir") or env.get("QUASAR_FRAGMENT_PULL_RESPONSE_DIR") or "").strip()
+            if response_dir_raw:
+                response_dir = Path(response_dir_raw).expanduser()
+            else:
+                response_dir = self._required_live_control_dir(env, "QUASAR_FRAGMENT_PULL_RESPONSE_DIR", "fragment pull response directory")
+            context = {
+                "learner_id": learner_id,
+                "manifest": manifest,
+                "transport": transport,
+                "input_dir": Path(str(payload.get("input_dir") or env.get("QUASAR_INPUT_DIR") or service_dir / "live_context" / "inputs")).expanduser(),
+                "env": env,
+                "workdir": Path(str(payload.get("workdir") or service_dir / "live_context")).expanduser(),
+                "worker": worker,
+                "signer": signer,
+                "live_control": self._deserialize_live_control(payload.get("live_control")),
+                "fragment_pull_response_dir": response_dir,
+                "service_dir": service_dir,
+                "service_argv": [str(item) for item in payload.get("service_argv") or []],
+                "job_argv": [str(item) for item in payload.get("job_argv") or []],
+                "last_pull_responses": self._load_fragment_pull_upload_state(
+                    self._fragment_pull_upload_state_path(response_dir)
+                ),
+            }
+            self._live_contexts[learner_id] = context
+            self._log("live_context_restored", learner_id=learner_id, path=str(path))
+
     def _best_effort_call(self, event: str, default: Any, fn, *args, **kwargs):
         try:
             return fn(*args, **kwargs)
@@ -1127,20 +1314,23 @@ class ExternalQuasarTrainingExecutor:
         metadata_put,
         learner_progress_put: PresignedUrlGrant | None,
         learner_metadata_path: Path,
-        last_uploaded: tuple[int, int] | None,
+        learner_state_path: Path | None = None,
+        last_uploaded: tuple[int, int] | None = None,
     ) -> tuple[int, int] | None:
-        if not learner_metadata_path.exists():
+        source_path = learner_metadata_path if learner_metadata_path.exists() else learner_state_path
+        if source_path is None or not source_path.exists():
             return last_uploaded
-        stat = learner_metadata_path.stat()
+        stat = source_path.stat()
         signature = (int(stat.st_mtime_ns), int(stat.st_size))
         if signature == last_uploaded:
             return last_uploaded
-        if metadata_ref is not None and metadata_put is not None:
+        if learner_metadata_path.exists() and metadata_ref is not None and metadata_put is not None:
             transport.put(metadata_put, learner_metadata_path.read_bytes(), expected_uri=metadata_ref.uri)
         self._publish_latest_learner_metadata(
             manifest=manifest,
             transport=transport,
             metadata_path=learner_metadata_path,
+            learner_state_path=learner_state_path,
             learner_progress_put=learner_progress_put,
         )
         return signature
@@ -1441,19 +1631,47 @@ class ExternalQuasarTrainingExecutor:
             workdir,
             require_stable=require_stable_response_dir,
         )
-        self._live_contexts[learner_id] = {
+        live_context_dir = service_dir / "live_context"
+        live_context_input_dir = live_context_dir / "inputs"
+        live_context_output_dir = live_context_dir / "outputs"
+        live_context_dir.mkdir(parents=True, exist_ok=True)
+        live_context_input_dir.mkdir(parents=True, exist_ok=True)
+        live_context_output_dir.mkdir(parents=True, exist_ok=True)
+        live_context_manifest_path = live_context_dir / "manifest.json"
+        live_context_manifest_path.write_text(json.dumps(manifest.to_dict(), sort_keys=True), encoding="utf-8")
+        live_context_env = dict(env)
+        live_context_env.update(
+            {
+                "QUASAR_JOB_MANIFEST": str(live_context_manifest_path),
+                "QUASAR_INPUT_DIR": str(live_context_input_dir),
+                "QUASAR_OUTPUT_DIR": str(live_context_output_dir),
+                "QUASAR_UPDATE_PATH": str(live_context_output_dir / "fragment_update.safetensors"),
+                "QUASAR_FRAGMENT_MANIFEST_PATH": str(live_context_output_dir / "fragment_manifest.json"),
+                "QUASAR_FRAGMENT_BASE_PATH": str(live_context_output_dir / "fragment_base.safetensors"),
+                "QUASAR_METRICS_PATH": str(live_context_output_dir / "metrics.json"),
+                "QUASAR_GPU_PROOF_PATH": str(live_context_output_dir / "gpu_proof.json"),
+            }
+        )
+        live_context_record = {
+            "learner_id": learner_id,
             "manifest": manifest,
             "transport": transport,
-            "input_dir": input_dir,
-            "env": env,
+            "input_dir": live_context_input_dir,
+            "env": live_context_env,
+            "workdir": live_context_dir,
             "worker": worker,
             "signer": signer,
             "live_control": live_control,
             "fragment_pull_response_dir": fragment_pull_response_dir,
+            "service_dir": service_dir,
+            "service_argv": list(service_argv),
+            "job_argv": list(job_argv),
             "last_pull_responses": self._load_fragment_pull_upload_state(
                 self._fragment_pull_upload_state_path(fragment_pull_response_dir)
             ),
         }
+        self._live_contexts[learner_id] = live_context_record
+        self._write_live_context(live_context_record)
         self._atomic_write_json(
             request_path,
             {
@@ -1497,6 +1715,7 @@ class ExternalQuasarTrainingExecutor:
                 metadata_put=metadata_put,
                 learner_progress_put=learner_progress_put,
                 learner_metadata_path=learner_metadata_path,
+                learner_state_path=self._path_from_env(env, "QUASAR_LEARNER_STATE_PATH"),
                 last_uploaded=last_uploaded,
             )
             last_pull_responses = self._best_effort_call(
@@ -1542,6 +1761,7 @@ class ExternalQuasarTrainingExecutor:
                     metadata_put=metadata_put,
                     learner_progress_put=learner_progress_put,
                     learner_metadata_path=learner_metadata_path,
+                    learner_state_path=self._path_from_env(env, "QUASAR_LEARNER_STATE_PATH"),
                     last_uploaded=None,
                 )
                 self._best_effort_call(
@@ -1566,25 +1786,134 @@ class ExternalQuasarTrainingExecutor:
                 raise subprocess.TimeoutExpired(service_argv, timeout_sec)
             time.sleep(0.25)
 
-    def idle_tick(self) -> None:
+    @staticmethod
+    def _fragment_pull_request_ids(request_dir: Path) -> set[str]:
+        if not request_dir.exists():
+            return set()
+        out: set[str] = set()
+        for path in sorted(request_dir.glob("*.json")):
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            request_id = str(payload.get("request_id") or path.stem).strip()
+            if request_id:
+                out.add(request_id)
+        return out
+
+    @staticmethod
+    def _fragment_pull_response_ids(response_dir: Path) -> set[str]:
+        if not response_dir.exists():
+            return set()
+        out: set[str] = set()
+        for path in sorted(response_dir.glob("*.json")):
+            if path.name.startswith("."):
+                continue
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            request_id = str(payload.get("request_id") or path.stem).strip()
+            if request_id:
+                out.add(request_id)
+        return out
+
+    def _idle_fragment_pull_response_needed(self, *, request_dir: Path, response_dir: Path) -> bool:
+        requests = self._fragment_pull_request_ids(request_dir)
+        if not requests:
+            return False
+        responses = self._fragment_pull_response_ids(response_dir)
+        return bool(requests - responses)
+
+    def _request_idle_fragment_pull_response_service(
+        self,
+        *,
+        learner_id: str,
+        context: dict[str, Any],
+    ) -> bool:
+        env = context.get("env")
+        workdir = context.get("workdir")
+        service_dir = context.get("service_dir")
+        service_argv = context.get("service_argv")
+        job_argv = context.get("job_argv")
+        manifest = context.get("manifest")
+        if (
+            not isinstance(env, dict)
+            or not isinstance(workdir, Path)
+            or not isinstance(service_dir, Path)
+            or not isinstance(service_argv, list)
+            or not isinstance(job_argv, list)
+            or not isinstance(manifest, TrainingJobManifest)
+        ):
+            return False
+        _service_key, _process = self._start_or_get_service(
+            learner_id=learner_id,
+            service_argv=[str(item) for item in service_argv],
+            env=env,
+            service_dir=service_dir,
+        )
+        requests_dir = service_dir / "requests"
+        done_dir = service_dir / "done"
+        failed_dir = service_dir / "failed"
+        ack_dir = service_dir / "acks"
+        for directory in (requests_dir, done_dir, failed_dir, ack_dir):
+            directory.mkdir(parents=True, exist_ok=True)
+        request_id = "serve-fragment-pulls-idle"
+        request_path = requests_dir / f"{request_id}.json"
+        done_path = done_dir / f"{request_id}.json"
+        failed_paths = sorted(failed_dir.glob(f"{request_id}*.json"))
+        if request_path.exists() and not done_path.exists() and not failed_paths:
+            return False
+        for directory in (done_dir, failed_dir, ack_dir):
+            for stale in directory.glob(f"{request_id}*.json"):
+                stale.unlink()
+        if request_path.exists():
+            request_path.unlink()
+        self._atomic_write_json(
+            request_path,
+            {
+                "kind": "serve_fragment_pulls",
+                "request_id": request_id,
+                "job_id": manifest.job_id,
+                "run_id": manifest.run_id,
+                "round_id": int(manifest.round_id),
+                "attempt": int(manifest.attempt),
+                "argv": [str(item) for item in job_argv],
+                "env": env,
+                "workdir": str(workdir),
+                "created_unix": time.time(),
+            },
+        )
+        self._log("fragment_pull_response_service_requested", learner_id=learner_id, request_id=request_id)
+        return True
+
+    def idle_tick(
+        self,
+        *,
+        worker: WorkerIdentity | None = None,
+        signer=None,
+        transport: GrantTransport | None = None,
+        config: Any | None = None,
+    ) -> None:
         """Keep persistent learners connected to live sync while no job is active."""
 
+        self._restore_live_contexts(worker=worker, signer=signer, transport=transport, config=config)
         for learner_id, context in list(self._live_contexts.items()):
             manifest = context.get("manifest")
-            transport = context.get("transport")
+            context_transport = context.get("transport")
             input_dir = context.get("input_dir")
             env = context.get("env")
             live_control = context.get("live_control")
             response_dir = context.get("fragment_pull_response_dir")
-            worker = context.get("worker")
-            signer = context.get("signer")
+            context_worker = context.get("worker")
+            context_signer = context.get("signer")
             if (
                 not isinstance(manifest, TrainingJobManifest)
-                or transport is None
+                or context_transport is None
                 or not isinstance(input_dir, Path)
                 or not isinstance(env, dict)
-                or not isinstance(worker, WorkerIdentity)
-                or signer is None
+                or not isinstance(context_worker, WorkerIdentity)
+                or context_signer is None
             ):
                 continue
             self._best_effort_call(
@@ -1592,25 +1921,39 @@ class ExternalQuasarTrainingExecutor:
                 None,
                 self._poll_mesh_messages,
                 manifest=manifest,
-                transport=transport,
+                transport=context_transport,
                 input_dir=input_dir,
                 env=env,
                 apply_sync_fragments=True,
                 live_control=live_control,
             )
+            response_dir_path = response_dir if isinstance(response_dir, Path) else self._required_live_control_dir(
+                env,
+                "QUASAR_FRAGMENT_PULL_RESPONSE_DIR",
+                "fragment pull response directory",
+            )
+            request_dir_path = self._required_live_control_dir(
+                env,
+                "QUASAR_FRAGMENT_PULL_REQUEST_DIR",
+                "fragment pull request directory",
+            )
+            if self._idle_fragment_pull_response_needed(request_dir=request_dir_path, response_dir=response_dir_path):
+                self._best_effort_call(
+                    "fragment_pull_response_service_request_failed",
+                    False,
+                    self._request_idle_fragment_pull_response_service,
+                    learner_id=learner_id,
+                    context=context,
+                )
             context["last_pull_responses"] = self._best_effort_call(
                 "fragment_pull_response_idle_upload_failed",
                 context.get("last_pull_responses", {}),
                 self._upload_fragment_pull_responses_and_remember,
                 manifest=manifest,
-                transport=transport,
-                worker=worker,
-                signer=signer,
-                response_dir=response_dir if isinstance(response_dir, Path) else self._required_live_control_dir(
-                    env,
-                    "QUASAR_FRAGMENT_PULL_RESPONSE_DIR",
-                    "fragment pull response directory",
-                ),
+                transport=context_transport,
+                worker=context_worker,
+                signer=context_signer,
+                response_dir=response_dir_path,
                 last_uploaded=dict(context.get("last_pull_responses") or {}),
             )
 
@@ -1717,6 +2060,7 @@ class ExternalQuasarTrainingExecutor:
                     metadata_put=metadata_put,
                     learner_progress_put=learner_progress_put,
                     learner_metadata_path=learner_metadata_path,
+                    learner_state_path=self._path_from_env(env, "QUASAR_LEARNER_STATE_PATH"),
                     last_uploaded=last_uploaded,
                 )
                 last_pull_responses = self._best_effort_call(
@@ -1747,6 +2091,7 @@ class ExternalQuasarTrainingExecutor:
                 metadata_put=metadata_put,
                 learner_progress_put=learner_progress_put,
                 learner_metadata_path=learner_metadata_path,
+                learner_state_path=self._path_from_env(env, "QUASAR_LEARNER_STATE_PATH"),
                 last_uploaded=None,
             )
             self._best_effort_call(

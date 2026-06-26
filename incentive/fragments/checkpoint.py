@@ -5,12 +5,13 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shutil
 import tarfile
 import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 from incentive.bucket import paths
 from incentive.bucket.storage import ObjectStore
@@ -27,6 +28,7 @@ from incentive.model.quasar import CheckpointManifest
 
 INITIAL_PARAMETER_FRAGMENT_STATE_NAME = "initial_fragment_state.parameters.safetensors"
 PARAMETER_CONTRACT_FILENAMES = ("quasar_parameter_contract.json", "parameter_contract.json")
+CHECKPOINT_READY_MARKER = ".quasar_syncer_checkpoint_ready"
 
 
 @dataclass(frozen=True)
@@ -56,36 +58,178 @@ def _cache_key(checkpoint: CheckpointManifest) -> str:
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
+def checkpoint_fingerprint(
+    checkpoint: CheckpointManifest,
+    *,
+    checkpoint_manifest_uri: str = "",
+    fragment_count: int | None = None,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "schema_version": 1,
+        "checkpoint_manifest_uri": str(checkpoint_manifest_uri or ""),
+        "weights_uri": str(checkpoint.weights_uri or ""),
+        "weights_sha256": str(checkpoint.weights_sha256 or ""),
+        "weights_size_bytes": int(checkpoint.weights_size_bytes or 0),
+        "global_step": int(checkpoint.global_step),
+    }
+    if fragment_count is not None:
+        payload["fragment_count"] = max(1, int(fragment_count))
+    return payload
+
+
+def _fingerprint_cache_key(fingerprint: dict[str, Any]) -> str:
+    comparable = {
+        key: value
+        for key, value in fingerprint.items()
+        if key != "schema_version" and value not in (None, "")
+    }
+    return hashlib.sha256(json.dumps(comparable, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+
+
+def _candidate_model_cache_keys(checkpoint: CheckpointManifest, fingerprint: dict[str, Any]) -> list[str]:
+    candidates = [
+        _fingerprint_cache_key(fingerprint),
+        _cache_key(checkpoint),
+        hashlib.sha256(str(checkpoint.weights_uri or "").encode("utf-8")).hexdigest(),
+    ]
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in candidates:
+        if item and item not in seen:
+            seen.add(item)
+            out.append(item)
+    return out
+
+
+def _ready_marker_payload(path: Path) -> dict[str, Any] | None:
+    try:
+        raw = path.read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        return None
+    if not raw:
+        return None
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError:
+        return {"legacy_ready_marker": raw}
+    return dict(value) if isinstance(value, dict) else None
+
+
+def _ready_marker_matches(payload: dict[str, Any] | None, expected: dict[str, Any]) -> bool:
+    if not payload or payload.get("legacy_ready_marker") is not None:
+        return False
+    for key, expected_value in expected.items():
+        if key == "schema_version":
+            continue
+        if expected_value in (None, ""):
+            continue
+        actual = payload.get(key)
+        if key in {"global_step", "fragment_count", "weights_size_bytes"}:
+            try:
+                if int(actual or 0) != int(expected_value):
+                    return False
+            except (TypeError, ValueError):
+                return False
+        elif str(actual or "") != str(expected_value):
+            return False
+    return True
+
+
+def _write_ready_marker(path: Path, fingerprint: dict[str, Any]) -> None:
+    payload = dict(fingerprint)
+    payload["ready_unix"] = int(time.time())
+    path.write_text(json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
+
+
 def _cache_root() -> Path:
     return Path(os.environ.get("QUASAR_SYNCER_CACHE_DIR") or ".runtime/syncer-cache").expanduser()
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while True:
+            chunk = handle.read(64 * 1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _remove_path(path: Path) -> None:
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        return
+
+
+def _remove_stale_download_temps(parent: Path) -> None:
+    for path in parent.glob(".tmp_*"):
+        if path.is_file():
+            _remove_path(path)
+
+
+def _checkpoint_archive_is_complete(bucket: ObjectStore, checkpoint: CheckpointManifest, archive: Path) -> bool:
+    if not archive.exists() or archive.stat().st_size <= 0:
+        return False
+    if checkpoint.weights_size_bytes is not None and int(archive.stat().st_size) != int(checkpoint.weights_size_bytes):
+        return False
+    head = bucket.head(checkpoint.weights_uri)
+    if head is not None:
+        expected_size = int(head.get("size_bytes") or 0)
+        if expected_size > 0 and int(archive.stat().st_size) != expected_size:
+            return False
+    if checkpoint.weights_sha256 and _file_sha256(archive) != checkpoint.weights_sha256:
+        return False
+    return True
 
 
 def _download_checkpoint(bucket: ObjectStore, checkpoint: CheckpointManifest, cache_root: Path) -> Path:
     suffix = ".tar" if checkpoint.weights_uri.endswith(".tar") else Path(checkpoint.weights_uri).suffix or ".artifact"
     archive = cache_root / "archives" / f"{_cache_key(checkpoint)}{suffix}"
-    if archive.exists():
+    if _checkpoint_archive_is_complete(bucket, checkpoint, archive):
         return archive
     archive.parent.mkdir(parents=True, exist_ok=True)
+    _remove_path(archive)
+    _remove_stale_download_temps(archive.parent)
     bucket.get_to_path(checkpoint.weights_uri, str(archive), expected_sha256=checkpoint.weights_sha256)
+    if not _checkpoint_archive_is_complete(bucket, checkpoint, archive):
+        _remove_path(archive)
+        raise ValueError(f"downloaded checkpoint archive is incomplete: {checkpoint.weights_uri}")
     return archive
 
 
-def _checkpoint_model_dir(bucket: ObjectStore, checkpoint: CheckpointManifest, cache_root: Path) -> Path:
+def _checkpoint_model_dir(
+    bucket: ObjectStore,
+    checkpoint: CheckpointManifest,
+    cache_root: Path,
+    *,
+    checkpoint_manifest_uri: str = "",
+    fragment_count: int | None = None,
+) -> Path:
+    fingerprint = checkpoint_fingerprint(
+        checkpoint,
+        checkpoint_manifest_uri=checkpoint_manifest_uri,
+        fragment_count=fragment_count,
+    )
+    suffix = ".tar" if checkpoint.weights_uri.endswith(".tar") else Path(checkpoint.weights_uri).suffix or ".artifact"
+    model_keys = _candidate_model_cache_keys(checkpoint, fingerprint)
+    target = cache_root / "models" / model_keys[0]
+    if suffix == ".tar":
+        for key in model_keys:
+            candidate = cache_root / "models" / key
+            ready = candidate / CHECKPOINT_READY_MARKER
+            if _ready_marker_matches(_ready_marker_payload(ready), fingerprint):
+                return candidate
     archive = _download_checkpoint(bucket, checkpoint, cache_root)
     if archive.suffix != ".tar":
         return archive
-    target = cache_root / "models" / _cache_key(checkpoint)
-    ready = target / ".quasar_syncer_checkpoint_ready"
-    if ready.exists():
-        return target
     if target.exists():
-        import shutil
-
         shutil.rmtree(target)
     target.mkdir(parents=True, exist_ok=True)
     with tarfile.open(archive, "r") as handle:
         safe_extract_tar(handle, target)
-    ready.write_text("ok\n", encoding="utf-8")
+    _write_ready_marker(target / CHECKPOINT_READY_MARKER, fingerprint)
     return target
 
 
@@ -242,54 +386,81 @@ def _load_checkpoint_fragment_tensors(
         parameter_names=parameter_names,
         fragment_count=fragment_count,
     )
+    return _load_fragment_tensors_from_plan(
+        plan=plan,
+        file_by_canonical=file_by_canonical,
+        fragment_id=fragment_id,
+    )
+
+
+def _load_fragment_tensors_from_plan(
+    *,
+    plan: FragmentPlan,
+    file_by_canonical: dict[str, tuple[Path, str]],
+    fragment_id: int,
+) -> tuple[dict[str, Any], int]:
     fragment = plan.fragment(int(fragment_id) % int(plan.fragment_count))
     tensors: dict[str, Any] = {}
-    from safetensors import safe_open
-
+    names_by_path: dict[Path, list[tuple[str, str]]] = {}
     for name in fragment.tensor_names:
         path, raw_name = file_by_canonical[name]
+        names_by_path.setdefault(path, []).append((name, raw_name))
+    from safetensors import safe_open
+
+    for path, pairs in names_by_path.items():
         with safe_open(str(path), framework="pt", device="cpu") as handle:
-            tensors[name] = handle.get_tensor(raw_name)
+            for name, raw_name in pairs:
+                tensors[name] = handle.get_tensor(raw_name)
     missing = sorted(set(fragment.tensor_names) - set(tensors))
     if missing:
         raise ValueError(f"checkpoint fragment initialization missing tensors: {missing[:5]}")
     return tensors, int(plan.fragment_count)
 
 
-def ensure_initial_fragment_state_from_checkpoint(
+def _existing_initial_fragment_state(
+    bucket: ObjectStore,
+    *,
+    netuid: int,
+    run_id: str,
+    fragment_id: int,
+    fragment_count: int,
+    global_step: int,
+    force: bool,
+) -> FragmentSyncState | None:
+    existing = load_fragment_sync_state(bucket, netuid=netuid, run_id=run_id, fragment_id=fragment_id)
+    if force or existing is None or not existing.fragment_state_uri:
+        return None
+    existing_is_parameter_contract = existing.fragment_state_uri.endswith(f"/{INITIAL_PARAMETER_FRAGMENT_STATE_NAME}")
+    existing_is_merged_state = bool(existing.merge_manifest_uri) or int(existing.accepted_receipts) > 0
+    existing_is_current = int(existing.fragment_count) == int(fragment_count) and int(existing.global_step) >= int(global_step)
+    existing_object_exists = False
+    try:
+        existing_object_exists = bool(bucket.exists(existing.fragment_state_uri))
+    except Exception:
+        existing_object_exists = False
+    if (existing_is_parameter_contract or existing_is_merged_state) and existing_is_current and existing_object_exists:
+        return existing
+    if not existing_is_parameter_contract and not existing_is_merged_state:
+        raise ValueError(
+            "existing fragment sync state is not a current absolute parameter fragment; "
+            f"start a fresh run_id or remove stale state for fragment_id={int(fragment_id)}"
+        )
+    return None
+
+
+def _publish_initial_fragment_state(
     bucket: ObjectStore,
     *,
     netuid: int,
     run_id: str,
     checkpoint: CheckpointManifest,
+    tensors: dict[str, Any],
     fragment_id: int,
     fragment_count: int,
     round_id: int,
     global_step: int,
+    checkpoint_manifest_uri: str,
 ) -> FragmentSyncState:
-    existing = load_fragment_sync_state(bucket, netuid=netuid, run_id=run_id, fragment_id=fragment_id)
-    if existing is not None and existing.fragment_state_uri:
-        existing_is_parameter_contract = existing.fragment_state_uri.endswith(f"/{INITIAL_PARAMETER_FRAGMENT_STATE_NAME}")
-        existing_is_merged_state = bool(existing.merge_manifest_uri) or int(existing.accepted_receipts) > 0
-        if existing_is_parameter_contract or existing_is_merged_state:
-            return existing
-        raise ValueError(
-            "existing fragment sync state is not a current absolute parameter fragment; "
-            f"start a fresh run_id or remove stale state for fragment_id={int(fragment_id)}"
-        )
-
-    cache_root = _cache_root()
-    model_dir = _checkpoint_model_dir(bucket, checkpoint, cache_root)
-    tensors, actual_fragment_count = _load_checkpoint_fragment_tensors(
-        bucket=bucket,
-        checkpoint=checkpoint,
-        model_dir=model_dir,
-        fragment_id=fragment_id,
-        fragment_count=fragment_count,
-    )
-    if actual_fragment_count != int(fragment_count):
-        raise ValueError(f"checkpoint fragment count mismatch: {actual_fragment_count} != {int(fragment_count)}")
-
     state_uri = bucket.uri_for_key(
         f"{paths.fragment_sync_prefix(netuid, run_id, int(fragment_id))}/{INITIAL_PARAMETER_FRAGMENT_STATE_NAME}"
     )
@@ -306,8 +477,10 @@ def ensure_initial_fragment_state_from_checkpoint(
                 "global_step": int(global_step),
                 "source": "checkpoint_initial_fragment_state",
                 "parameter_contract": "checkpoint_tensor_contract",
+                "checkpoint_manifest_uri": str(checkpoint_manifest_uri or ""),
                 "checkpoint_uri": checkpoint.weights_uri,
                 "checkpoint_sha256": checkpoint.weights_sha256 or "",
+                "checkpoint_global_step": int(checkpoint.global_step),
             },
         )
         handle.flush()
@@ -331,3 +504,111 @@ def ensure_initial_fragment_state_from_checkpoint(
     bucket.put_json(bucket.uri_for_key(paths.fragment_sync_manifest_key(netuid, run_id, int(fragment_id))), payload)
     bucket.put_json(bucket.uri_for_key(paths.fragment_sync_state_key(netuid, run_id, int(fragment_id))), payload)
     return state
+
+
+def ensure_initial_fragment_states_from_checkpoint(
+    bucket: ObjectStore,
+    *,
+    netuid: int,
+    run_id: str,
+    checkpoint: CheckpointManifest,
+    fragment_ids: Iterable[int],
+    fragment_count: int,
+    round_id: int,
+    global_step: int,
+    checkpoint_manifest_uri: str = "",
+    force: bool = False,
+    progress_callback: Any | None = None,
+) -> list[FragmentSyncState]:
+    requested = sorted({int(fragment_id) % int(fragment_count) for fragment_id in fragment_ids})
+    states: dict[int, FragmentSyncState] = {}
+    pending: list[int] = []
+    for fragment_id in requested:
+        existing = _existing_initial_fragment_state(
+            bucket,
+            netuid=netuid,
+            run_id=run_id,
+            fragment_id=fragment_id,
+            fragment_count=fragment_count,
+            global_step=global_step,
+            force=force,
+        )
+        if existing is None:
+            pending.append(fragment_id)
+        else:
+            states[fragment_id] = existing
+
+    if pending:
+        cache_root = _cache_root()
+        model_dir = _checkpoint_model_dir(
+            bucket,
+            checkpoint,
+            cache_root,
+            checkpoint_manifest_uri=checkpoint_manifest_uri,
+            fragment_count=fragment_count,
+        )
+        files = _safetensor_files(model_dir)
+        if not files:
+            raise FileNotFoundError(f"checkpoint has no safetensors files under {model_dir}")
+        parameter_names = _checkpoint_parameter_names(bucket=bucket, checkpoint=checkpoint, model_dir=model_dir)
+        plan, file_by_canonical = _checkpoint_fragment_plan_from_files(
+            files=files,
+            parameter_names=parameter_names,
+            fragment_count=fragment_count,
+        )
+        if int(plan.fragment_count) != int(fragment_count):
+            raise ValueError(f"checkpoint fragment count mismatch: {int(plan.fragment_count)} != {int(fragment_count)}")
+        for fragment_id in pending:
+            tensors, actual_fragment_count = _load_fragment_tensors_from_plan(
+                plan=plan,
+                file_by_canonical=file_by_canonical,
+                fragment_id=fragment_id,
+            )
+            if actual_fragment_count != int(fragment_count):
+                raise ValueError(f"checkpoint fragment count mismatch: {actual_fragment_count} != {int(fragment_count)}")
+            state = _publish_initial_fragment_state(
+                bucket,
+                netuid=netuid,
+                run_id=run_id,
+                checkpoint=checkpoint,
+                tensors=tensors,
+                fragment_id=fragment_id,
+                fragment_count=fragment_count,
+                round_id=round_id,
+                global_step=global_step,
+                checkpoint_manifest_uri=checkpoint_manifest_uri,
+            )
+            states[fragment_id] = state
+            if callable(progress_callback):
+                progress_callback(fragment_id, state)
+            del tensors
+
+    return [states[fragment_id] for fragment_id in requested]
+
+
+def ensure_initial_fragment_state_from_checkpoint(
+    bucket: ObjectStore,
+    *,
+    netuid: int,
+    run_id: str,
+    checkpoint: CheckpointManifest,
+    fragment_id: int,
+    fragment_count: int,
+    round_id: int,
+    global_step: int,
+    checkpoint_manifest_uri: str = "",
+    force: bool = False,
+) -> FragmentSyncState:
+    states = ensure_initial_fragment_states_from_checkpoint(
+        bucket,
+        netuid=netuid,
+        run_id=run_id,
+        checkpoint=checkpoint,
+        fragment_ids=[fragment_id],
+        fragment_count=fragment_count,
+        round_id=round_id,
+        global_step=global_step,
+        checkpoint_manifest_uri=checkpoint_manifest_uri,
+        force=force,
+    )
+    return states[0]

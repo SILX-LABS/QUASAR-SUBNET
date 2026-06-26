@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
-import json
 import os
+import signal
+import threading
 import time
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -26,11 +27,15 @@ from incentive.coordination.mesh import (
     list_learner_progress,
     request_fragment_pull,
 )
-from incentive.coordination.current_run import publish_current_run
-from incentive.coordination.live_control import fragment_pull_response_grants, fragment_state_get_grant
+from incentive.coordination.current_run import publish_current_run, read_current_run
+from incentive.coordination.live_control import (
+    fragment_pull_response_grants,
+    fragment_state_get_grant,
+    live_fragment_verdict_grants,
+)
 from incentive.coordination.queue import OrchestratorQueue, scan_recent_receipt_job_ids
 from incentive.core.crypto import AssignmentEncryptor, Ed25519SealedBoxAssignmentCrypto
-from incentive.core.protocol import LiveFragmentClaim, LiveFragmentVerdict, MinerReceipt, ResourceRequirements, TrainingJobManifest, ValidatorVerdict
+from incentive.core.protocol import LiveFragmentClaim, LiveFragmentVerdict, MinerReceipt, ResourceRequirements, TrainingJobManifest
 from incentive.core.runtime import (
     env_bool as _env_bool,
     env_csv as _env_csv,
@@ -49,7 +54,11 @@ from incentive.data import (
     summarize_shards,
 )
 from incentive.fragments.artifacts import FRAGMENT_SYNC_FORMAT
-from incentive.fragments.checkpoint import ensure_initial_fragment_state_from_checkpoint
+from incentive.fragments.checkpoint import (
+    checkpoint_fingerprint,
+    ensure_initial_fragment_state_from_checkpoint,
+    ensure_initial_fragment_states_from_checkpoint,
+)
 from incentive.fragments.sync import load_fragment_sync_state
 from incentive.model import CheckpointManifest
 from incentive.orchestrator.scheduler import load_accounts, rank_targets
@@ -141,6 +150,10 @@ def _flatten_wandb_metrics(payload: dict[str, Any], *, prefix: str = "") -> dict
     return metrics
 
 
+class _SchedulerTaskTimeout(BaseException):
+    """Raised by the scheduler watchdog without being swallowed by task internals."""
+
+
 class _OrchestratorWandb:
     def __init__(self, *, config: "RunConfig", chain: ChainConfig, model: ModelConfig, signer: Signer) -> None:
         self._run = None
@@ -191,9 +204,8 @@ class _OrchestratorWandb:
                     "fragment_count": int(config.fragment_count),
                     "sync_overlap_tau": int(config.sync_overlap_tau),
                     "sync_quorum": int(config.sync_quorum),
-                    "auto_merge_release": bool(config.auto_merge_release),
+                    "auto_finalize_assignments": bool(config.auto_finalize_assignments),
                     "auto_release_checkpoints": bool(config.auto_release_checkpoints),
-                    "release_every_n_rounds": int(config.release_every_n_rounds),
                     "job_min_gpus": int(config.job_min_gpus),
                     "job_gpu_count": int(config.job_gpu_count),
                     "max_miners_per_round": int(config.max_miners_per_round),
@@ -242,7 +254,7 @@ class RunConfig:
     auto_prepare_tokens_per_shard: int = 16_777_216
     auto_prepare_sequence_length: int = 2048
     auto_prepare_shuffle_buffer_size: int = 10_000
-    max_rounds: int = 1
+    max_rounds: int = 0
     start_round_id: int = 0
     poll_interval_sec: float = 5.0
     timeout_sec: float = 0.0
@@ -266,9 +278,7 @@ class RunConfig:
     sync_min_grace_sec: float = 0.0
     sync_max_grace_sec: float = 180.0
     sync_estimated_sync_sec: float = 0.0
-    round_merge_min_grace_sec: float = 900.0
-    round_merge_max_grace_sec: float = 1800.0
-    release_every_n_rounds: int = 0
+    scheduler_task_timeout_sec: float = 540.0
     training_command: str = "python3 -m incentive.training.quasar_job"
     training_model_id: str = ""
     training_revision: str = ""
@@ -286,7 +296,7 @@ class RunConfig:
     validation_grant_ttl_sec: int = 900
     validation_job_heartbeat_ttl_sec: int = 120
     allow_validator_heartbeat_discovery: bool = False
-    auto_merge_release: bool = False
+    auto_finalize_assignments: bool = True
     auto_release_checkpoints: bool = True
     validation_target_hotkeys: list[str] = field(default_factory=list)
     merge_validator_hotkeys: list[str] = field(default_factory=list)
@@ -334,7 +344,7 @@ class RunConfig:
                 _env_int("QUASAR_SEQUENCE_LENGTH", 2048),
             ),
             auto_prepare_shuffle_buffer_size=_env_int("QUASAR_AUTO_PREPARE_SHUFFLE_BUFFER_SIZE", 10_000),
-            max_rounds=_env_int("QUASAR_ORCHESTRATOR_STEPS", _env_int("QUASAR_ORCHESTRATOR_MAX_ROUNDS", 1)),
+            max_rounds=_env_int("QUASAR_ORCHESTRATOR_STEPS", _env_int("QUASAR_ORCHESTRATOR_MAX_ROUNDS", 0)),
             start_round_id=_env_int("QUASAR_ORCHESTRATOR_START_ROUND", 0),
             poll_interval_sec=_env_float("QUASAR_ORCHESTRATOR_POLL_INTERVAL", 5.0),
             timeout_sec=_env_float("QUASAR_ORCHESTRATOR_TIMEOUT_SEC", 0.0),
@@ -358,9 +368,7 @@ class RunConfig:
             sync_min_grace_sec=_env_float("QUASAR_SYNC_MIN_GRACE_SEC", 0.0),
             sync_max_grace_sec=_env_float("QUASAR_SYNC_MAX_GRACE_SEC", 180.0),
             sync_estimated_sync_sec=_env_float("QUASAR_SYNC_ESTIMATED_SYNC_SEC", 0.0),
-            round_merge_min_grace_sec=_env_float("QUASAR_ROUND_MERGE_MIN_GRACE_SEC", 900.0),
-            round_merge_max_grace_sec=_env_float("QUASAR_ROUND_MERGE_MAX_GRACE_SEC", 1800.0),
-            release_every_n_rounds=_env_int("QUASAR_RELEASE_EVERY_N_ROUNDS", 0),
+            scheduler_task_timeout_sec=_env_float("QUASAR_SCHEDULER_TASK_TIMEOUT_SEC", 540.0),
             training_command=os.environ.get("QUASAR_TRAINING_COMMAND", "python3 -m incentive.training.quasar_job"),
             training_model_id=os.environ.get("QUASAR_TRAINING_MODEL_ID", model.model_id),
             training_revision=os.environ.get("QUASAR_TRAINING_MODEL_REVISION", model.revision),
@@ -382,7 +390,7 @@ class RunConfig:
             allow_validator_heartbeat_discovery=_env_bool("QUASAR_ALLOW_VALIDATOR_HEARTBEAT_DISCOVERY", False),
             max_miners_per_round=_env_int("QUASAR_MAX_MINERS_PER_ROUND", 0),
             multi_gpu_payout_multiplier=_env_float("QUASAR_MULTI_GPU_PAYOUT_MULTIPLIER", 1.0),
-            auto_merge_release=_env_bool("QUASAR_AUTO_MERGE_RELEASE", True),
+            auto_finalize_assignments=_env_bool("QUASAR_AUTO_FINALIZE_ASSIGNMENTS", True),
             auto_release_checkpoints=_env_bool("QUASAR_AUTO_RELEASE_CHECKPOINTS", True),
             validation_target_hotkeys=_env_csv("QUASAR_VALIDATION_TARGET_HOTKEYS", "QUASAR_VALIDATOR_HOTKEYS"),
             merge_validator_hotkeys=_env_csv("QUASAR_MERGE_VALIDATOR_HOTKEYS"),
@@ -437,19 +445,25 @@ class RunManager:
                 self._save_state(status="timeout", current_round=round_id, emitted_rounds=emitted_rounds)
                 return
 
-            self._maybe_prepare_shards_background()
-            reconcile = self.reconcile_queue()
-            self.queue.reconcile_from_bucket()
+            reconcile = self._safe_scheduler_task("reconcile_queue", self.reconcile_queue)
+            self._safe_scheduler_task(
+                "queue_refresh",
+                lambda: self.queue.reconcile_from_bucket() or {"enabled": True},
+            )
             queue_depth = self.queue.depth()
-            validation_jobs = self._maybe_emit_validation_jobs()
-            run_state = self._load_state()
-            live_sync = run_state.get("live_sync") if isinstance(run_state.get("live_sync"), dict) else {}
-            recovery = {"enabled": True, "deferred": True, "reason": "scheduler_priority"}
-            catchup = {"enabled": True, "deferred": True, "reason": "scheduler_priority"}
-            snapshot = {"enabled": False, "deferred": True, "reason": "scheduler_priority"}
-            finalization = self._maybe_finalize_pending_round(current_round=round_id, queue_depth=queue_depth)
+            release_work = {
+                "enabled": bool(self.config.auto_release_checkpoints),
+                "processed": False,
+                "reason": "checkpoint_release_deferred_until_idle",
+            }
+            live_sync = {"enabled": True, "deferred": True, "reason": "assignment_refresh_priority"}
+            maintenance_deferred = {"enabled": True, "deferred": True, "reason": "assignment_refresh_priority"}
+            validation_jobs = dict(maintenance_deferred)
+            finalization = dict(maintenance_deferred)
+            recovery = dict(maintenance_deferred)
+            catchup = dict(maintenance_deferred)
+            snapshot = dict(maintenance_deferred)
             if finalization.get("finalized"):
-                previous_live_sync = self._load_state().get("live_sync")
                 self._save_state(
                     status="round_finalized",
                     current_round=round_id,
@@ -458,286 +472,177 @@ class RunManager:
                     reconcile=reconcile,
                     validation_jobs=validation_jobs,
                     fragment_catchup=catchup,
-                    live_sync=previous_live_sync if isinstance(previous_live_sync, dict) else {},
+                    learner_recovery=recovery,
+                    snapshot=snapshot,
+                    live_sync=live_sync,
                     finalization=finalization,
+                    checkpoint_release=release_work,
                     latest_checkpoint_manifest_uri=self.checkpoint_manifest_uri,
                     latest_global_step=self.checkpoint.global_step,
                 )
                 self._emit_event({"event": "round_finalized", "run_id": self.config.run_id, **finalization})
                 time.sleep(self.config.poll_interval_sec)
                 continue
-            if finalization.get("pending"):
-                release_work = self._maybe_process_pending_checkpoint_release(queue_depth=queue_depth)
-                if release_work.get("processed") or release_work.get("reason") == "checkpoint_release_failed":
-                    self._save_state(
-                        status="checkpoint_release_processed" if release_work.get("processed") else "checkpoint_release_failed",
-                        current_round=round_id,
-                        emitted_rounds=emitted_rounds,
-                        queue_depth=queue_depth,
-                        reconcile=reconcile,
-                        validation_jobs=validation_jobs,
-                        live_sync=live_sync,
-                        finalization=finalization,
-                        checkpoint_release=release_work,
-                        latest_checkpoint_manifest_uri=self.checkpoint_manifest_uri,
-                        latest_global_step=self.checkpoint.global_step,
-                    )
-                    self._emit_event({"event": "checkpoint_release", "run_id": self.config.run_id, **release_work})
-                    time.sleep(self.config.poll_interval_sec)
-                    continue
-                miners = self.discover_workers()
-                eligible_miners = self._miners_with_capacity(miners)
-                if (
-                    finalization.get("reason") == "waiting_for_receipts"
-                    and bool(finalization.get("all_jobs_terminal_without_receipts"))
-                    and int(finalization.get("queue_depth") or 0) == 0
-                    and not eligible_miners
-                ):
-                    finalized = self._mark_round_finalized(
-                        round_id=int(finalization.get("round_id", round_id - 1)),
-                        status="skipped_no_receipts",
-                        reason="all round jobs ended without receipts and no eligible miners are available",
-                        validation=finalization.get("validation") if isinstance(finalization.get("validation"), dict) else {},
-                    )
-                    self._save_state(
-                        status="round_finalized",
-                        current_round=round_id,
-                        emitted_rounds=emitted_rounds,
-                        queue_depth=self.queue.depth(),
-                        reconcile=reconcile,
-                        validation_jobs=validation_jobs,
-                        live_sync=live_sync,
-                        finalization=finalized,
-                        data_catalog=self._catalog_state(),
-                    )
-                    self._emit_event({"event": "round_finalized", "run_id": self.config.run_id, **finalized})
-                    time.sleep(self.config.poll_interval_sec)
-                    continue
-                if eligible_miners and (not self.config.max_rounds or emitted_rounds < self.config.max_rounds):
-                    jobs = self.emit_round(round_id=round_id, miners=eligible_miners)
-                    emitted_rounds += 1
-                    self._save_state(
-                        status="round_emitted_pending_finalization",
-                        current_round=round_id + 1,
-                        emitted_rounds=emitted_rounds,
-                        queue_depth=self.queue.depth(),
-                        job_ids=[job.manifest.job_id for job in jobs],
-                        miners=[target.hotkey for target in eligible_miners],
-                        reconcile=reconcile,
-                        validation_jobs=validation_jobs,
-                        live_sync=live_sync,
-                        finalization=finalization,
-                        pending_round_assignment_policy="current_round_only",
-                        data_catalog=self._catalog_state(),
-                    )
-                    self._emit_event(
-                        {
-                            "event": "round_emitted_pending_finalization",
-                            "run_id": self.config.run_id,
-                            "round_id": round_id,
-                            "jobs": len(jobs),
-                            "miners": [target.hotkey for target in eligible_miners],
-                            "queue_depth": self.queue.depth(),
-                            "pending_round_id": finalization.get("round_id"),
-                            "pending_reason": finalization.get("reason"),
-                            "pending_round_assignment_policy": "current_round_only",
-                            "train_sources": summarize_shards(self.shards),
-                        }
-                    )
-                    round_id += 1
-                    time.sleep(self.config.poll_interval_sec)
-                    continue
-                recovery = self._maybe_coordinate_learner_recovery()
-                catchup = self._maybe_broadcast_fragment_catchup()
-                snapshot = self._maybe_initiate_chandy_lamport_snapshot(round_id=round_id)
-                live_sync = self._maybe_sync_live_fragment(round_id=round_id)
-                self._save_state(
-                    status="waiting_for_finalization",
-                    current_round=round_id,
-                    emitted_rounds=emitted_rounds,
-                    queue_depth=queue_depth,
-                    reconcile=reconcile,
-                    validation_jobs=validation_jobs,
-                    live_sync=live_sync,
-                    finalization=finalization,
-                )
-                self._emit_event({"event": "waiting_for_finalization", "run_id": self.config.run_id, **finalization})
-                time.sleep(self.config.poll_interval_sec)
-                continue
 
-            miners = self.discover_workers()
+            miners, discovery = self._discover_workers_for_tick()
             eligible_miners = self._miners_with_capacity(miners)
-            release_work = self._maybe_process_pending_checkpoint_release(queue_depth=queue_depth)
-            if release_work.get("processed") or release_work.get("reason") == "checkpoint_release_failed":
-                self._save_state(
-                    status="checkpoint_release_processed" if release_work.get("processed") else "checkpoint_release_failed",
-                    current_round=round_id,
-                    emitted_rounds=emitted_rounds,
-                    queue_depth=queue_depth,
-                    miners=[target.hotkey for target in miners],
-                    reconcile=reconcile,
-                    validation_jobs=validation_jobs,
-                    live_sync=live_sync,
-                    finalization=finalization,
-                    checkpoint_release=release_work,
-                    latest_checkpoint_manifest_uri=self.checkpoint_manifest_uri,
-                    latest_global_step=self.checkpoint.global_step,
+            if not self._assignment_emission_allowed(emitted_rounds):
+                self._safe_scheduler_task(
+                    "auto_prepare",
+                    lambda: self._maybe_prepare_shards_background() or {"enabled": True},
                 )
-                self._emit_event({"event": "checkpoint_release", "run_id": self.config.run_id, **release_work})
-                time.sleep(self.config.poll_interval_sec)
-                continue
-            if eligible_miners and (not self.config.max_rounds or emitted_rounds < self.config.max_rounds):
-                jobs = self.emit_round(round_id=round_id, miners=eligible_miners)
-                emitted_rounds += 1
-                self._save_state(
-                    status="round_emitted",
-                    current_round=round_id + 1,
-                    emitted_rounds=emitted_rounds,
-                    queue_depth=self.queue.depth(),
-                    job_ids=[job.manifest.job_id for job in jobs],
-                    miners=[target.hotkey for target in eligible_miners],
-                    reconcile=reconcile,
-                    validation_jobs=validation_jobs,
-                    live_sync=live_sync,
-                    finalization=finalization,
-                    data_catalog=self._catalog_state(),
+                validation_jobs = self._safe_scheduler_task("validation_jobs", self._maybe_emit_validation_jobs)
+                finalization = self._safe_scheduler_task(
+                    "finalization",
+                    lambda: self._maybe_finalize_pending_round(current_round=round_id),
                 )
-                self._emit_event(
-                    {
-                        "event": "round_emitted",
-                        "run_id": self.config.run_id,
-                        "round_id": round_id,
-                        "jobs": len(jobs),
-                        "miners": [target.hotkey for target in eligible_miners],
-                        "queue_depth": self.queue.depth(),
-                        "finalization_pending": bool(finalization.get("pending")),
-                        "train_sources": summarize_shards(self.shards),
-                    }
+                recovery = self._safe_scheduler_task("learner_recovery", self._maybe_coordinate_learner_recovery)
+                catchup = self._safe_scheduler_task("fragment_catchup", self._maybe_broadcast_fragment_catchup)
+                snapshot = self._safe_scheduler_task(
+                    "snapshot",
+                    lambda: self._maybe_initiate_chandy_lamport_snapshot(round_id=round_id),
                 )
-                round_id += 1
-                time.sleep(self.config.poll_interval_sec)
-                continue
-
-            recovery = self._maybe_coordinate_learner_recovery()
-            catchup = self._maybe_broadcast_fragment_catchup()
-            snapshot = self._maybe_initiate_chandy_lamport_snapshot(round_id=round_id)
-            live_sync = self._maybe_sync_live_fragment(round_id=round_id)
-
-            release_work = self._maybe_process_pending_checkpoint_release(queue_depth=queue_depth)
-            if release_work.get("processed") or release_work.get("reason") == "checkpoint_release_failed":
+                live_sync = self._safe_scheduler_task(
+                    "live_sync",
+                    lambda: self._maybe_sync_live_fragment(round_id=round_id),
+                )
+                release_work = self._safe_scheduler_task(
+                    "checkpoint_release",
+                    self._maybe_process_pending_checkpoint_release,
+                )
                 self._save_state(
-                    status="checkpoint_release_processed" if release_work.get("processed") else "checkpoint_release_failed",
+                    status="assignment_budget_exhausted",
                     current_round=round_id,
                     emitted_rounds=emitted_rounds,
                     queue_depth=queue_depth,
                     reconcile=reconcile,
+                    discovery=discovery,
                     validation_jobs=validation_jobs,
                     fragment_catchup=catchup,
+                    learner_recovery=recovery,
+                    snapshot=snapshot,
                     live_sync=live_sync,
                     finalization=finalization,
                     checkpoint_release=release_work,
+                    assignment_limit=int(self.config.max_rounds or 0),
                     latest_checkpoint_manifest_uri=self.checkpoint_manifest_uri,
                     latest_global_step=self.checkpoint.global_step,
                 )
-                self._emit_event({"event": "checkpoint_release", "run_id": self.config.run_id, **release_work})
-                time.sleep(self.config.poll_interval_sec)
-                continue
-            if self.config.max_rounds and emitted_rounds >= self.config.max_rounds:
-                release_work = self._maybe_process_pending_checkpoint_release(queue_depth=queue_depth)
-                if release_work.get("processed"):
-                    self._save_state(
-                        status="checkpoint_release_processed",
-                        current_round=round_id,
-                        emitted_rounds=emitted_rounds,
-                        queue_depth=queue_depth,
-                        reconcile=reconcile,
-                        validation_jobs=validation_jobs,
-                        live_sync=live_sync,
-                        checkpoint_release=release_work,
-                    )
-                    time.sleep(self.config.poll_interval_sec)
-                    continue
-                self._save_state(status="complete", current_round=round_id, emitted_rounds=emitted_rounds)
-                return
-
-            miners = self.discover_workers()
-            eligible_miners = self._miners_with_capacity(miners)
-            if eligible_miners:
-                jobs = self.emit_round(round_id=round_id, miners=eligible_miners)
-                emitted_rounds += 1
-                self._save_state(
-                    status="round_emitted",
-                    current_round=round_id + 1,
-                    emitted_rounds=emitted_rounds,
-                    queue_depth=self.queue.depth(),
-                    job_ids=[job.manifest.job_id for job in jobs],
-                    miners=[target.hotkey for target in eligible_miners],
-                    reconcile=reconcile,
-                    validation_jobs=validation_jobs,
-                    live_sync=live_sync,
-                    finalization=finalization,
-                    data_catalog=self._catalog_state(),
-                )
                 self._emit_event(
                     {
-                        "event": "round_emitted",
+                        "event": "assignment_budget_exhausted",
                         "run_id": self.config.run_id,
-                        "round_id": round_id,
-                        "jobs": len(jobs),
-                        "miners": [target.hotkey for target in eligible_miners],
-                        "queue_depth": self.queue.depth(),
-                        "finalization_pending": bool(finalization.get("pending")),
-                        "train_sources": summarize_shards(self.shards),
+                        "emitted_rounds": int(emitted_rounds),
+                        "assignment_limit": int(self.config.max_rounds or 0),
+                        "live_sync_reason": live_sync.get("reason") if isinstance(live_sync, dict) else "",
                     }
                 )
+                time.sleep(self.config.poll_interval_sec)
+                continue
+
+            if eligible_miners:
+                emitted_rounds, live_sync = self._emit_round_and_sync(
+                    round_id=round_id,
+                    emitted_rounds=emitted_rounds,
+                    eligible_miners=eligible_miners,
+                    status="round_emitted",
+                    event="round_emitted",
+                    reconcile=reconcile,
+                    validation_jobs=validation_jobs,
+                    finalization=finalization,
+                    live_sync=live_sync,
+                    state_extra={
+                        "discovery": discovery,
+                        "fragment_catchup": catchup,
+                        "learner_recovery": recovery,
+                        "snapshot": snapshot,
+                        "checkpoint_release": release_work,
+                    },
+                )
                 round_id += 1
+                if not self._assignment_emission_allowed(emitted_rounds):
+                    self._save_state(
+                        status="complete",
+                        current_round=round_id,
+                        emitted_rounds=emitted_rounds,
+                        queue_depth=self.queue.depth(),
+                        reconcile=reconcile,
+                        validation_jobs=validation_jobs,
+                        finalization=finalization,
+                        live_sync=live_sync,
+                        discovery=discovery,
+                        fragment_catchup=catchup,
+                        learner_recovery=recovery,
+                        snapshot=snapshot,
+                        latest_checkpoint_manifest_uri=self.checkpoint_manifest_uri,
+                        latest_global_step=self.checkpoint.global_step,
+                        checkpoint_release=release_work,
+                    )
+                    return
                 time.sleep(self.config.poll_interval_sec)
                 continue
 
             if not miners:
-                release_work = self._maybe_process_pending_checkpoint_release(queue_depth=queue_depth)
-                if release_work.get("processed"):
-                    self._save_state(
-                        status="checkpoint_release_processed",
-                        current_round=round_id,
-                        emitted_rounds=emitted_rounds,
-                        queue_depth=queue_depth,
-                        reconcile=reconcile,
-                        validation_jobs=validation_jobs,
-                        live_sync=live_sync,
-                        checkpoint_release=release_work,
-                    )
-                    time.sleep(self.config.poll_interval_sec)
-                    continue
+                self._safe_scheduler_task(
+                    "auto_prepare",
+                    lambda: self._maybe_prepare_shards_background() or {"enabled": True},
+                )
+                validation_jobs = self._safe_scheduler_task("validation_jobs", self._maybe_emit_validation_jobs)
+                finalization = self._safe_scheduler_task(
+                    "finalization",
+                    lambda: self._maybe_finalize_pending_round(current_round=round_id),
+                )
+                recovery = self._safe_scheduler_task("learner_recovery", self._maybe_coordinate_learner_recovery)
+                catchup = self._safe_scheduler_task("fragment_catchup", self._maybe_broadcast_fragment_catchup)
+                snapshot = self._safe_scheduler_task(
+                    "snapshot",
+                    lambda: self._maybe_initiate_chandy_lamport_snapshot(round_id=round_id),
+                )
+                live_sync = self._safe_scheduler_task(
+                    "live_sync",
+                    lambda: self._maybe_sync_live_fragment(round_id=round_id),
+                )
+                release_work = self._safe_scheduler_task(
+                    "checkpoint_release",
+                    self._maybe_process_pending_checkpoint_release,
+                )
                 self._save_state(
                     status="waiting_for_miners",
                     current_round=round_id,
                     emitted_rounds=emitted_rounds,
-                    queue_depth=0,
+                    queue_depth=queue_depth,
                     reconcile=reconcile,
+                    discovery=discovery,
                     validation_jobs=validation_jobs,
+                    fragment_catchup=catchup,
+                    learner_recovery=recovery,
+                    snapshot=snapshot,
                     live_sync=live_sync,
+                    checkpoint_release=release_work,
                 )
                 self._emit_event({"event": "waiting_for_miners", "run_id": self.config.run_id})
                 time.sleep(self.config.poll_interval_sec)
                 continue
 
-            release_work = self._maybe_process_pending_checkpoint_release(queue_depth=queue_depth)
-            if release_work.get("processed"):
-                self._save_state(
-                    status="checkpoint_release_processed",
-                    current_round=round_id,
-                    emitted_rounds=emitted_rounds,
-                    queue_depth=queue_depth,
-                    miners=[target.hotkey for target in miners],
-                    reconcile=reconcile,
-                    validation_jobs=validation_jobs,
-                    live_sync=live_sync,
-                    checkpoint_release=release_work,
-                )
-                time.sleep(self.config.poll_interval_sec)
-                continue
-
+            self._safe_scheduler_task(
+                "auto_prepare",
+                lambda: self._maybe_prepare_shards_background() or {"enabled": True},
+            )
+            validation_jobs = self._safe_scheduler_task("validation_jobs", self._maybe_emit_validation_jobs)
+            finalization = self._safe_scheduler_task(
+                "finalization",
+                lambda: self._maybe_finalize_pending_round(current_round=round_id),
+            )
+            recovery = self._safe_scheduler_task("learner_recovery", self._maybe_coordinate_learner_recovery)
+            catchup = self._safe_scheduler_task("fragment_catchup", self._maybe_broadcast_fragment_catchup)
+            snapshot = self._safe_scheduler_task(
+                "snapshot",
+                lambda: self._maybe_initiate_chandy_lamport_snapshot(round_id=round_id),
+            )
+            live_sync = self._safe_scheduler_task(
+                "live_sync",
+                lambda: self._maybe_sync_live_fragment(round_id=round_id),
+            )
             self._save_state(
                 status="waiting_for_capacity",
                 current_round=round_id,
@@ -745,17 +650,180 @@ class RunManager:
                 queue_depth=queue_depth,
                 miners=[target.hotkey for target in miners],
                 reconcile=reconcile,
+                discovery=discovery,
                 validation_jobs=validation_jobs,
+                fragment_catchup=catchup,
+                learner_recovery=recovery,
+                snapshot=snapshot,
                 live_sync=live_sync,
+                checkpoint_release=release_work,
             )
             self._emit_event({"event": "waiting_for_capacity", "run_id": self.config.run_id, "queue_depth": queue_depth})
             time.sleep(self.config.poll_interval_sec)
+
+    def _safe_scheduler_task(self, name: str, fn: Any) -> dict[str, Any]:
+        timeout_sec = self._scheduler_task_timeout_sec(name)
+        use_alarm = (
+            timeout_sec > 0.0
+            and threading.current_thread() is threading.main_thread()
+            and hasattr(signal, "SIGALRM")
+            and hasattr(signal, "ITIMER_REAL")
+        )
+        old_handler = None
+        old_timer: tuple[float, float] | None = None
+        started = time.monotonic()
+        if use_alarm:
+            def _timeout(_signum: int, _frame: Any) -> None:
+                raise _SchedulerTaskTimeout(f"{name} exceeded scheduler timeout of {timeout_sec:.1f}s")
+
+            old_handler = signal.getsignal(signal.SIGALRM)
+            signal.signal(signal.SIGALRM, _timeout)
+            old_timer = signal.setitimer(signal.ITIMER_REAL, timeout_sec)
+        try:
+            result = fn()
+        except _SchedulerTaskTimeout as exc:
+            error = f"{type(exc).__name__}: {exc}"
+            self._emit_event({"event": "scheduler_task_failed", "task": name, "error": error})
+            return {"enabled": True, "error": error, "reason": f"{name}_failed", "timeout_sec": timeout_sec}
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
+            self._emit_event({"event": "scheduler_task_failed", "task": name, "error": error})
+            return {"enabled": True, "error": error, "reason": f"{name}_failed"}
+        finally:
+            if use_alarm:
+                elapsed = max(0.0, time.monotonic() - started)
+                signal.setitimer(signal.ITIMER_REAL, 0.0)
+                if old_handler is not None:
+                    signal.signal(signal.SIGALRM, old_handler)
+                if old_timer is not None and old_timer[0] > 0.0:
+                    signal.setitimer(signal.ITIMER_REAL, max(0.001, old_timer[0] - elapsed), old_timer[1])
+        return result if isinstance(result, dict) else {"enabled": True, "result": result}
+
+    @staticmethod
+    def _state_has_active_live_sync(state: dict[str, Any]) -> bool:
+        terminal_statuses = {"broadcast", "expired", "failed", "merged"}
+        terminal_ids: set[str] = set()
+        for request_id, record in dict(state.get("live_sync_request_history") or {}).items():
+            if not str(request_id) or not isinstance(record, dict):
+                continue
+            if str(record.get("result_status") or record.get("status") or "") in terminal_statuses:
+                terminal_ids.add(str(request_id))
+        for request_id, request in dict(state.get("live_sync_requests") or {}).items():
+            if not isinstance(request, dict):
+                continue
+            if str(request_id) in terminal_ids:
+                continue
+            if str(request.get("status") or "requested") not in terminal_statuses:
+                return True
+        return False
+
+    def _scheduler_task_timeout_sec(self, name: str) -> float:
+        task_name = str(name).lower().replace("-", "_")
+        env_name = f"QUASAR_{str(name).upper().replace('-', '_')}_TASK_TIMEOUT_SEC"
+        if os.environ.get(env_name):
+            try:
+                requested = max(0.0, float(os.environ[env_name]))
+            except ValueError:
+                requested = max(0.0, float(self.config.scheduler_task_timeout_sec))
+            if task_name == "live_sync" and requested > 0.0:
+                return max(requested, self._live_sync_merge_timeout_sec() + 60.0)
+            return requested
+        if task_name == "live_sync":
+            try:
+                if not self._checkpoint_bootstrap_ready_from_state(self._load_state()):
+                    return 0.0
+            except Exception:
+                pass
+            return max(
+                max(0.0, float(self.config.scheduler_task_timeout_sec)),
+                self._live_sync_merge_timeout_sec() + 60.0,
+            )
+        if task_name == "checkpoint_release":
+            return 0.0
+        if task_name in {
+            "auto_prepare",
+            "discover_workers",
+            "load_accounts",
+            "queue_refresh",
+            "reconcile_queue",
+            "validation_jobs",
+        }:
+            return min(120.0, max(0.0, float(self.config.scheduler_task_timeout_sec)))
+        return max(0.0, float(self.config.scheduler_task_timeout_sec))
+
+    def _assignment_emission_allowed(self, emitted_rounds: int) -> bool:
+        limit = int(self.config.max_rounds or 0)
+        return limit <= 0 or int(emitted_rounds) < limit
+
+    def _discover_workers_for_tick(self) -> tuple[list[MinerTarget], dict[str, Any]]:
+        result = self._safe_scheduler_task("discover_workers", lambda: {"miners": self.discover_workers()})
+        miners = result.get("miners") if isinstance(result, dict) else []
+        if not isinstance(miners, list):
+            miners = []
+        summary = dict(result) if isinstance(result, dict) else {"enabled": True}
+        summary["miner_count"] = len(miners)
+        summary.pop("miners", None)
+        return miners, summary
+
+    def _emit_round_and_sync(
+        self,
+        *,
+        round_id: int,
+        emitted_rounds: int,
+        eligible_miners: list[MinerTarget],
+        status: str,
+        event: str,
+        reconcile: dict[str, Any],
+        validation_jobs: dict[str, Any],
+        finalization: dict[str, Any],
+        live_sync: dict[str, Any] | None = None,
+        state_extra: dict[str, Any] | None = None,
+        event_extra: dict[str, Any] | None = None,
+    ) -> tuple[int, dict[str, Any]]:
+        jobs = self.emit_round(round_id=round_id, miners=eligible_miners)
+        emitted_rounds += 1
+        live_sync_payload: dict[str, Any] = (
+            dict(live_sync)
+            if isinstance(live_sync, dict) and live_sync
+            else {"enabled": True, "pending": True, "reason": "post_emit_live_sync_deferred"}
+        )
+        state_payload = {
+            "status": status,
+            "current_round": int(round_id) + 1,
+            "emitted_rounds": emitted_rounds,
+            "queue_depth": self.queue.depth(),
+            "job_ids": [job.manifest.job_id for job in jobs],
+            "miners": [target.hotkey for target in eligible_miners],
+            "reconcile": reconcile,
+            "validation_jobs": validation_jobs,
+            "live_sync": live_sync_payload,
+            "finalization": finalization,
+            "data_catalog": self._catalog_state(),
+        }
+        if state_extra:
+            state_payload.update(state_extra)
+        self._save_state(**state_payload)
+        event_payload = {
+            "event": event,
+            "run_id": self.config.run_id,
+            "round_id": int(round_id),
+            "jobs": len(jobs),
+            "miners": [target.hotkey for target in eligible_miners],
+            "queue_depth": self.queue.depth(),
+            "finalization_pending": bool(finalization.get("pending")),
+            "train_sources": summarize_shards(self.shards),
+        }
+        if event_extra:
+            event_payload.update(event_extra)
+        self._emit_event(event_payload)
+        return emitted_rounds, live_sync_payload
 
     def bootstrap(self) -> None:
         if not self.config.run_id:
             raise ValueError("QUASAR_RUN_ID or --run-id is required")
         if not self.config.checkpoint_manifest_uri:
             raise ValueError("QUASAR_CHECKPOINT_MANIFEST_URI or --checkpoint-manifest-uri is required")
+        self._refresh_checkpoint_from_state(self._load_state())
         self._validate_initial_checkpoint_for_live_sync()
         self.bucket.put_json(
             self.bucket.uri_for_key(paths.run_config_key(self.config.netuid, self.config.run_id)),
@@ -793,6 +861,7 @@ class RunManager:
                 "publish shard manifests under the data catalog or pass --shard-manifest-uri for a manual run"
             )
         state = self._load_state()
+        self._refresh_checkpoint_from_state(state)
         self._save_state(
             status="bootstrapped",
             current_round=int(state.get("current_round", self.config.start_round_id)),
@@ -802,6 +871,56 @@ class RunManager:
             latest_global_step=self.checkpoint.global_step,
             data_catalog=self._catalog_state(),
         )
+        publish_current_run(
+            self.bucket,
+            netuid=self.config.netuid,
+            run_id=self.config.run_id,
+            owner_hotkey=getattr(self.signer, "identity", ""),
+            checkpoint_manifest_uri=self.checkpoint_manifest_uri,
+            metadata={"role": "orchestrator", "global_step": int(self.checkpoint.global_step)},
+        )
+
+    def reset_live_sync_to_checkpoint(self, *, reason: str = "operator_reset") -> dict[str, Any]:
+        state = self._load_state()
+        self._refresh_checkpoint_from_state(state)
+        base_step = int(self.checkpoint.global_step)
+        now = time.time()
+        existing_requests = sorted(str(request_id) for request_id in dict(state.get("live_sync_requests") or {}))
+        reset = {
+            "enabled": True,
+            "pending": False,
+            "reason": str(reason or "operator_reset"),
+            "reset": True,
+            "reset_unix": now,
+            "cleared_requests": existing_requests,
+            "global_step": base_step,
+            "next_request_step": base_step,
+            "checkpoint_manifest_uri": self.checkpoint_manifest_uri,
+        }
+        self._save_state(
+            status="live_sync_reset",
+            current_round=int(state.get("current_round", self.config.start_round_id) or self.config.start_round_id),
+            emitted_rounds=int(state.get("emitted_rounds", 0) or 0),
+            queue_depth=self.queue.depth(),
+            live_sync_requests={},
+            live_sync_request_attempts={},
+            live_sync_next_request_step=base_step,
+            live_sync_global_step=base_step,
+            live_sync_timing={},
+            live_sync=reset,
+            latest_checkpoint_manifest_uri=self.checkpoint_manifest_uri,
+            latest_global_step=base_step,
+        )
+        publish_current_run(
+            self.bucket,
+            netuid=self.config.netuid,
+            run_id=self.config.run_id,
+            owner_hotkey=getattr(self.signer, "identity", ""),
+            checkpoint_manifest_uri=self.checkpoint_manifest_uri,
+            metadata={"role": "orchestrator", "global_step": base_step},
+        )
+        self._emit_event({"event": "live_sync_reset", "run_id": self.config.run_id, **reset})
+        return reset
 
     def discover_workers(self) -> list[MinerTarget]:
         heartbeats = [
@@ -878,12 +997,20 @@ class RunManager:
 
     def _miners_with_capacity(self, miners: list[MinerTarget]) -> list[MinerTarget]:
         max_inflight = max(1, int(self.config.max_inflight_per_hotkey))
-        accounts = load_accounts(
-            self.bucket,
-            netuid=self.config.netuid,
-            run_id=self.config.run_id,
-            validator_hotkeys=self._merge_validator_hotkeys(),
+        account_result = self._safe_scheduler_task(
+            "load_accounts",
+            lambda: {
+                "accounts": load_accounts(
+                    self.bucket,
+                    netuid=self.config.netuid,
+                    run_id=self.config.run_id,
+                    validator_hotkeys=self._merge_validator_hotkeys(),
+                )
+            },
         )
+        accounts = account_result.get("accounts") if isinstance(account_result, dict) else {}
+        if not isinstance(accounts, dict):
+            accounts = {}
         candidates = [
             target
             for target in miners
@@ -900,37 +1027,13 @@ class RunManager:
             ranked = ranked[: self.config.max_miners_per_round]
         return ranked
 
-    def _without_round_active_assignments(self, *, round_id: int, miners: list[MinerTarget]) -> list[MinerTarget]:
-        if not miners:
-            return []
-        round_job_ids = self._round_job_ids(round_id)
-        if not round_job_ids:
-            return miners
-        skipped_job_ids = self._round_skipped_job_ids(round_id)
-        active_worker_keys: set[tuple[str, str]] = set()
-        active_hotkeys_without_worker: set[str] = set()
-        for entry in self.queue.entries():
-            if entry.job_id not in round_job_ids or entry.job_id in skipped_job_ids:
-                continue
-            if entry.assigned_worker:
-                active_worker_keys.add((entry.assigned_hotkey, entry.assigned_worker))
-            else:
-                active_hotkeys_without_worker.add(entry.assigned_hotkey)
-        if not active_worker_keys and not active_hotkeys_without_worker:
-            return miners
-        return [
-            miner
-            for miner in miners
-            if (miner.hotkey, miner.worker_id) not in active_worker_keys
-            and miner.hotkey not in active_hotkeys_without_worker
-        ]
-
     def reconcile_queue(self) -> dict[str, Any]:
         self.queue.reconcile_from_bucket()
         before = self.queue.depth()
         expired = self.queue.prune_expired()
         removed: list[str] = []
         skipped: list[str] = []
+        obsolete: list[str] = []
         receipt_job_ids = scan_recent_receipt_job_ids(
             self.bucket,
             netuid=self.config.netuid,
@@ -954,6 +1057,30 @@ class RunManager:
                 if self.queue.remove(entry.job_id):
                     skipped.append(entry.job_id)
                 break
+        for entry in list(self.queue.entries()):
+            obsolete_reason = self._obsolete_queue_entry_reason(entry)
+            if not obsolete_reason:
+                continue
+            if self.queue.remove(entry.job_id):
+                obsolete.append(entry.job_id)
+                self._mark_queue_entry_skipped(
+                    entry,
+                    source="orchestrator-obsolete-checkpoint",
+                    reason=obsolete_reason,
+                )
+        live_heartbeats = self._live_training_heartbeats_by_worker()
+        abandoned: list[str] = []
+        for entry in list(self.queue.entries()):
+            abandoned_reason = self._abandoned_queue_entry_reason(entry, live_heartbeats)
+            if not abandoned_reason:
+                continue
+            if self.queue.remove(entry.job_id):
+                abandoned.append(entry.job_id)
+                self._mark_queue_entry_skipped(
+                    entry,
+                    source="orchestrator-abandoned-lease",
+                    reason=abandoned_reason,
+                )
         live_workers = self._live_training_worker_keys()
         live_hotkeys = {hotkey for hotkey, _worker_id in live_workers}
         inactive: list[str] = []
@@ -978,11 +1105,96 @@ class RunManager:
             "removed_receipted_jobs": removed,
             "removed_expired_jobs": [entry.job_id for entry in expired],
             "removed_skipped_jobs": skipped,
+            "removed_obsolete_checkpoint_jobs": obsolete,
+            "removed_abandoned_lease_jobs": abandoned,
             "removed_inactive_jobs": inactive,
             "scanned_receipt_jobs": len(receipt_job_ids),
             "receipt_errors": 0,
             "flushed": flushed,
         }
+
+    def _live_training_heartbeats_by_worker(self) -> dict[tuple[str, str | None], WorkerHeartbeat]:
+        return {
+            (heartbeat.hotkey, heartbeat.worker_id): heartbeat
+            for heartbeat in list_heartbeats(
+                self.bucket,
+                netuid=self.config.netuid,
+                max_age_sec=self.config.heartbeat_ttl_sec,
+                role="miner",
+            )
+            if heartbeat.run_id == self.config.run_id
+            and heartbeat.status not in {"offline", "stopped"}
+            and _is_training_worker_heartbeat(heartbeat)
+        }
+
+    def _abandoned_queue_entry_reason(
+        self,
+        entry: Any,
+        live_heartbeats: dict[tuple[str, str | None], WorkerHeartbeat],
+    ) -> str:
+        worker_id = str(getattr(entry, "assigned_worker", "") or "")
+        if not worker_id:
+            return ""
+        heartbeat = live_heartbeats.get((str(entry.assigned_hotkey), worker_id))
+        if heartbeat is None:
+            return ""
+        capabilities = dict(heartbeat.capabilities or {})
+        active_job_id = str(capabilities.get("active_job_id") or "").strip()
+        queue_status = str(capabilities.get("queue_status") or "").strip().lower()
+        if active_job_id == str(entry.job_id):
+            return ""
+        created_unix = int(getattr(entry, "created_unix", 0) or 0)
+        last_seen_unix = int(getattr(heartbeat, "last_seen_unix", 0) or 0)
+        if created_unix <= 0 or last_seen_unix <= created_unix:
+            return ""
+        lease_window_sec = max(30, int(self.config.grant_ttl_sec), int(self.config.heartbeat_ttl_sec) * 2)
+        if "queue_status" not in capabilities and "active_job_id" not in capabilities:
+            if last_seen_unix >= created_unix + lease_window_sec:
+                return (
+                    "assigned worker heartbeat does not publish active queue lease "
+                    f"after grant window (age={last_seen_unix - created_unix}s, lease_window={lease_window_sec}s)"
+                )
+            return ""
+        if active_job_id:
+            return (
+                "assigned worker reports a different active job "
+                f"(queued={entry.job_id}, active={active_job_id})"
+            )
+        stale_after = created_unix + max(30, int(self.config.heartbeat_ttl_sec))
+        if queue_status in {"idle", "waiting", "waiting_for_orchestrator_jobs"} and last_seen_unix >= stale_after:
+            return "assigned worker reports idle after this queue lease was created"
+        return ""
+
+    def _obsolete_queue_entry_reason(self, entry: Any) -> str:
+        try:
+            manifest = TrainingJobManifest.from_dict(self.bucket.get_json(entry.manifest_uri))
+        except Exception as exc:
+            self._emit_event(
+                {
+                    "event": "queue_obsolete_checkpoint_manifest_read_failed",
+                    "run_id": self.config.run_id,
+                    "job_id": str(getattr(entry, "job_id", "")),
+                    "manifest_uri": str(getattr(entry, "manifest_uri", "")),
+                    "error_type": type(exc).__name__,
+                    "error": str(exc)[:500],
+                }
+            )
+            return ""
+        active_step = int(getattr(self.checkpoint, "global_step", 0) or 0)
+        job_step = int(manifest.global_step)
+        if job_step < active_step:
+            return (
+                "job checkpoint global_step is older than active checkpoint "
+                f"(job={job_step}, active={active_step})"
+            )
+        active_weights_uri = str(getattr(self.checkpoint, "weights_uri", "") or "")
+        job_checkpoint_uri = str(getattr(manifest.checkpoint_ref, "uri", "") or "")
+        if job_step == active_step and active_weights_uri and job_checkpoint_uri and job_checkpoint_uri != active_weights_uri:
+            return (
+                "job checkpoint weights URI differs from active checkpoint "
+                f"(job={job_checkpoint_uri}, active={active_weights_uri})"
+            )
+        return ""
 
     def _mark_queue_entry_skipped(self, entry: Any, *, source: str, reason: str) -> None:
         job_dir = paths.job_manifest_key(self.config.netuid, self.config.run_id, entry.job_id).rsplit("/", 1)[0]
@@ -1239,11 +1451,47 @@ class RunManager:
     def _set_checkpoint(self, manifest_uri: str) -> None:
         self.checkpoint_manifest_uri = manifest_uri
         self.checkpoint = self._load_checkpoint(manifest_uri)
+        if self.config.checkpoint_manifest_uri != manifest_uri:
+            self.config = replace(self.config, checkpoint_manifest_uri=manifest_uri)
 
     def _refresh_checkpoint_from_state(self, state: dict[str, Any]) -> None:
+        candidates: list[str] = []
         latest = str(state.get("latest_checkpoint_manifest_uri") or "")
-        if latest and latest != self.checkpoint_manifest_uri and self.bucket.exists(latest):
-            self._set_checkpoint(latest)
+        if latest:
+            candidates.append(latest)
+        try:
+            current = read_current_run(self.bucket, netuid=self.config.netuid)
+            if current.run_id == self.config.run_id and current.checkpoint_manifest_uri:
+                candidates.append(str(current.checkpoint_manifest_uri))
+        except Exception:
+            pass
+        fallback_steps: list[int] = []
+        for value in (state.get("last_live_checkpoint_release_step"), state.get("latest_global_step")):
+            try:
+                step = int(value or 0)
+            except (TypeError, ValueError):
+                continue
+            if step > int(getattr(self.checkpoint, "global_step", 0) or 0) and step not in fallback_steps:
+                fallback_steps.append(step)
+            candidates.append(self.bucket.uri_for_key(paths.checkpoint_manifest_key(self.config.netuid, step)))
+
+        best_uri = self.checkpoint_manifest_uri
+        best_step = int(getattr(self.checkpoint, "global_step", 0) or 0)
+        for uri in candidates:
+            if not uri:
+                continue
+            try:
+                if not self.bucket.exists(uri):
+                    continue
+                checkpoint = CheckpointManifest.from_dict(self.bucket.get_json(uri))
+            except Exception:
+                continue
+            step = int(checkpoint.global_step)
+            if step > best_step or (step == best_step and uri != best_uri and uri == latest):
+                best_uri = uri
+                best_step = step
+        if best_uri != self.checkpoint_manifest_uri:
+            self._set_checkpoint(best_uri)
 
     def _maybe_emit_validation_jobs(self) -> dict[str, Any]:
         if not self.config.auto_validation_jobs:
@@ -1353,9 +1601,11 @@ class RunManager:
             if target_learner == source_progress.learner_id:
                 continue
             progress = progresses.get(target_learner)
-            stale = progress is None or (float(progress.created_unix or 0.0) and now - float(progress.created_unix) > self.config.heartbeat_ttl_sec)
-            recovering = str(heartbeat.status or "").lower() in {"recovering", "rejoining", "ready"}
-            if not stale or not recovering:
+            if str(heartbeat.status or "").lower() in {"offline", "stopped"}:
+                continue
+            progress_created = float(getattr(progress, "created_unix", 0.0) or 0.0) if progress is not None else 0.0
+            stale = progress is None or not progress_created or now - progress_created > self.config.heartbeat_ttl_sec
+            if not stale:
                 continue
             target_global_step = int(progress.global_step) if progress is not None else 0
             buffered_syncs: list[dict[str, Any]] = []
@@ -1605,52 +1855,349 @@ class RunManager:
     def _configured_validation_hotkeys(self) -> list[str]:
         return _dedupe_hotkeys([*self._merge_validator_hotkeys(), *self.config.validation_target_hotkeys])
 
-    def _maybe_finalize_pending_round(self, *, current_round: int, queue_depth: int) -> dict[str, Any]:
-        if not self.config.auto_merge_release:
+    def _maybe_finalize_pending_round(self, *, current_round: int) -> dict[str, Any]:
+        if not self.config.auto_finalize_assignments:
             return {"enabled": False}
         pending_round = self._oldest_unfinalized_round(current_round=current_round)
         if pending_round is None:
             return {"enabled": True, "pending": False}
-        pending_queue_depth = self._round_queue_depth(pending_round)
-        readiness = self._round_validation_readiness(round_id=pending_round, queue_depth=pending_queue_depth)
-        if pending_queue_depth > 0 and not readiness.get("sync_ready"):
-            return {
-                "enabled": True,
-                "pending": True,
-                "round_id": pending_round,
-                "reason": "waiting_for_receipts",
-                "queue_depth": pending_queue_depth,
-                "validation": readiness,
-            }
-        if readiness.get("pending"):
-            return readiness
-        if int(readiness.get("receipt_count") or 0) == 0:
-            skipped_job_ids = self._round_skipped_job_ids(pending_round)
-            round_job_ids = self._round_job_ids(pending_round)
-            all_terminal = bool(round_job_ids) and pending_queue_depth == 0 and round_job_ids.issubset(skipped_job_ids)
-            return {
-                "enabled": True,
-                "pending": True,
-                "round_id": pending_round,
-                "reason": "waiting_for_receipts",
-                "queue_depth": pending_queue_depth,
-                "validation": readiness,
-                "all_jobs_terminal_without_receipts": all_terminal,
-                "terminal_job_count": len(skipped_job_ids),
-                "round_job_count": len(round_job_ids),
-            }
-        if int(readiness.get("accepted_quorum_receipts") or 0) == 0:
-            return self._mark_round_finalized(
-                round_id=pending_round,
-                status="skipped_no_accepted_updates",
-                reason="validator quorum rejected every receipt",
-                validation=readiness,
+        return self._finalize_round(
+            round_id=pending_round,
+            reason=(
+                "round_id is legacy assignment metadata only; "
+                "jobs remain in lifecycle queues and live sync is authoritative"
+            ),
+        )
+
+    def _checkpoint_bootstrap_fingerprint(self) -> dict[str, Any]:
+        return checkpoint_fingerprint(
+            self.checkpoint,
+            checkpoint_manifest_uri=self.checkpoint_manifest_uri,
+            fragment_count=max(1, int(self.config.fragment_count)),
+        )
+
+    @staticmethod
+    def _checkpoint_bootstrap_fingerprint_matches(actual: dict[str, Any], expected: dict[str, Any]) -> bool:
+        if not actual:
+            return False
+        for key, expected_value in expected.items():
+            if key == "schema_version":
+                continue
+            if expected_value in (None, ""):
+                continue
+            actual_value = actual.get(key)
+            if key in {"global_step", "fragment_count", "weights_size_bytes"}:
+                try:
+                    if int(actual_value or 0) != int(expected_value):
+                        return False
+                except (TypeError, ValueError):
+                    return False
+            elif str(actual_value or "") != str(expected_value):
+                return False
+        return True
+
+    def _checkpoint_bootstrap_ready_from_state(self, state: dict[str, Any]) -> bool:
+        bootstrap = dict(state.get("checkpoint_bootstrap") or {})
+        if str(bootstrap.get("status") or "") != "ready":
+            return False
+        expected = self._checkpoint_bootstrap_fingerprint()
+        if not self._checkpoint_bootstrap_fingerprint_matches(
+            dict(bootstrap.get("checkpoint_fingerprint") or {}),
+            expected,
+        ):
+            return False
+        fragment_count = max(1, int(expected.get("fragment_count") or self.config.fragment_count))
+        completed: set[int] = set()
+        for item in bootstrap.get("completed_fragments") or []:
+            try:
+                completed.add(int(item))
+            except (TypeError, ValueError):
+                continue
+        return completed == set(range(fragment_count))
+
+    def _fragment_sync_state_bootstrap_ready(
+        self,
+        *,
+        fragment_id: int,
+        fragment_count: int,
+        base_global_step: int,
+    ) -> bool:
+        try:
+            state = load_fragment_sync_state(
+                self.bucket,
+                netuid=self.config.netuid,
+                run_id=self.config.run_id,
+                fragment_id=fragment_id,
             )
-        return self._finalize_round(round_id=pending_round)
+        except Exception:
+            return False
+        if state is None:
+            return False
+        if state.artifact_format != FRAGMENT_SYNC_FORMAT:
+            return False
+        if int(state.fragment_id) != int(fragment_id) or int(state.fragment_count) != int(fragment_count):
+            return False
+        if int(state.global_step) < int(base_global_step):
+            return False
+        if not state.fragment_state_uri or not state.fragment_state_sha256:
+            return False
+        try:
+            return self.bucket.exists(state.fragment_state_uri)
+        except Exception:
+            return False
+
+    def _save_checkpoint_bootstrap_state(
+        self,
+        *,
+        status: str,
+        fingerprint: dict[str, Any],
+        fragment_count: int,
+        completed_fragments: list[int],
+        round_id: int,
+        base_global_step: int,
+        current_fragment: int | None = None,
+        failures: list[dict[str, Any]] | None = None,
+        started_unix: float | None = None,
+    ) -> dict[str, Any]:
+        now = time.time()
+        completed = sorted({int(item) for item in completed_fragments})
+        missing = [fragment_id for fragment_id in range(max(1, int(fragment_count))) if fragment_id not in set(completed)]
+        bootstrap: dict[str, Any] = {
+            "schema_version": 1,
+            "status": str(status),
+            "checkpoint_fingerprint": dict(fingerprint),
+            "checkpoint_manifest_uri": self.checkpoint_manifest_uri,
+            "fragment_count": int(fragment_count),
+            "completed_fragments": completed,
+            "missing_fragments": missing,
+            "round_id": int(round_id),
+            "base_global_step": int(base_global_step),
+            "started_unix": float(started_unix if started_unix is not None else now),
+            "updated_unix": now,
+        }
+        if current_fragment is not None:
+            bootstrap["current_fragment"] = int(current_fragment)
+        if failures:
+            bootstrap["failures"] = list(failures)
+            bootstrap["last_error"] = str(failures[-1].get("error") or "")
+        live_sync: dict[str, Any] = {
+            "enabled": True,
+            "pending": str(status) != "ready",
+            "reason": "bootstrap_ready" if str(status) == "ready" else "initial_fragment_state_bootstrapping",
+            "status": str(status),
+            "checkpoint_manifest_uri": self.checkpoint_manifest_uri,
+            "fragment_count": int(fragment_count),
+            "completed_fragments": len(completed),
+            "missing_fragments": missing,
+            "global_step": int(base_global_step),
+        }
+        if current_fragment is not None:
+            live_sync["fragment_id"] = int(current_fragment)
+        if failures:
+            live_sync["reason"] = "initial_fragment_state_not_ready"
+            live_sync["error"] = str(failures[-1].get("error") or "")
+        state_update: dict[str, Any] = {
+            "checkpoint_bootstrap": bootstrap,
+            "latest_checkpoint_manifest_uri": self.checkpoint_manifest_uri,
+            "latest_global_step": int(base_global_step),
+        }
+        state = self._load_state()
+        has_protocol_state = bool(dict(state.get("live_sync_requests") or {})) or int(
+            state.get("live_sync_global_step", base_global_step) or base_global_step
+        ) > int(base_global_step)
+        if str(status) != "ready" or not has_protocol_state:
+            state_update["live_sync"] = live_sync
+        self._save_state(**state_update)
+        return bootstrap
+
+    def _ensure_initial_live_fragment_states(self, *, round_id: int) -> dict[str, Any]:
+        fragment_count = max(1, int(self.config.fragment_count))
+        base_global_step = int(self.checkpoint.global_step)
+        fingerprint = self._checkpoint_bootstrap_fingerprint()
+        state = self._load_state()
+        existing = dict(state.get("checkpoint_bootstrap") or {})
+        existing_matches = self._checkpoint_bootstrap_fingerprint_matches(
+            dict(existing.get("checkpoint_fingerprint") or {}),
+            fingerprint,
+        )
+        started_unix = float(existing.get("started_unix") or time.time()) if existing_matches else time.time()
+        completed: list[int] = []
+        if existing_matches:
+            for fragment_id in range(fragment_count):
+                if self._fragment_sync_state_bootstrap_ready(
+                    fragment_id=fragment_id,
+                    fragment_count=fragment_count,
+                    base_global_step=base_global_step,
+                ):
+                    completed.append(fragment_id)
+        if len(completed) == fragment_count:
+            bootstrap = self._save_checkpoint_bootstrap_state(
+                status="ready",
+                fingerprint=fingerprint,
+                fragment_count=fragment_count,
+                completed_fragments=completed,
+                round_id=round_id,
+                base_global_step=base_global_step,
+                started_unix=started_unix,
+            )
+            return {
+                "enabled": True,
+                "pending": False,
+                "ready": True,
+                "reason": "bootstrap_ready",
+                "checkpoint_bootstrap": bootstrap,
+                "completed_fragments": len(completed),
+                "fragment_count": fragment_count,
+                "global_step": base_global_step,
+            }
+
+        completed_set = set(completed)
+        self._save_checkpoint_bootstrap_state(
+            status="running",
+            fingerprint=fingerprint,
+            fragment_count=fragment_count,
+            completed_fragments=sorted(completed_set),
+            round_id=round_id,
+            base_global_step=base_global_step,
+            started_unix=started_unix,
+        )
+        missing_fragments = [fragment_id for fragment_id in range(fragment_count) if fragment_id not in completed_set]
+        if missing_fragments:
+            self._save_checkpoint_bootstrap_state(
+                status="running",
+                fingerprint=fingerprint,
+                fragment_count=fragment_count,
+                completed_fragments=sorted(completed_set),
+                current_fragment=missing_fragments[0],
+                round_id=round_id,
+                base_global_step=base_global_step,
+                started_unix=started_unix,
+            )
+
+            def _bootstrap_progress(fragment_id: int, _state: Any) -> None:
+                completed_set.add(int(fragment_id))
+                self._save_checkpoint_bootstrap_state(
+                    status="running",
+                    fingerprint=fingerprint,
+                    fragment_count=fragment_count,
+                    completed_fragments=sorted(completed_set),
+                    current_fragment=int(fragment_id),
+                    round_id=round_id,
+                    base_global_step=base_global_step,
+                    started_unix=started_unix,
+                )
+
+            try:
+                ensure_initial_fragment_states_from_checkpoint(
+                    self.bucket,
+                    netuid=self.config.netuid,
+                    run_id=self.config.run_id,
+                    checkpoint=self.checkpoint,
+                    fragment_ids=missing_fragments,
+                    fragment_count=fragment_count,
+                    round_id=round_id,
+                    global_step=base_global_step,
+                    checkpoint_manifest_uri=self.checkpoint_manifest_uri,
+                    force=not existing_matches,
+                    progress_callback=_bootstrap_progress,
+                )
+            except Exception as exc:
+                current_fragment = next((item for item in missing_fragments if item not in completed_set), missing_fragments[0])
+                failure = {
+                    "fragment_id": int(current_fragment),
+                    "error_type": type(exc).__name__,
+                    "error": f"{type(exc).__name__}: {exc}",
+                    "failed_unix": time.time(),
+                }
+                bootstrap = self._save_checkpoint_bootstrap_state(
+                    status="failed",
+                    fingerprint=fingerprint,
+                    fragment_count=fragment_count,
+                    completed_fragments=sorted(completed_set),
+                    current_fragment=current_fragment,
+                    failures=[failure],
+                    round_id=round_id,
+                    base_global_step=base_global_step,
+                    started_unix=started_unix,
+                )
+                return {
+                    "enabled": True,
+                    "pending": True,
+                    "ready": False,
+                    "reason": "initial_fragment_state_not_ready",
+                    "checkpoint_bootstrap": bootstrap,
+                    "fragment_id": int(current_fragment),
+                    "fragment_count": fragment_count,
+                    "global_step": base_global_step,
+                    "completed_fragments": len(completed_set),
+                    "error": failure["error"],
+                }
+
+        for fragment_id in range(fragment_count):
+            if self._fragment_sync_state_bootstrap_ready(
+                fragment_id=fragment_id,
+                fragment_count=fragment_count,
+                base_global_step=base_global_step,
+            ):
+                completed_set.add(fragment_id)
+                continue
+            else:
+                failure = {
+                    "fragment_id": int(fragment_id),
+                    "error_type": "MissingFragmentState",
+                    "error": "initial fragment state write did not publish a usable latest fragment pointer",
+                    "failed_unix": time.time(),
+                }
+                bootstrap = self._save_checkpoint_bootstrap_state(
+                    status="failed",
+                    fingerprint=fingerprint,
+                    fragment_count=fragment_count,
+                    completed_fragments=sorted(completed_set),
+                    current_fragment=fragment_id,
+                    failures=[failure],
+                    round_id=round_id,
+                    base_global_step=base_global_step,
+                    started_unix=started_unix,
+                )
+                return {
+                    "enabled": True,
+                    "pending": True,
+                    "ready": False,
+                    "reason": "initial_fragment_state_not_ready",
+                    "checkpoint_bootstrap": bootstrap,
+                    "fragment_id": int(fragment_id),
+                    "fragment_count": fragment_count,
+                    "global_step": base_global_step,
+                    "completed_fragments": len(completed_set),
+                    "error": failure["error"],
+                }
+
+        bootstrap = self._save_checkpoint_bootstrap_state(
+            status="ready",
+            fingerprint=fingerprint,
+            fragment_count=fragment_count,
+            completed_fragments=sorted(completed_set),
+            round_id=round_id,
+            base_global_step=base_global_step,
+            started_unix=started_unix,
+        )
+        return {
+            "enabled": True,
+            "pending": False,
+            "ready": True,
+            "reason": "bootstrap_ready",
+            "checkpoint_bootstrap": bootstrap,
+            "completed_fragments": len(completed_set),
+            "fragment_count": fragment_count,
+            "global_step": base_global_step,
+        }
 
     def _maybe_sync_live_fragment(self, *, round_id: int) -> dict[str, Any]:
         quorum = max(1, int(self.config.sync_quorum))
         fragment_count = max(1, int(self.config.fragment_count))
+        bootstrap = self._ensure_initial_live_fragment_states(round_id=round_id)
+        if not bootstrap.get("ready"):
+            return bootstrap
         all_progresses = list_learner_progress(self.bucket, netuid=self.config.netuid, run_id=self.config.run_id)
         live_learner_ids = self._live_training_learner_ids()
         progresses = [item for item in all_progresses if item.learner_id in live_learner_ids]
@@ -1672,14 +2219,87 @@ class RunManager:
             for step, attempt in dict(state.get("live_sync_request_attempts") or {}).items()
             if str(step)
         }
+        request_attempts = self._live_sync_request_attempts_from_history(state, request_attempts)
+        history = self._live_sync_request_history_from_state(state)
+        history_terminal = self._terminal_live_sync_request_history({"live_sync_request_history": history})
         metadata_by_learner = {item.learner_id: item for item in progresses}
         merged: list[dict[str, Any]] = []
         pending: list[dict[str, Any]] = []
         failed: list[dict[str, Any]] = []
         retry_steps: list[int] = []
         max_merged_step = int(state.get("live_sync_global_step", self.checkpoint.global_step))
+        active_steps = {
+            int(request.get("global_step") or 0)
+            for request in requests.values()
+            if isinstance(request, dict)
+        }
+        if active_steps:
+            max_merged_step = min(max_merged_step, min(active_steps))
+        max_merged_step = self._advance_contiguous_live_sync_step_from_history(
+            state=state,
+            active_steps=active_steps,
+            cursor=max_merged_step,
+        )
+
+        def commit_live_sync_progress() -> None:
+            self._save_state(
+                live_sync_requests=requests,
+                live_sync_request_attempts=request_attempts,
+                live_sync_request_history=history,
+                live_sync_global_step=max_merged_step,
+                live_sync_timing=timing,
+            )
+
+        def record_live_sync_result(result: dict[str, Any]) -> None:
+            nonlocal history, history_terminal
+            history = self._live_sync_request_history_with_result(
+                {"live_sync_request_history": history},
+                result,
+            )
+            history_terminal = self._terminal_live_sync_request_history({"live_sync_request_history": history})
 
         for request_id in sorted(list(requests), key=lambda key: self._live_request_sort_key(requests[key])):
+            if request_id in history_terminal:
+                terminal = dict(history_terminal[request_id])
+                requests.pop(request_id, None)
+                retry_step = int(terminal.get("global_step") or requests.get(request_id, {}).get("global_step") or 0)
+                if str(terminal.get("result_status") or terminal.get("status") or "") not in {"broadcast", "merged"}:
+                    retry_steps.append(retry_step)
+                    request_attempts[str(retry_step)] = max(
+                        int(request_attempts.get(str(retry_step), 0) or 0),
+                        self._next_live_sync_request_attempt(request_id),
+                    )
+                commit_live_sync_progress()
+                continue
+            request_step = int(requests[request_id].get("global_step") or 0)
+            if request_step < max_merged_step:
+                obsolete_request = dict(requests.get(request_id) or {})
+                requests.pop(request_id, None)
+                obsolete = {
+                    "status": "expired",
+                    "reason": "live_fragment_request_obsolete",
+                    "request_id": request_id,
+                    "global_step": request_step,
+                    "fragment_id": int(obsolete_request.get("fragment_id") or request_step % fragment_count),
+                    "live_sync_global_step": max_merged_step,
+                }
+                failed.append(obsolete)
+                record_live_sync_result(obsolete)
+                commit_live_sync_progress()
+                continue
+            if request_step > max_merged_step:
+                pending.append(
+                    {
+                        "status": "pending",
+                        "reason": "waiting_for_prior_live_sync_step",
+                        "request_id": request_id,
+                        "global_step": request_step,
+                        "fragment_id": int(requests[request_id].get("fragment_id") or request_step % fragment_count),
+                        "live_sync_global_step": max_merged_step,
+                        "request": dict(requests[request_id]),
+                    }
+                )
+                continue
             result = self._advance_live_sync_request(
                 request=dict(requests[request_id]),
                 round_id=round_id,
@@ -1688,6 +2308,10 @@ class RunManager:
                 live_learner_ids=live_learner_ids,
                 metadata_by_learner=metadata_by_learner,
                 timing=timing,
+                commit_request_state=lambda updated_request: (
+                    requests.__setitem__(request_id, dict(updated_request)),
+                    commit_live_sync_progress(),
+                ),
             )
             status = str(result.get("status") or "")
             if status in {"merged", "expired"}:
@@ -1705,15 +2329,23 @@ class RunManager:
                     retry_step = int(result.get("global_step") or 0)
                     retry_steps.append(retry_step)
                     request_attempts[str(retry_step)] = max(0, int(request_attempts.get(str(retry_step), 0) or 0)) + 1
+                record_live_sync_result(result)
+                commit_live_sync_progress()
                 continue
             if status == "failed":
                 failed.append(result)
                 requests.pop(request_id, None)
+                retry_step = int(result.get("global_step") or 0)
+                retry_steps.append(retry_step)
+                request_attempts[str(retry_step)] = max(0, int(request_attempts.get(str(retry_step), 0) or 0)) + 1
+                record_live_sync_result(result)
+                commit_live_sync_progress()
                 continue
             else:
                 pending.append(result)
             if isinstance(result.get("request"), dict):
                 requests[request_id] = dict(result["request"])
+                commit_live_sync_progress()
 
         requested: list[dict[str, Any]] = []
         blocked: dict[str, Any] | None = None
@@ -1734,11 +2366,18 @@ class RunManager:
             fragment_count=fragment_count,
             next_request_step=next_request_step,
             active_requests=requests,
+            lower_bound=max_merged_step,
         )
+        retry_floor = int(self.checkpoint.global_step)
+        if gap_step is not None:
+            retry_floor = min(retry_floor, int(gap_step))
+        retry_steps = [step for step in retry_steps if int(step) >= retry_floor]
         if retry_steps:
             next_request_step = min(next_request_step, min(retry_steps))
         if gap_step is not None:
             next_request_step = min(next_request_step, gap_step)
+        if (retry_steps or gap_step is not None) and next_request_step < max_merged_step:
+            max_merged_step = next_request_step
         while len(requests) < max_inflight:
             created = self._create_live_sync_request(
                 global_step=next_request_step,
@@ -1757,12 +2396,25 @@ class RunManager:
             request = dict(created["request"])
             requests[str(request["request_id"])] = request
             requested.append(created)
+            max_merged_step = min(max_merged_step, int(request.get("global_step") or max_merged_step))
+            commit_live_sync_progress()
             next_request_step += 1
+        if requests:
+            next_request_step = max(
+                next_request_step,
+                max(int(request.get("global_step") or 0) for request in requests.values()) + 1,
+            )
 
+        retain_attempts_from = min(
+            [int(max_merged_step), int(next_request_step)]
+            + [int(step) for step in active_steps]
+            + [int(step) for step in retry_steps]
+            + ([] if gap_step is None else [int(gap_step)])
+        )
         live_attempts_next: dict[str, int] = {}
         for step, attempt in request_attempts.items():
             try:
-                if int(step) >= int(max_merged_step):
+                if int(step) >= int(retain_attempts_from):
                     live_attempts_next[str(step)] = max(0, int(attempt))
             except (TypeError, ValueError):
                 continue
@@ -1792,6 +2444,7 @@ class RunManager:
             "pending_requests": pending,
             "failed_requests": failed,
             "blocked": blocked,
+            "checkpoint_bootstrap": bootstrap.get("checkpoint_bootstrap"),
             "timing": timing,
         }
         if merged:
@@ -1838,16 +2491,189 @@ class RunManager:
         )
 
     def _live_sync_requests_from_state(self, state: dict[str, Any]) -> dict[str, dict[str, Any]]:
+        terminal_ids = set(self._terminal_live_sync_request_history(state))
+        terminal_statuses = {"broadcast", "expired", "failed", "merged"}
         return {
             str(request_id): dict(request)
             for request_id, request in dict(state.get("live_sync_requests") or {}).items()
-            if isinstance(request, dict) and str(request_id)
+            if isinstance(request, dict)
+            and str(request_id)
+            and str(request_id) not in terminal_ids
+            and str(request.get("status") or "requested") not in terminal_statuses
         }
+
+    @staticmethod
+    def _live_sync_request_attempt_from_id(request_id: str) -> int:
+        suffix = "-retry-"
+        if suffix not in request_id:
+            return 0
+        try:
+            return max(0, int(request_id.rsplit(suffix, 1)[1]))
+        except (TypeError, ValueError):
+            return 0
+
+    @classmethod
+    def _next_live_sync_request_attempt(cls, request_id: str) -> int:
+        return cls._live_sync_request_attempt_from_id(request_id) + 1
+
+    def _terminal_live_sync_request_history(self, state: dict[str, Any]) -> dict[str, dict[str, Any]]:
+        terminal: dict[str, dict[str, Any]] = {}
+        for request_id, record in dict(state.get("live_sync_request_history") or {}).items():
+            if not str(request_id) or not isinstance(record, dict):
+                continue
+            status = str(record.get("result_status") or record.get("status") or "")
+            if status in {"broadcast", "merged", "expired", "failed"}:
+                terminal[str(request_id)] = dict(record)
+        return terminal
+
+    def _live_sync_request_attempts_from_history(
+        self,
+        state: dict[str, Any],
+        request_attempts: dict[str, int],
+    ) -> dict[str, int]:
+        attempts = {str(step): max(0, int(attempt)) for step, attempt in dict(request_attempts).items() if str(step)}
+        for request_id, record in self._terminal_live_sync_request_history(state).items():
+            try:
+                step = int(record.get("global_step") or 0)
+            except (TypeError, ValueError):
+                continue
+            if step <= 0:
+                continue
+            attempts[str(step)] = max(
+                int(attempts.get(str(step), 0) or 0),
+                self._next_live_sync_request_attempt(str(request_id)),
+            )
+        return attempts
+
+    @staticmethod
+    def _advance_contiguous_live_sync_step_from_history(
+        *,
+        state: dict[str, Any],
+        active_steps: set[int],
+        cursor: int,
+    ) -> int:
+        history_by_step: dict[int, int] = {}
+        for record in dict(state.get("live_sync_request_history") or {}).values():
+            if not isinstance(record, dict):
+                continue
+            status = str(record.get("result_status") or record.get("status") or "")
+            if status not in {"broadcast", "merged"}:
+                continue
+            try:
+                step = int(record.get("global_step") or 0)
+                next_step = int(record.get("next_global_step") or step + 1)
+            except (TypeError, ValueError):
+                continue
+            if next_step > step:
+                history_by_step[step] = max(next_step, history_by_step.get(step, step))
+        current = int(cursor)
+        while current not in active_steps and current in history_by_step:
+            next_step = int(history_by_step[current])
+            if next_step <= current:
+                break
+            current = next_step
+        return current
+
+    @staticmethod
+    def _live_sync_request_history_from_state(state: dict[str, Any]) -> dict[str, dict[str, Any]]:
+        return {
+            str(key): dict(value)
+            for key, value in dict(state.get("live_sync_request_history") or {}).items()
+            if isinstance(value, dict)
+        }
+
+    def _live_sync_request_history_with_result(
+        self,
+        state: dict[str, Any],
+        result: dict[str, Any],
+    ) -> dict[str, dict[str, Any]]:
+        request_id = str(result.get("request_id") or "")
+        if not request_id:
+            return self._live_sync_request_history_from_state(state)
+        history = self._live_sync_request_history_from_state(state)
+        status = str(result.get("status") or "")
+        lifecycle_status = status
+        if status == "merged":
+            lifecycle_status = "broadcast" if result.get("fragment_state_uri") else "merged"
+        record = {
+            "request_id": request_id,
+            "status": lifecycle_status,
+            "result_status": status,
+            "reason": str(result.get("reason") or ""),
+            "global_step": int(result.get("global_step") or 0),
+            "fragment_id": int(result.get("fragment_id") or 0),
+            "next_global_step": int(result.get("next_global_step") or 0),
+            "finished_unix": time.time(),
+        }
+        for key in (
+            "round_id",
+            "accepted_updates",
+            "ready_responses",
+            "accepted_live_verdicts",
+            "fragment_state_uri",
+            "fragment_state_sha256",
+            "error",
+        ):
+            if key in result:
+                record[key] = result[key]
+        history[request_id] = record
+        if len(history) > 512:
+            ordered = sorted(
+                history.items(),
+                key=lambda item: (
+                    int(dict(item[1]).get("global_step") or 0),
+                    float(dict(item[1]).get("finished_unix") or 0.0),
+                    str(item[0]),
+                ),
+            )
+            history = dict(ordered[-512:])
+        return history
+
+    def _record_live_sync_request_history(self, result: dict[str, Any]) -> None:
+        history = self._live_sync_request_history_with_result(self._load_state(), result)
+        self._save_state(live_sync_request_history=history)
 
     def _live_sync_request_ttl_sec(self) -> float:
         heartbeat_window = max(1.0, float(self.config.heartbeat_ttl_sec) * 2.0)
         grant_window = max(1.0, float(self.config.grant_ttl_sec))
-        return min(grant_window, heartbeat_window)
+        configured = os.environ.get("QUASAR_LIVE_SYNC_REQUEST_TTL_SEC", "").strip()
+        if configured:
+            try:
+                requested = max(1.0, float(configured))
+            except ValueError:
+                requested = 900.0
+        else:
+            requested = max(900.0, heartbeat_window)
+        return min(grant_window, requested)
+
+    def _live_request_verdict_grants_expired(self, request: dict[str, Any], *, now: float) -> bool:
+        grants_by_learner = request.get("verdict_grants")
+        if not isinstance(grants_by_learner, dict) or not grants_by_learner:
+            return False
+        expirations: list[int] = []
+        for learner_grants in grants_by_learner.values():
+            if not isinstance(learner_grants, dict):
+                continue
+            for grant in learner_grants.values():
+                if not isinstance(grant, dict):
+                    continue
+                try:
+                    expires_unix = int(grant.get("expires_unix") or 0)
+                except (TypeError, ValueError):
+                    expires_unix = 0
+                if expires_unix > 0:
+                    expirations.append(expires_unix)
+        if not expirations:
+            return False
+        min_remaining_sec = min(120.0, max(0.0, float(self.config.grant_ttl_sec) * 0.25))
+        return max(expirations) <= int(float(now) + min_remaining_sec)
+
+    def _live_sync_merge_timeout_sec(self) -> float:
+        grant_window = max(1.0, float(self.config.grant_ttl_sec))
+        return max(900.0, min(grant_window, 3600.0))
+
+    def _live_sync_merge_max_attempts(self) -> int:
+        return max(1, _env_int("QUASAR_LIVE_SYNC_MERGE_MAX_ATTEMPTS", 3))
 
     def _earliest_unmerged_live_sync_step(
         self,
@@ -1855,24 +2681,48 @@ class RunManager:
         fragment_count: int,
         next_request_step: int,
         active_requests: dict[str, dict[str, Any]],
+        lower_bound: int | None = None,
     ) -> int | None:
         active_steps = {
             int(request.get("global_step") or 0)
             for request in active_requests.values()
             if isinstance(request, dict)
         }
-        lower_bound = int(self.checkpoint.global_step)
+        active_fragments = {
+            int(request.get("fragment_id") or 0)
+            for request in active_requests.values()
+            if isinstance(request, dict)
+        }
+        checkpoint_step = int(self.checkpoint.global_step)
+        cursor = max(checkpoint_step, int(lower_bound if lower_bound is not None else checkpoint_step))
+        bootstrap_cutoff = checkpoint_step + max(1, int(fragment_count))
+        lower_bound = checkpoint_step if cursor < bootstrap_cutoff else cursor
         upper_bound = max(lower_bound, int(next_request_step))
         for step in range(lower_bound, upper_bound):
             if step in active_steps:
                 continue
             fragment_id = step % max(1, int(fragment_count))
-            state = load_fragment_sync_state(
-                self.bucket,
-                netuid=self.config.netuid,
-                run_id=self.config.run_id,
-                fragment_id=fragment_id,
-            )
+            if fragment_id in active_fragments:
+                continue
+            try:
+                state = load_fragment_sync_state(
+                    self.bucket,
+                    netuid=self.config.netuid,
+                    run_id=self.config.run_id,
+                    fragment_id=fragment_id,
+                )
+            except Exception as exc:
+                self._emit_event(
+                    {
+                        "event": "live_sync_gap_state_read_failed",
+                        "run_id": self.config.run_id,
+                        "global_step": int(step),
+                        "fragment_id": int(fragment_id),
+                        "error_type": type(exc).__name__,
+                        "error": str(exc)[:500],
+                    }
+                )
+                continue
             if state is not None and (not state.merge_manifest_uri or int(state.accepted_receipts) <= 0):
                 return step
         return None
@@ -1933,7 +2783,7 @@ class RunManager:
             "live_sync": {
                 "enabled": True,
                 "pending": True,
-                "reason": "initial_fragment_state_bootstrapping",
+                "reason": "bootstrap_ready_preparing_pull",
                 "fragment_id": fragment_id,
                 "global_step": int(global_step),
                 "learner_metadata_count": len(candidates),
@@ -1952,28 +2802,26 @@ class RunManager:
             state_update["live_sync_global_step"] = int(max_merged_step)
         self._save_state(**state_update)
         try:
-            initial_state = self._ensure_initial_live_fragment_state(
+            previous_state = self._live_fragment_state_for_pull(
                 fragment_id=fragment_id,
                 fragment_count=fragment_count,
-                global_step=int(global_step),
-                round_id=round_id,
             )
         except Exception as exc:
             return {
                 "status": "blocked",
-                "reason": "initial_fragment_state_not_ready",
+                "reason": "live_fragment_state_not_ready",
                 "fragment_id": fragment_id,
                 "global_step": int(global_step),
                 "learner_metadata_count": len(candidates),
                 "quorum": quorum,
                 "error": f"{type(exc).__name__}: {exc}",
             }
-        previous_fragment_state_uri = str(initial_state.get("fragment_state_uri") or "")
-        previous_fragment_state_sha256 = str(initial_state.get("fragment_state_sha256") or "")
+        previous_fragment_state_uri = str(previous_state.get("fragment_state_uri") or "")
+        previous_fragment_state_sha256 = str(previous_state.get("fragment_state_sha256") or "")
         if not previous_fragment_state_uri or not previous_fragment_state_sha256:
             return {
                 "status": "blocked",
-                "reason": "initial_fragment_state_missing_uri_or_sha",
+                "reason": "live_fragment_state_missing_uri_or_sha",
                 "fragment_id": fragment_id,
                 "global_step": int(global_step),
                 "learner_metadata_count": len(candidates),
@@ -1982,6 +2830,9 @@ class RunManager:
 
         vector_clock = VectorClock({"syncer": int(global_step)}).to_dict()
         broker = self._live_grant_broker()
+        validator_hotkeys = self._merge_validator_hotkeys()
+        verdict_grants_enabled = broker is None or not validator_hotkeys
+        verdict_grants_by_learner: dict[str, dict[str, Any]] = {}
         for item in candidates:
             if item.learner_id in already_answered:
                 continue
@@ -1997,6 +2848,19 @@ class RunManager:
                 request_id=request_id,
                 expires_in=self.config.grant_ttl_sec,
             )
+            verdict_grants = live_fragment_verdict_grants(
+                broker,
+                self.bucket,
+                netuid=self.config.netuid,
+                run_id=self.config.run_id,
+                validator_hotkeys=validator_hotkeys,
+                request_id=request_id,
+                learner_id=item.learner_id,
+                expires_in=self.config.grant_ttl_sec,
+            )
+            if verdict_grants:
+                verdict_grants_enabled = True
+                verdict_grants_by_learner[str(item.learner_id)] = dict(verdict_grants)
             request_fragment_pull(
                 self.bucket,
                 netuid=self.config.netuid,
@@ -2009,12 +2873,14 @@ class RunManager:
                 round_id=round_id,
                 request_id=request_id,
                 response_grants=response_grants,
+                verdict_grants=verdict_grants,
                 previous_fragment_state_uri=previous_fragment_state_uri,
                 previous_fragment_state_sha256=previous_fragment_state_sha256,
             )
 
         request = {
             "request_id": request_id,
+            "status": "requested",
             "targets": targets,
             "requested_unix": time.time(),
             "global_step": int(global_step),
@@ -2024,6 +2890,8 @@ class RunManager:
             "quorum": int(quorum),
             "previous_fragment_state_uri": previous_fragment_state_uri,
             "previous_fragment_state_sha256": previous_fragment_state_sha256,
+            "verdict_grants_enabled": bool(verdict_grants_enabled),
+            "verdict_grants": verdict_grants_by_learner,
             "vector_clock": vector_clock,
         }
         self._append_syncer_event(
@@ -2038,6 +2906,7 @@ class RunManager:
                 "quorum": int(quorum),
                 "previous_fragment_state_uri": previous_fragment_state_uri,
                 "previous_fragment_state_sha256": previous_fragment_state_sha256,
+                "verdict_grants_enabled": bool(verdict_grants_enabled),
             },
             vector_clock,
         )
@@ -2049,7 +2918,7 @@ class RunManager:
             "global_step": int(global_step),
             "requested_learners": len(candidates),
             "quorum": quorum,
-            "initial_state": initial_state,
+            "previous_state": previous_state,
         }
 
     def _advance_live_sync_request(
@@ -2062,6 +2931,7 @@ class RunManager:
         live_learner_ids: set[str],
         metadata_by_learner: dict[str, Any],
         timing: dict[str, Any],
+        commit_request_state: Any | None = None,
     ) -> dict[str, Any]:
         from incentive.merge.outer import merge_live_learner_fragment_states
 
@@ -2070,13 +2940,83 @@ class RunManager:
         fragment_id = int(
             request.get("fragment_id") if request.get("fragment_id") is not None else global_step % max(1, fragment_count)
         )
+        request_round_id = int(request.get("round_id") if request.get("round_id") is not None else round_id)
+        existing_manifest = self._completed_live_fragment_merge_manifest(
+            request_id=request_id,
+            round_id=request_round_id,
+            global_step=global_step,
+            fragment_id=fragment_id,
+            fragment_count=fragment_count,
+        )
+        if existing_manifest is not None:
+            next_global_step = int(getattr(existing_manifest, "next_global_step", global_step + 1))
+            now = time.time()
+            sync_duration = max(0.0, now - float(request.get("requested_unix") or now))
+            result = {
+                "status": "merged",
+                "reason": "live_fragment_merged",
+                "request_id": request_id,
+                "round_id": request_round_id,
+                "fragment_id": fragment_id,
+                "global_step": global_step,
+                "next_global_step": next_global_step,
+                "accepted_updates": len(getattr(existing_manifest, "accepted_updates", []) or []),
+                "ready_responses": 0,
+                "accepted_live_verdicts": len(getattr(existing_manifest, "accepted_updates", []) or []),
+                "fragment_state_uri": getattr(existing_manifest, "fragment_state_uri", ""),
+                "fragment_state_sha256": getattr(existing_manifest, "fragment_state_sha256", ""),
+                "sync_duration_sec": sync_duration,
+                "resumed_existing_merge": True,
+            }
+            release_queued = self._maybe_queue_live_checkpoint_release(existing_manifest)
+            if release_queued is not None:
+                result["checkpoint_release_pending"] = True
+                result["checkpoint_release"] = release_queued
+            self._append_syncer_event(
+                "live_fragment_merged",
+                result,
+                request.get("vector_clock") or {"syncer": global_step},
+            )
+            return result
+        now = time.time()
+        request_age = max(0.0, now - float(request.get("requested_unix") or now))
+        request_ttl = self._live_sync_request_ttl_sec()
+        verdict_grants_expired = self._live_request_verdict_grants_expired(request, now=now)
+        if request_age >= request_ttl:
+            return {
+                "status": "expired",
+                "reason": "live_fragment_request_expired",
+                "request_id": request_id,
+                "fragment_id": fragment_id,
+                "global_step": global_step,
+                "request_age_sec": request_age,
+                "request_ttl_sec": request_ttl,
+                "verdict_grants_expired": verdict_grants_expired,
+                "ready_responses": 0,
+                "target_learners": len(dict(request.get("targets") or {})),
+                "quorum": quorum,
+            }
         saved_targets = {
             str(learner_id): int(target_step)
             for learner_id, target_step in dict(request.get("targets") or {}).items()
         }
-        now = time.time()
-        request_age = max(0.0, now - float(request.get("requested_unix") or now))
-        request_ttl = self._live_sync_request_ttl_sec()
+        if (
+            self._live_grant_broker() is not None
+            and self._merge_validator_hotkeys()
+            and not bool(request.get("verdict_grants_enabled"))
+        ):
+            return {
+                "status": "expired",
+                "reason": "live_fragment_request_missing_verdict_grants",
+                "request_id": request_id,
+                "fragment_id": fragment_id,
+                "global_step": global_step,
+                "request_age_sec": request_age,
+                "request_ttl_sec": request_ttl,
+                "ready_responses": 0,
+                "target_learners": len(saved_targets),
+                "quorum": quorum,
+            }
         active_targets = {
             learner_id: target_step
             for learner_id, target_step in saved_targets.items()
@@ -2085,8 +3025,9 @@ class RunManager:
         if active_targets != saved_targets:
             request["targets"] = active_targets
             request["dropped_targets"] = sorted(set(saved_targets) - set(active_targets))
+        request["status"] = "requested"
         if len(active_targets) < quorum:
-            if request_age >= request_ttl:
+            if request_age >= request_ttl or verdict_grants_expired:
                 return {
                     "status": "expired",
                     "reason": "live_fragment_request_expired",
@@ -2095,6 +3036,7 @@ class RunManager:
                     "global_step": global_step,
                     "request_age_sec": request_age,
                     "request_ttl_sec": request_ttl,
+                    "verdict_grants_expired": verdict_grants_expired,
                     "ready_responses": 0,
                     "target_learners": len(active_targets),
                     "quorum": quorum,
@@ -2123,7 +3065,7 @@ class RunManager:
             metadata_by_learner=metadata_by_learner,
         )
         if len(ready) < quorum:
-            if request_age >= request_ttl:
+            if request_age >= request_ttl or verdict_grants_expired:
                 return {
                     "status": "expired",
                     "reason": "live_fragment_request_expired",
@@ -2132,6 +3074,7 @@ class RunManager:
                     "global_step": global_step,
                     "request_age_sec": request_age,
                     "request_ttl_sec": request_ttl,
+                    "verdict_grants_expired": verdict_grants_expired,
                     "ready_responses": len(ready),
                     "target_learners": len(active_targets),
                     "quorum": quorum,
@@ -2152,13 +3095,17 @@ class RunManager:
                 "request": request,
             }
 
+        request["status"] = "claim_received"
+        request["ready_responses"] = len(ready)
+        if callable(commit_request_state):
+            commit_request_state(request)
         accepted, pending_verdicts, failed_verdicts = self._accepted_live_fragment_responses(
             ready,
             validators=self._merge_validator_hotkeys(),
             verdict_quorum=self._merge_verdict_quorum(self._merge_validator_hotkeys()),
         )
         if len(accepted) < quorum:
-            if request_age >= request_ttl:
+            if request_age >= request_ttl or verdict_grants_expired:
                 return {
                     "status": "expired",
                     "reason": "live_fragment_request_expired_waiting_for_verdicts",
@@ -2167,6 +3114,7 @@ class RunManager:
                     "global_step": global_step,
                     "request_age_sec": request_age,
                     "request_ttl_sec": request_ttl,
+                    "verdict_grants_expired": verdict_grants_expired,
                     "ready_responses": len(ready),
                     "accepted_live_verdicts": len(accepted),
                     "pending_live_verdicts": pending_verdicts,
@@ -2191,6 +3139,8 @@ class RunManager:
                 "request": request,
             }
 
+        request["status"] = "validated"
+        request["accepted_live_verdicts"] = len(accepted)
         if "quorum_unix" not in request:
             request["quorum_unix"] = now
             request["xi_quorum_sec"] = max(0.0, now - float(request.get("requested_unix") or now))
@@ -2213,12 +3163,33 @@ class RunManager:
                 "request": request,
             }
 
+        merge_timeout = self._live_sync_merge_timeout_sec()
+        request["merge_started_unix"] = now
+        request["merge_timeout_sec"] = merge_timeout
+        request["merge_attempts"] = max(0, int(request.get("merge_attempts") or 0)) + 1
+        request["last_merge_attempt_unix"] = now
+        request["status"] = "merge_started"
+        if callable(commit_request_state):
+            commit_request_state(request)
+        self._emit_event(
+            {
+                "event": "live_fragment_merge_started",
+                "run_id": self.config.run_id,
+                "request_id": request_id,
+                "fragment_id": fragment_id,
+                "global_step": global_step,
+                "ready_responses": len(ready),
+                "accepted_live_verdicts": len(accepted),
+                "merge_attempts": int(request.get("merge_attempts") or 0),
+                "merge_timeout_sec": merge_timeout,
+            }
+        )
         try:
             manifest = merge_live_learner_fragment_states(
                 self.bucket,
                 netuid=self.config.netuid,
                 run_id=self.config.run_id,
-                round_id=round_id,
+                round_id=request_round_id,
                 global_step=global_step,
                 fragment_id=fragment_id,
                 fragment_count=fragment_count,
@@ -2231,6 +3202,21 @@ class RunManager:
             )
         except Exception as exc:
             request["last_error"] = f"{type(exc).__name__}: {exc}"
+            if int(request.get("merge_attempts") or 0) < self._live_sync_merge_max_attempts():
+                return {
+                    "status": "pending",
+                    "reason": "live_fragment_merge_retry",
+                    "request_id": request_id,
+                    "fragment_id": fragment_id,
+                    "global_step": global_step,
+                    "error": request["last_error"],
+                    "ready_responses": len(ready),
+                    "accepted_live_verdicts": len(accepted),
+                    "merge_attempts": int(request.get("merge_attempts") or 0),
+                    "max_merge_attempts": self._live_sync_merge_max_attempts(),
+                    "request": request,
+                }
+            request["status"] = "failed"
             return {
                 "status": "failed",
                 "reason": "live_fragment_merge_failed",
@@ -2239,6 +3225,9 @@ class RunManager:
                 "global_step": global_step,
                 "error": request["last_error"],
                 "ready_responses": len(ready),
+                "accepted_live_verdicts": len(accepted),
+                "merge_attempts": int(request.get("merge_attempts") or 0),
+                "max_merge_attempts": self._live_sync_merge_max_attempts(),
                 "request": request,
             }
 
@@ -2265,6 +3254,79 @@ class RunManager:
             result["checkpoint_release"] = release_queued
         self._append_syncer_event("live_fragment_merged", result, request.get("vector_clock") or {"syncer": global_step})
         return result
+
+    def _completed_live_fragment_merge_manifest(
+        self,
+        *,
+        request_id: str,
+        round_id: int,
+        global_step: int,
+        fragment_id: int,
+        fragment_count: int,
+    ):
+        from incentive.fragments.sync import publish_fragment_sync_state
+        from incentive.merge.outer import RoundMergeManifest
+
+        live_prefix = paths.live_fragment_merge_prefix(self.config.netuid, self.config.run_id, global_step, fragment_id)
+        manifest_uri = self.bucket.uri_for_key(f"{live_prefix}/merge_manifest.json")
+        if not self.bucket.exists(manifest_uri):
+            return None
+        try:
+            manifest = RoundMergeManifest.from_dict(self.bucket.get_json(manifest_uri))
+        except Exception as exc:
+            self._emit_event(
+                {
+                    "event": "live_fragment_existing_merge_manifest_read_failed",
+                    "run_id": self.config.run_id,
+                    "request_id": request_id,
+                    "global_step": int(global_step),
+                    "fragment_id": int(fragment_id),
+                    "error_type": type(exc).__name__,
+                    "error": str(exc)[:500],
+                }
+            )
+            return None
+        if (
+            manifest.run_id != self.config.run_id
+            or int(manifest.global_step) != int(global_step)
+            or int(manifest.next_global_step) != int(global_step) + 1
+            or int(manifest.fragment_id if manifest.fragment_id is not None else -1) != int(fragment_id)
+            or int(manifest.fragment_count if manifest.fragment_count is not None else 0) != int(fragment_count)
+            or not manifest.accepted_updates
+        ):
+            return None
+        required_uris = [
+            str(manifest.merged_delta_uri or ""),
+            str(manifest.fragment_state_uri or ""),
+            str(manifest.manifest_uri or manifest_uri),
+        ]
+        if manifest.momentum_uri:
+            required_uris.append(str(manifest.momentum_uri))
+        if any((not uri or not self.bucket.exists(uri)) for uri in required_uris):
+            return None
+        try:
+            publish_fragment_sync_state(
+                self.bucket,
+                netuid=self.config.netuid,
+                merge_manifest=manifest,
+                grant_broker=self._live_grant_broker(),
+                grant_ttl_sec=self.config.grant_ttl_sec,
+            )
+        except Exception as exc:
+            self._emit_event(
+                {
+                    "event": "live_fragment_existing_merge_publish_failed",
+                    "run_id": self.config.run_id,
+                    "request_id": request_id,
+                    "global_step": int(global_step),
+                    "fragment_id": int(fragment_id),
+                    "manifest_uri": manifest_uri,
+                    "error_type": type(exc).__name__,
+                    "error": str(exc)[:500],
+                }
+            )
+            return None
+        return manifest
 
     def _ready_live_fragment_responses(
         self,
@@ -2449,7 +3511,21 @@ class RunManager:
                 )
                 continue
             merged = dict(item)
-            merged["weight"] = sum(float(verdict.accepted_weight or 0.0) for verdict in passing) / float(len(passing))
+            accepted_weight = sum(float(verdict.accepted_weight or 0.0) for verdict in passing) / float(len(passing))
+            if accepted_weight <= 0.0:
+                failed.append(
+                    {
+                        "learner_id": learner_id,
+                        "request_id": request_id,
+                        "reason": "non_positive_validator_accepted_weight",
+                        "pass_count": len(passing),
+                        "fail_count": len(failing),
+                        "accepted_weight": accepted_weight,
+                        "quorum": quorum,
+                    }
+                )
+                continue
+            merged["weight"] = accepted_weight
             merged["trained_tokens"] = max(int(verdict.trained_tokens or 0) for verdict in passing)
             merged["local_steps"] = max(int(verdict.local_steps or 0) for verdict in passing)
             merged["live_verdicts"] = [verdict.to_dict() for verdict in passing]
@@ -2528,17 +3604,7 @@ class RunManager:
         }
 
     def _next_syncer_event_sequence(self) -> int:
-        prefix = self.bucket.uri_for_key(paths.mesh_event_tape_prefix(self.config.netuid, self.config.run_id, "syncer"))
-        max_sequence = 0
-        for uri in self.bucket.list(prefix):
-            if not uri.endswith(".json") or "/seq=" not in uri:
-                continue
-            raw = uri.rsplit("/seq=", 1)[-1].removesuffix(".json")
-            try:
-                max_sequence = max(max_sequence, int(raw))
-            except ValueError:
-                continue
-        return max_sequence + 1
+        return time.time_ns()
 
     def _append_syncer_event(
         self,
@@ -2562,6 +3628,40 @@ class RunManager:
     def _live_grant_broker(self):
         return self.service.emitter.config.grant_broker
 
+    def _live_fragment_state_for_pull(
+        self,
+        *,
+        fragment_id: int,
+        fragment_count: int,
+    ) -> dict[str, Any]:
+        state = load_fragment_sync_state(
+            self.bucket,
+            netuid=self.config.netuid,
+            run_id=self.config.run_id,
+            fragment_id=fragment_id,
+        )
+        if state is None:
+            raise FileNotFoundError(f"fragment sync state missing for fragment_id={int(fragment_id)}")
+        if state.artifact_format != FRAGMENT_SYNC_FORMAT:
+            raise ValueError(f"fragment sync state has unsupported format: {state.artifact_format!r}")
+        if int(state.fragment_count) != int(fragment_count):
+            raise ValueError(f"fragment sync state count mismatch: {state.fragment_count} != {int(fragment_count)}")
+        if not state.fragment_state_uri or not state.fragment_state_sha256:
+            raise ValueError("fragment sync state missing uri or sha256")
+        if not self.bucket.exists(state.fragment_state_uri):
+            raise FileNotFoundError(f"fragment sync state object missing: {state.fragment_state_uri}")
+        return {
+            "status": "ready",
+            "fragment_state_uri": state.fragment_state_uri,
+            "fragment_state_sha256": state.fragment_state_sha256,
+            "fragment_id": int(fragment_id),
+            "fragment_count": int(fragment_count),
+            "global_step": int(state.global_step),
+            "round_id": int(state.round_id),
+            "merge_manifest_uri": state.merge_manifest_uri,
+            "accepted_receipts": int(state.accepted_receipts),
+        }
+
     def _ensure_initial_live_fragment_state(
         self,
         *,
@@ -2569,6 +3669,7 @@ class RunManager:
         fragment_count: int,
         global_step: int,
         round_id: int,
+        force: bool = False,
     ) -> dict[str, Any]:
         state = ensure_initial_fragment_state_from_checkpoint(
             self.bucket,
@@ -2579,6 +3680,8 @@ class RunManager:
             fragment_count=fragment_count,
             round_id=round_id,
             global_step=global_step,
+            checkpoint_manifest_uri=self.checkpoint_manifest_uri,
+            force=force,
         )
         return {
             "status": "initialized_from_checkpoint",
@@ -2586,7 +3689,7 @@ class RunManager:
             "fragment_state_sha256": state.fragment_state_sha256,
             "fragment_id": int(fragment_id),
             "fragment_count": int(fragment_count),
-            "global_step": int(global_step),
+            "global_step": int(state.global_step),
             "round_id": int(round_id),
         }
 
@@ -2626,13 +3729,6 @@ class RunManager:
     def _round_job_count(self, round_id: int) -> int:
         index = self._round_index(round_id)
         return int(index.get("job_count") or len(index.get("jobs", []) or []))
-
-    def _round_job_ids(self, round_id: int) -> set[str]:
-        return {
-            str(dict(item).get("job_id") or "")
-            for item in self._round_index(round_id).get("jobs", []) or []
-            if str(dict(item).get("job_id") or "")
-        }
 
     def _round_index(self, round_id: int) -> dict[str, Any]:
         uri = self.bucket.uri_for_key(paths.round_index_key(self.config.netuid, self.config.run_id, round_id))
@@ -2688,27 +3784,6 @@ class RunManager:
             "source": "manifest_scan",
         }
 
-    def _round_skipped_job_ids(self, round_id: int) -> set[str]:
-        skipped: set[str] = set()
-        for job_id in self._round_job_ids(round_id):
-            job_dir = paths.job_manifest_key(self.config.netuid, self.config.run_id, job_id).rsplit("/", 1)[0] + "/"
-            for uri in self.bucket.list(self.bucket.uri_for_key(job_dir)):
-                if "/skip-" in uri and uri.endswith(".json"):
-                    skipped.add(job_id)
-                    break
-        return skipped
-
-    def _round_queue_depth(self, round_id: int) -> int:
-        depth = 0
-        for entry in self.queue.entries():
-            try:
-                manifest = self.bucket.get_json(entry.manifest_uri)
-            except Exception:
-                continue
-            if int(manifest.get("round_id") or 0) == int(round_id):
-                depth += 1
-        return depth
-
     def _round_is_finalized(self, round_id: int) -> bool:
         finalization_uri = self.bucket.uri_for_key(
             paths.round_finalization_key(self.config.netuid, self.config.run_id, round_id)
@@ -2729,325 +3804,6 @@ class RunManager:
                 receipts.append(receipt)
         receipts.sort(key=lambda item: (item.worker.hotkey_ss58, item.job_id, item.receipt_id))
         return receipts
-
-    def _round_verdicts(self, *, round_id: int, validator_hotkeys: list[str]) -> list[ValidatorVerdict]:
-        verdicts: list[ValidatorVerdict] = []
-        validators = [item.strip() for item in validator_hotkeys if item.strip()]
-        round_job_ids = self._round_job_ids(round_id)
-        if not round_job_ids:
-            return verdicts
-        for validator_hotkey in validators:
-            prefix = self.bucket.uri_for_key(
-                f"{paths.root_prefix(self.config.netuid)}/verdicts/{self.config.run_id}/validator={validator_hotkey}/"
-            )
-            for uri in self.bucket.list(prefix):
-                if not uri.endswith(".json"):
-                    continue
-                try:
-                    verdict = ValidatorVerdict.from_dict(self.bucket.get_json(uri))
-                except Exception:
-                    continue
-                if verdict.run_id != self.config.run_id or verdict.validator_hotkey != validator_hotkey:
-                    continue
-                if not verdict.verify_signature(validator_hotkey):
-                    continue
-                if verdict.job_id in round_job_ids:
-                    verdicts.append(verdict)
-        verdicts.sort(key=lambda item: (item.receipt_id, item.validator_hotkey))
-        return verdicts
-
-    def _round_validation_readiness(self, *, round_id: int, queue_depth: int = 0) -> dict[str, Any]:
-        validators = self._merge_validator_hotkeys()
-        quorum = self._merge_verdict_quorum(validators)
-        sync_quorum = max(1, int(self.config.sync_quorum))
-        receipts = self._round_receipts(round_id)
-        round_job_ids = self._round_job_ids(round_id)
-        skipped_job_ids = self._round_skipped_job_ids(round_id)
-        all_jobs_terminal_without_receipts = bool(round_job_ids) and skipped_job_ids >= round_job_ids
-        if not receipts:
-            return {
-                "enabled": True,
-                "pending": False,
-                "round_id": int(round_id),
-                "job_count": len(round_job_ids),
-                "skipped_job_count": len(skipped_job_ids),
-                "all_jobs_terminal_without_receipts": all_jobs_terminal_without_receipts,
-                "receipt_count": 0,
-                "validator_count": len(validators),
-                "verdict_quorum": quorum,
-                "sync_quorum": sync_quorum,
-                "sync_ready": False,
-                "accepted_quorum_receipts": 0,
-            }
-
-        verdicts_by_receipt: dict[str, list[ValidatorVerdict]] = {receipt.receipt_id: [] for receipt in receipts}
-        for verdict in self._round_verdicts(round_id=round_id, validator_hotkeys=validators):
-            if verdict.receipt_id in verdicts_by_receipt:
-                verdicts_by_receipt[verdict.receipt_id].append(verdict)
-
-        ready_receipts = 0
-        accepted_quorum_receipts = 0
-        missing_receipts: list[str] = []
-        accepted_quorum_times: list[float] = []
-        missing_receipt_ages: list[float] = []
-        missing_receipt_ids: list[str] = []
-        now = time.time()
-        for receipt in receipts:
-            receipt_verdicts = verdicts_by_receipt.get(receipt.receipt_id, [])
-            validator_decisions = {verdict.validator_hotkey: verdict for verdict in receipt_verdicts}
-            total_decisions = len(validator_decisions)
-            pass_count = sum(1 for verdict in validator_decisions.values() if verdict.status == "pass")
-            fail_count = sum(1 for verdict in validator_decisions.values() if verdict.status == "fail")
-            accepted = pass_count >= quorum and not (self.config.merge_fail_veto and fail_count > 0)
-            if total_decisions >= quorum:
-                ready_receipts += 1
-            else:
-                missing_receipts.append(receipt.receipt_id)
-                missing_receipt_ids.append(receipt.receipt_id)
-                receipt_time = float(receipt.finished_unix or receipt.started_unix or 0.0)
-                if receipt_time > 0.0:
-                    missing_receipt_ages.append(max(0.0, now - receipt_time))
-            if accepted:
-                accepted_quorum_receipts += 1
-                quorum_time = max(
-                    float(verdict.checked_unix or 0.0)
-                    for verdict in validator_decisions.values()
-                    if verdict.status == "pass"
-                )
-                if quorum_time > 0.0:
-                    accepted_quorum_times.append(quorum_time)
-
-        sync_ready = accepted_quorum_receipts >= sync_quorum
-        adaptive = self._adaptive_sync_window(
-            round_id=round_id,
-            receipts=receipts,
-            quorum_reached_unix=min(accepted_quorum_times) if sync_ready and accepted_quorum_times else None,
-        )
-        if sync_ready and not adaptive["grace_elapsed"]:
-            return {
-                "enabled": True,
-                "pending": True,
-                "round_id": int(round_id),
-                "reason": "adaptive_grace_window",
-                "receipt_count": len(receipts),
-                "ready_receipts": ready_receipts,
-                "missing_receipts": len(missing_receipts),
-                "validator_count": len(validators),
-                "verdict_quorum": quorum,
-                "sync_quorum": sync_quorum,
-                "accepted_quorum_receipts": accepted_quorum_receipts,
-                "sync_ready": False,
-                "adaptive_sync": adaptive,
-                "validation_lag": self._validation_lag_summary(missing_receipt_ages, missing_receipt_ids),
-            }
-
-        if sync_ready:
-            cutoff = self._round_merge_cutoff_window(
-                round_id=round_id,
-                queue_depth=queue_depth,
-                receipt_count=len(receipts),
-                ready_receipts=ready_receipts,
-                missing_receipts=len(missing_receipts),
-                accepted_quorum_receipts=accepted_quorum_receipts,
-                adaptive=adaptive,
-            )
-            if not cutoff["elapsed"]:
-                return {
-                    "enabled": True,
-                    "pending": True,
-                    "round_id": int(round_id),
-                    "reason": "round_merge_grace_window",
-                    "receipt_count": len(receipts),
-                    "ready_receipts": ready_receipts,
-                    "missing_receipts": len(missing_receipts),
-                    "queue_depth": int(queue_depth),
-                    "validator_count": len(validators),
-                    "verdict_quorum": quorum,
-                    "sync_quorum": sync_quorum,
-                    "accepted_quorum_receipts": accepted_quorum_receipts,
-                    "sync_ready": False,
-                    "adaptive_sync": adaptive,
-                    "round_merge_cutoff": cutoff,
-                    "validation_lag": self._validation_lag_summary(missing_receipt_ages, missing_receipt_ids),
-                }
-
-        if missing_receipts and not sync_ready:
-            return {
-                "enabled": True,
-                "pending": True,
-                "round_id": int(round_id),
-                "reason": "waiting_for_verdict_quorum",
-                "receipt_count": len(receipts),
-                "ready_receipts": ready_receipts,
-                "missing_receipts": len(missing_receipts),
-                "validator_count": len(validators),
-                "verdict_quorum": quorum,
-                "sync_quorum": sync_quorum,
-                "sync_ready": False,
-                "accepted_quorum_receipts": accepted_quorum_receipts,
-                "adaptive_sync": adaptive,
-                "validation_lag": self._validation_lag_summary(missing_receipt_ages, missing_receipt_ids),
-            }
-        return {
-            "enabled": True,
-            "pending": False,
-            "round_id": int(round_id),
-            "receipt_count": len(receipts),
-            "ready_receipts": ready_receipts,
-            "validator_count": len(validators),
-            "verdict_quorum": quorum,
-            "sync_quorum": sync_quorum,
-            "accepted_quorum_receipts": accepted_quorum_receipts,
-            "sync_ready": sync_ready,
-            "adaptive_sync": adaptive,
-            "validation_lag": self._validation_lag_summary(missing_receipt_ages, missing_receipt_ids),
-        }
-
-    @staticmethod
-    def _validation_lag_summary(missing_receipt_ages: list[float], missing_receipt_ids: list[str]) -> dict[str, Any]:
-        if not missing_receipt_ids:
-            return {"missing_receipts": 0, "oldest_missing_receipt_age_sec": 0.0, "oldest_missing_receipt_id": ""}
-        oldest_index = max(range(len(missing_receipt_ages)), key=lambda index: missing_receipt_ages[index]) if missing_receipt_ages else 0
-        return {
-            "missing_receipts": len(missing_receipt_ids),
-            "oldest_missing_receipt_age_sec": float(missing_receipt_ages[oldest_index]) if missing_receipt_ages else 0.0,
-            "oldest_missing_receipt_id": str(missing_receipt_ids[oldest_index] if oldest_index < len(missing_receipt_ids) else missing_receipt_ids[0]),
-        }
-
-    def _round_merge_cutoff_window(
-        self,
-        *,
-        round_id: int,
-        queue_depth: int,
-        receipt_count: int,
-        ready_receipts: int,
-        missing_receipts: int,
-        accepted_quorum_receipts: int,
-        adaptive: dict[str, Any],
-    ) -> dict[str, Any]:
-        inflight = max(0, int(queue_depth)) + max(0, int(missing_receipts))
-        if inflight <= 0:
-            self._clear_round_merge_cutoff(round_id)
-            return {
-                "enabled": True,
-                "elapsed": True,
-                "reason": "no_pending_round_work",
-                "queue_depth": int(queue_depth),
-                "receipt_count": int(receipt_count),
-                "ready_receipts": int(ready_receipts),
-                "missing_receipts": int(missing_receipts),
-                "accepted_quorum_receipts": int(accepted_quorum_receipts),
-            }
-        min_grace = max(0.0, float(self.config.round_merge_min_grace_sec))
-        max_grace = max(min_grace, float(self.config.round_merge_max_grace_sec))
-        adaptive_grace = max(0.0, float(adaptive.get("grace_sec") or 0.0))
-        grace_cap = max_grace if max_grace > 0.0 else max(0.0, float(self.config.poll_interval_sec)) * 2.0
-        grace = min(grace_cap, max(min_grace, adaptive_grace))
-        if grace <= 0.0:
-            return {
-                "enabled": True,
-                "elapsed": True,
-                "reason": "zero_grace",
-                "queue_depth": int(queue_depth),
-                "receipt_count": int(receipt_count),
-                "ready_receipts": int(ready_receipts),
-                "missing_receipts": int(missing_receipts),
-                "accepted_quorum_receipts": int(accepted_quorum_receipts),
-            }
-        now = time.time()
-        state = self._load_state()
-        cutoffs = {
-            str(key): dict(value)
-            for key, value in dict(state.get("round_merge_cutoffs") or {}).items()
-            if isinstance(value, dict)
-        }
-        key = str(int(round_id))
-        record = dict(cutoffs.get(key) or {})
-        if not record:
-            record = {
-                "round_id": int(round_id),
-                "created_unix": now,
-                "deadline_unix": now + grace,
-                "grace_sec": grace,
-                "queue_depth_at_quorum": int(queue_depth),
-                "receipt_count_at_quorum": int(receipt_count),
-                "ready_receipts_at_quorum": int(ready_receipts),
-                "missing_receipts_at_quorum": int(missing_receipts),
-                "accepted_quorum_receipts_at_quorum": int(accepted_quorum_receipts),
-            }
-            cutoffs[key] = record
-            self._save_state(round_merge_cutoffs=cutoffs)
-        deadline = float(record.get("deadline_unix") or now)
-        return {
-            "enabled": True,
-            "elapsed": now >= deadline,
-            "reason": "deadline_elapsed" if now >= deadline else "waiting_for_cutoff",
-            "deadline_unix": deadline,
-            "created_unix": float(record.get("created_unix") or now),
-            "grace_sec": float(record.get("grace_sec") or grace),
-            "elapsed_sec": max(0.0, now - float(record.get("created_unix") or now)),
-            "remaining_sec": max(0.0, deadline - now),
-            "queue_depth": int(queue_depth),
-            "receipt_count": int(receipt_count),
-            "ready_receipts": int(ready_receipts),
-            "missing_receipts": int(missing_receipts),
-            "accepted_quorum_receipts": int(accepted_quorum_receipts),
-        }
-
-    def _clear_round_merge_cutoff(self, round_id: int) -> None:
-        state = self._load_state()
-        cutoffs = {
-            str(key): dict(value)
-            for key, value in dict(state.get("round_merge_cutoffs") or {}).items()
-            if isinstance(value, dict)
-        }
-        if cutoffs.pop(str(int(round_id)), None) is not None:
-            self._save_state(round_merge_cutoffs=cutoffs)
-
-    def _adaptive_sync_window(
-        self,
-        *,
-        round_id: int,
-        receipts: list[MinerReceipt],
-        quorum_reached_unix: float | None,
-    ) -> dict[str, Any]:
-        step_times = [
-            float(receipt.compute_sec) / float(max(1, int(receipt.claimed_local_steps)))
-            for receipt in receipts
-            if float(receipt.compute_sec or 0.0) > 0.0 and int(receipt.claimed_local_steps or 0) > 0
-        ]
-        xi_step = sorted(step_times)[len(step_times) // 2] if step_times else 0.0
-        if quorum_reached_unix is None or xi_step <= 0.0:
-            return {
-                "tau": int(self.config.sync_overlap_tau),
-                "xi_step_sec": xi_step,
-                "xi_quorum_sec": 0.0,
-                "xi_sync_sec": 0.0,
-                "slack_sec": 0.0,
-                "grace_sec": 0.0,
-                "elapsed_since_quorum_sec": 0.0,
-                "grace_elapsed": True,
-            }
-        jobs = self._round_job_manifests(round_id)
-        earliest_created = min((float(job.created_unix) for job in jobs), default=quorum_reached_unix or time.time())
-        xi_quorum = max(0.0, float(quorum_reached_unix or time.time()) - earliest_created) if quorum_reached_unix else 0.0
-        xi_sync = max(0.0, float(self.config.sync_estimated_sync_sec))
-        slack = max(0.0, float(self.config.sync_overlap_tau) * xi_step - (xi_quorum + xi_sync))
-        grace = min(
-            max(float(self.config.sync_min_grace_sec), slack * max(0.0, float(self.config.sync_safety_margin))),
-            max(float(self.config.sync_min_grace_sec), float(self.config.sync_max_grace_sec)),
-        )
-        elapsed = max(0.0, time.time() - float(quorum_reached_unix or time.time())) if quorum_reached_unix else 0.0
-        return {
-            "tau": int(self.config.sync_overlap_tau),
-            "xi_step_sec": xi_step,
-            "xi_quorum_sec": xi_quorum,
-            "xi_sync_sec": xi_sync,
-            "slack_sec": slack,
-            "grace_sec": grace,
-            "elapsed_since_quorum_sec": elapsed,
-            "grace_elapsed": quorum_reached_unix is not None and elapsed >= grace,
-        }
 
     def _round_job_manifests(self, round_id: int) -> list[TrainingJobManifest]:
         manifests: list[TrainingJobManifest] = []
@@ -3081,26 +3837,32 @@ class RunManager:
                 total += self._manifest_training_shard_count(manifest)
         return total
 
-    def _finalize_round(self, *, round_id: int) -> dict[str, Any]:
+    def _finalize_round(self, *, round_id: int, reason: str = "") -> dict[str, Any]:
+        telemetry_error = ""
         try:
-            accepted_receipts = sorted(self._round_accepted_receipt_ids(round_id))
-            removed_queue_jobs = self._remove_round_queue_entries(round_id)
-            self._save_state(
-                status="round_receipt_telemetry_finalized",
-                current_round=max(int(self._load_state().get("current_round", round_id + 1)), int(round_id) + 1),
-                receipt_telemetry_phase={
-                    "round_id": int(round_id),
-                    "accepted_receipts": len(accepted_receipts),
-                    "removed_superseded_queue_jobs": removed_queue_jobs,
-                },
-            )
+            receipts = self._round_receipts(round_id)
         except Exception as exc:
-            return {
-                "enabled": True,
-                "pending": True,
+            receipts = []
+            telemetry_error = f"{type(exc).__name__}: {exc}"
+            self._emit_event(
+                {
+                    "event": "round_receipt_telemetry_read_failed",
+                    "run_id": self.config.run_id,
+                    "round_id": int(round_id),
+                    "error": telemetry_error,
+                }
+            )
+        self._save_state(
+            status="round_receipt_telemetry_finalized",
+            current_round=max(int(self._load_state().get("current_round", round_id + 1)), int(round_id) + 1),
+            receipt_telemetry_phase={
                 "round_id": int(round_id),
-                "reason": f"{type(exc).__name__}: {exc}",
-            }
+                "receipt_count": len(receipts),
+                "removed_superseded_queue_jobs": [],
+                "queue_lifecycle": "jobs_remain_until_receipt_expiry_inactive_or_obsolete_checkpoint",
+                "telemetry_error": telemetry_error,
+            },
+        )
 
         out = {
             "enabled": True,
@@ -3108,52 +3870,17 @@ class RunManager:
             "finalized": True,
             "round_id": int(round_id),
             "status": "receipt_telemetry",
-            "accepted_receipts": len(accepted_receipts),
+            "receipt_count": len(receipts),
+            "accepted_receipts": 0,
             "accepted_updates": 0,
-            "removed_superseded_queue_jobs": removed_queue_jobs,
+            "removed_superseded_queue_jobs": [],
+            "queue_lifecycle": "jobs_remain_until_receipt_expiry_inactive_or_obsolete_checkpoint",
         }
+        if reason:
+            out["reason"] = str(reason)
+        if telemetry_error:
+            out["telemetry_error"] = telemetry_error
         self._write_round_finalization(status="receipt_telemetry", round_id=round_id, payload=out)
-        self._clear_round_merge_cutoff(round_id)
-        return out
-
-    def _remove_round_queue_entries(self, round_id: int) -> list[str]:
-        removed: list[str] = []
-        self.queue.reconcile_from_bucket()
-        for entry in list(self.queue.entries()):
-            try:
-                manifest = TrainingJobManifest.from_dict(self.bucket.get_json(entry.manifest_uri))
-            except Exception:
-                continue
-            if int(manifest.round_id) != int(round_id):
-                continue
-            if self.queue.remove(entry.job_id):
-                removed.append(entry.job_id)
-        if removed:
-            self.queue.flush()
-        return removed
-
-    def _mark_round_finalized(
-        self,
-        *,
-        round_id: int,
-        status: str,
-        reason: str,
-        validation: dict[str, Any] | None = None,
-    ) -> dict[str, Any]:
-        out = {
-            "enabled": True,
-            "pending": False,
-            "finalized": True,
-            "round_id": int(round_id),
-            "status": status,
-            "reason": reason,
-            "accepted_updates": 0,
-            "checkpoint_manifest_uri": self.checkpoint_manifest_uri,
-            "global_step": self.checkpoint.global_step,
-        }
-        if validation is not None:
-            out["validation"] = validation
-        self._write_round_finalization(status=status, round_id=round_id, payload=out)
         return out
 
     def _write_round_finalization(self, *, status: str, round_id: int, payload: dict[str, Any]) -> None:
@@ -3172,60 +3899,7 @@ class RunManager:
             finalization,
         )
 
-    def _round_merge_is_stale(self, merge_manifest: Any, *, round_id: int) -> bool:
-        if self.bucket.exists(
-            self.bucket.uri_for_key(paths.round_finalization_key(self.config.netuid, self.config.run_id, round_id))
-        ):
-            return False
-        accepted_now = self._round_accepted_receipt_ids(round_id)
-        accepted_manifest = {
-            str(getattr(update, "receipt_id", "") or "")
-            for update in getattr(merge_manifest, "accepted_updates", []) or []
-            if str(getattr(update, "receipt_id", "") or "")
-        }
-        return accepted_now != accepted_manifest
-
-    def _round_accepted_receipt_ids(self, round_id: int) -> set[str]:
-        validators = self._merge_validator_hotkeys()
-        quorum = self._merge_verdict_quorum(validators)
-        verdicts_by_receipt: dict[str, list[ValidatorVerdict]] = {
-            receipt.receipt_id: []
-            for receipt in self._round_receipts(round_id)
-        }
-        for verdict in self._round_verdicts(round_id=round_id, validator_hotkeys=validators):
-            if verdict.receipt_id in verdicts_by_receipt:
-                verdicts_by_receipt[verdict.receipt_id].append(verdict)
-        accepted: set[str] = set()
-        for receipt_id, receipt_verdicts in verdicts_by_receipt.items():
-            validator_decisions = {verdict.validator_hotkey: verdict for verdict in receipt_verdicts}
-            pass_count = sum(1 for verdict in validator_decisions.values() if verdict.status == "pass")
-            fail_count = sum(1 for verdict in validator_decisions.values() if verdict.status == "fail")
-            if pass_count >= quorum and not (self.config.merge_fail_veto and fail_count > 0):
-                accepted.add(receipt_id)
-        return accepted
-
-    def _merge_ready_round(self, *, round_id: int, rebuild_current_round: bool = False):
-        from incentive.merge.outer import merge_round_fragment_updates
-
-        validators = self._merge_validator_hotkeys()
-        quorum = self._merge_verdict_quorum(validators)
-        return merge_round_fragment_updates(
-            self.bucket,
-            netuid=self.config.netuid,
-            run_id=self.config.run_id,
-            round_id=round_id,
-            global_step=self.checkpoint.global_step,
-            validator_hotkey=validators[0],
-            outer_lr=self.config.merge_outer_lr,
-            validator_hotkeys=validators,
-            verdict_quorum=quorum,
-            fail_veto=self.config.merge_fail_veto,
-            grant_broker=self._live_grant_broker(),
-            grant_ttl_sec=self.config.grant_ttl_sec,
-            rebuild_current_round=rebuild_current_round,
-        )
-
-    def _queue_checkpoint_release(self, merge_manifest: Any, *, key: str | None = None, source: str = "round") -> dict[str, Any]:
+    def _queue_live_checkpoint_release(self, merge_manifest: Any, *, key: str | None = None) -> dict[str, Any]:
         state = self._load_state()
         requests = {
             str(key): dict(value)
@@ -3240,7 +3914,7 @@ class RunManager:
         request = {
             "round_id": round_id,
             "status": "pending",
-            "source": source,
+            "source": "live_sync",
             "requested_unix": time.time(),
             "merge_manifest_uri": getattr(merge_manifest, "manifest_uri", None)
             or self.bucket.uri_for_key(paths.merge_manifest_key(self.config.netuid, self.config.run_id, round_id)),
@@ -3284,10 +3958,9 @@ class RunManager:
         next_step = int(getattr(merge_manifest, "next_global_step", 0) or 0)
         if next_step < last_release_step + fragment_count:
             return None
-        request = self._queue_checkpoint_release(
+        request = self._queue_live_checkpoint_release(
             merge_manifest,
             key=f"live-step-{next_step}",
-            source="live_sync",
         )
         request["covered_fragments"] = sorted(covered)
         request["fragment_count"] = fragment_count
@@ -3308,9 +3981,9 @@ class RunManager:
             self._save_state(checkpoint_release_requests=requests)
         return request
 
-    def _maybe_process_pending_checkpoint_release(self, *, queue_depth: int) -> dict[str, Any]:
-        if int(queue_depth) > 0:
-            return {"enabled": True, "processed": False, "reason": "queue_not_empty", "queue_depth": int(queue_depth)}
+    def _maybe_process_pending_checkpoint_release(self) -> dict[str, Any]:
+        if not self.config.auto_release_checkpoints:
+            return {"enabled": False, "processed": False, "reason": "auto_release_checkpoints_disabled"}
         state = self._load_state()
         requests = {
             str(key): dict(value)
@@ -3320,6 +3993,18 @@ class RunManager:
         last_live_release_step = int(state.get("last_live_checkpoint_release_step", self.checkpoint.global_step) or 0)
         superseded = False
         for key, request in list(requests.items()):
+            if str(request.get("source") or "round") != "live_sync":
+                if str(request.get("status") or "pending") in {"pending", "running"}:
+                    request.update(
+                        {
+                            "status": "disabled",
+                            "finished_unix": time.time(),
+                            "reason": "legacy_round_checkpoint_release_disabled",
+                        }
+                    )
+                    requests[key] = request
+                    superseded = True
+                continue
             if str(request.get("source") or "") != "live_sync":
                 continue
             if str(request.get("status") or "pending") not in {"pending", "running"}:
@@ -3340,27 +4025,38 @@ class RunManager:
         if superseded:
             self._save_state(checkpoint_release_requests=requests)
         pending = [
-            (int(request.get("round_id") or key), key, request)
+            (
+                0 if str(request.get("source") or "") == "live_sync" else 1,
+                int(request.get("next_global_step") or request.get("round_id") or 0),
+                int(request.get("round_id") or key),
+                key,
+                request,
+            )
             for key, request in requests.items()
-            if str(request.get("status") or "pending") == "pending"
+            if str(request.get("source") or "") == "live_sync"
+            and str(request.get("status") or "pending") in {"pending", "running"}
         ]
         if not pending:
             return {"enabled": True, "processed": False, "reason": "no_pending_checkpoint_release"}
         pending.sort()
-        round_id, key, request = pending[0]
+        _priority, _step, round_id, key, request = pending[0]
         from incentive.merge.outer import RoundMergeManifest
 
         merge_uri = str(
             request.get("merge_manifest_uri")
             or self.bucket.uri_for_key(paths.merge_manifest_key(self.config.netuid, self.config.run_id, round_id))
         )
+        now = time.time()
         request["status"] = "running"
-        request["started_unix"] = time.time()
+        request.setdefault("started_unix", now)
+        request["last_attempt_started_unix"] = now
+        request["attempts"] = int(request.get("attempts") or 0) + 1
+        request["updated_unix"] = now
         requests[key] = request
         self._save_state(checkpoint_release_requests=requests)
         try:
             merge_manifest = RoundMergeManifest.from_dict(self.bucket.get_json(merge_uri))
-            release = self._release_round_checkpoint(merge_manifest)
+            release = self._release_checkpoint_from_live_merge(merge_manifest)
         except Exception as exc:
             request.update(
                 {
@@ -3430,7 +4126,7 @@ class RunManager:
             "global_step": global_step,
         }
 
-    def _release_round_checkpoint(self, merge_manifest: Any):
+    def _release_checkpoint_from_live_merge(self, merge_manifest: Any):
         from incentive.model.quasar import ModelSource
         from incentive.model.release import release_merged_checkpoint
 
@@ -3489,23 +4185,59 @@ class RunManager:
 
     def _ensure_release_fragment_states(self, merge_manifest: Any) -> list[Any]:
         fragment_count = max(1, int(getattr(merge_manifest, "fragment_count", self.config.fragment_count) or 1))
-        return [
-            self._ensure_initial_live_fragment_state(
+        run_state = self._load_state()
+        last_live_release_step = int(run_state.get("last_live_checkpoint_release_step", self.checkpoint.global_step) or 0)
+        states: list[Any] = []
+        missing: list[int] = []
+        invalid: list[str] = []
+        for fragment_id in range(fragment_count):
+            state = load_fragment_sync_state(
+                self.bucket,
+                netuid=self.config.netuid,
+                run_id=self.config.run_id,
                 fragment_id=fragment_id,
-                fragment_count=fragment_count,
-                global_step=int(getattr(merge_manifest, "global_step", self.checkpoint.global_step) or 0),
-                round_id=int(getattr(merge_manifest, "round_id", 0) or 0),
             )
-            for fragment_id in range(fragment_count)
-        ]
-
-    def _should_release_round_checkpoint(self, round_id: int) -> bool:
-        if not self.config.auto_release_checkpoints:
-            return False
-        cadence = int(self.config.release_every_n_rounds or 0)
-        if cadence <= 0:
-            cadence = max(1, int(self.config.fragment_count))
-        return (int(round_id) + 1) % max(1, cadence) == 0
+            if state is None:
+                missing.append(fragment_id)
+                continue
+            if state.artifact_format != FRAGMENT_SYNC_FORMAT:
+                invalid.append(f"{fragment_id}: artifact_format={state.artifact_format!r}")
+                continue
+            if int(state.fragment_count) != fragment_count:
+                invalid.append(f"{fragment_id}: fragment_count={state.fragment_count}")
+                continue
+            if not state.fragment_state_uri or not state.fragment_state_sha256:
+                invalid.append(f"{fragment_id}: missing fragment state uri/sha")
+                continue
+            if not self.bucket.exists(state.fragment_state_uri):
+                invalid.append(f"{fragment_id}: fragment state object missing")
+                continue
+            if not state.merge_manifest_uri:
+                invalid.append(f"{fragment_id}: missing accepted live merge manifest")
+                continue
+            if not self.bucket.exists(state.merge_manifest_uri):
+                invalid.append(f"{fragment_id}: live merge manifest object missing")
+                continue
+            if int(state.accepted_receipts) <= 0:
+                invalid.append(f"{fragment_id}: accepted_updates=0")
+                continue
+            if int(state.global_step) <= last_live_release_step:
+                invalid.append(
+                    f"{fragment_id}: global_step={int(state.global_step)} <= last_live_release_step={last_live_release_step}"
+                )
+                continue
+            states.append(state)
+        if missing or invalid:
+            details: list[str] = []
+            if missing:
+                details.append(f"missing={missing}")
+            if invalid:
+                details.append(f"invalid={invalid}")
+            raise ValueError(
+                "checkpoint release requires accepted absolute live fragment states for every fragment; "
+                + "; ".join(details)
+            )
+        return states
 
     def _release_output_dir(self, round_id: int) -> str:
         template = self.config.release_output_dir
@@ -3654,7 +4386,8 @@ class RunManager:
 
     def _save_state(self, **values: Any) -> None:
         state = dict(self._load_state())
-        state.update(values)
+        incoming = dict(values)
+        state.update(incoming)
         state["run_id"] = self.config.run_id
         state["updated_unix"] = int(time.time())
         self.bucket.put_json(self._state_uri(), state)

@@ -32,6 +32,20 @@ def _completed_cache_path(config: "MinerWorkerConfig") -> Path:
     return base / safe_segment(config.hotkey) / safe_segment(config.worker_id) / f"{safe_segment(config.run_id)}.completed.txt"
 
 
+def _learner_state_path(config: "MinerWorkerConfig") -> Path:
+    configured_root = os.environ.get("QUASAR_LEARNER_STATE_DIR")
+    cache_root = config.cache_dir or os.environ.get("QUASAR_MINER_CACHE_DIR")
+    root = Path(configured_root or cache_root or (Path.home() / ".quasar-incentive" / "cache"))
+    return (
+        root
+        / "learners"
+        / safe_segment(config.run_id)
+        / safe_segment(config.hotkey)
+        / safe_segment(config.worker_id)
+        / "learner_state.json"
+    )
+
+
 def _load_completed_cache(path: Path) -> set[str]:
     try:
         if not path.exists():
@@ -83,6 +97,7 @@ class MinerWorker:
         self._seen: set[str] = _load_completed_cache(self._completed_cache_path)
         self._queue_etag: str | None = None
         self._queue_state: QueueState | None = None
+        self._active_entry: QueueEntry | None = None
 
     @property
     def worker_identity(self) -> WorkerIdentity:
@@ -93,6 +108,35 @@ class MinerWorker:
             host_id=self.config.host_id or str(capabilities.get("hostname") or capabilities.get("host") or ""),
             capabilities=capabilities,
         )
+
+    def heartbeat_capabilities(self, base: dict[str, object] | None = None) -> dict[str, object]:
+        capabilities = dict(base or self.config.capabilities or {})
+        state_path = _learner_state_path(self.config)
+        if state_path.exists():
+            try:
+                state = json.loads(state_path.read_text(encoding="utf-8"))
+            except Exception:
+                state = {}
+            capabilities["has_persistent_learner_state"] = True
+            capabilities["learner_state_path"] = str(state_path)
+            capabilities["learner_local_step"] = int(state.get("local_step") or 0)
+            capabilities["learner_global_step"] = int(state.get("global_step") or 0)
+            capabilities["learner_state_updated_unix"] = float(state.get("updated_unix") or 0.0)
+            if state.get("base_checkpoint_uri"):
+                capabilities["base_checkpoint_uri"] = str(state.get("base_checkpoint_uri") or "")
+            if state.get("base_checkpoint_sha256"):
+                capabilities["base_checkpoint_sha256"] = str(state.get("base_checkpoint_sha256") or "")
+        active = self._active_entry
+        if active is None:
+            capabilities["queue_status"] = "idle"
+            capabilities["active_job_id"] = ""
+            capabilities["active_round_id"] = 0
+        else:
+            capabilities["queue_status"] = "training"
+            capabilities["active_job_id"] = active.job_id
+            capabilities["active_attempt"] = int(active.attempt)
+            capabilities["active_job_created_unix"] = int(active.created_unix or 0)
+        return capabilities
 
     def run_once(self) -> list[MinerReceipt]:
         if self.bucket is None:
@@ -117,7 +161,12 @@ class MinerWorker:
             tick = getattr(executor, "idle_tick", None)
             if callable(tick):
                 try:
-                    tick()
+                    tick(
+                        worker=self.worker_identity,
+                        signer=self.signer,
+                        transport=self.transport,
+                        config=self.config,
+                    )
                 except Exception as exc:
                     self._log("executor_idle_tick_failed", executor=executor.__class__.__name__, reason=f"{type(exc).__name__}: {exc}")
 
@@ -140,6 +189,7 @@ class MinerWorker:
                 continue
             dedupe_key = self._dedupe_key(entry)
             if dedupe_key in self._seen:
+                self._mark_skipped(entry, "job already completed locally")
                 continue
             try:
                 receipts.append(self.execute_entry(entry))
@@ -189,13 +239,17 @@ class MinerWorker:
         executor = self.task_executors.get((manifest.task, manifest.task_version))
         if executor is None:
             raise ValueError(f"no executor for task {manifest.task}:{manifest.task_version}")
-        receipt = executor.execute(
-            manifest=manifest,
-            grant=grant,
-            transport=self.transport,
-            worker=self.worker_identity,
-            signer=self.signer,
-        )
+        self._active_entry = entry
+        try:
+            receipt = executor.execute(
+                manifest=manifest,
+                grant=grant,
+                transport=self.transport,
+                worker=self.worker_identity,
+                signer=self.signer,
+            )
+        finally:
+            self._active_entry = None
         self._remember_completed(self._dedupe_key(entry))
         return receipt
 

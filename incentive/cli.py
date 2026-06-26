@@ -765,6 +765,7 @@ def _validation_job_worker_from_args(
             worker_id=args.worker_id,
             owner_identity=args.owner_identity,
             independent_quasar_eval=independent_eval,
+            live_verdict_grant_min_remaining_sec=args.live_verdict_grant_min_remaining_sec,
         ),
     )
     return worker
@@ -871,24 +872,6 @@ def cmd_ledger(args: argparse.Namespace) -> int:
         fail_penalty=args.fail_penalty,
     )
     _json_print(summary.to_dict())
-    return 0
-
-
-def cmd_merge_round(args: argparse.Namespace) -> int:
-    chain = ChainConfig.from_env()
-    bucket = s3_bucket_from_env()
-    from incentive.merge.outer import merge_round_fragment_updates
-
-    manifest = merge_round_fragment_updates(
-        bucket,
-        netuid=chain.netuid,
-        run_id=args.run_id,
-        round_id=args.round_id,
-        global_step=args.global_step,
-        validator_hotkey=args.validator_hotkey,
-        outer_lr=args.outer_lr,
-    )
-    _json_print(manifest.to_dict())
     return 0
 
 
@@ -1188,6 +1171,11 @@ def build_parser() -> argparse.ArgumentParser:
     validate_assigned.add_argument("--owner-identity", default=os.environ.get("QUASAR_OWNER_IDENTITY", ""))
     validate_assigned.add_argument("--validator-hotkey", default="")
     validate_assigned.add_argument("--max-jobs", type=int, default=0)
+    validate_assigned.add_argument(
+        "--live-verdict-grant-min-remaining-sec",
+        type=int,
+        default=int(os.environ.get("QUASAR_LIVE_VERDICT_GRANT_MIN_REMAINING_SEC", "120")),
+    )
     _add_quasar_eval_args(validate_assigned)
     validate_assigned.set_defaults(fn=cmd_validate_assigned)
 
@@ -1201,6 +1189,11 @@ def build_parser() -> argparse.ArgumentParser:
     validator_run.add_argument("--timeout-sec", type=float, default=0.0)
     validator_run.add_argument("--poll-interval-sec", type=float, default=5.0)
     validator_run.add_argument("--window-id", default=None)
+    validator_run.add_argument(
+        "--live-verdict-grant-min-remaining-sec",
+        type=int,
+        default=int(os.environ.get("QUASAR_LIVE_VERDICT_GRANT_MIN_REMAINING_SEC", "120")),
+    )
     _add_quasar_eval_args(validator_run)
     validator_run.set_defaults(fn=cmd_validator_run)
 
@@ -1221,14 +1214,6 @@ def build_parser() -> argparse.ArgumentParser:
     ledger.add_argument("--validator-hotkey", action="append")
     ledger.add_argument("--fail-penalty", type=float, default=1.0)
     ledger.set_defaults(fn=cmd_ledger)
-
-    merge = sub.add_parser("merge-round")
-    merge.add_argument("--run-id", required=True)
-    merge.add_argument("--round-id", type=int, required=True)
-    merge.add_argument("--global-step", type=int, required=True)
-    merge.add_argument("--validator-hotkey", required=True)
-    merge.add_argument("--outer-lr", type=float, default=1.0)
-    merge.set_defaults(fn=cmd_merge_round)
 
     release = sub.add_parser("release-checkpoint")
     release.add_argument("--run-id", required=True)

@@ -16,6 +16,7 @@ venv/
 .reports/
 releases/
 tmp/
+tests/
 
 *.slcd
 *.safetensors

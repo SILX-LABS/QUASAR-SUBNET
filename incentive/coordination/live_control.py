@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import time
 from typing import Any
 
@@ -106,6 +107,28 @@ def fragment_pull_response_grants(
     }
 
 
+def live_fragment_verdict_grants(
+    broker: PresignedUrlBroker | None,
+    bucket: ObjectStore,
+    *,
+    netuid: int,
+    run_id: str,
+    validator_hotkeys: list[str],
+    request_id: str,
+    learner_id: str,
+    expires_in: int,
+) -> dict[str, Any]:
+    if broker is None:
+        return {}
+    grants: dict[str, Any] = {}
+    for validator_hotkey in sorted({str(item) for item in validator_hotkeys if str(item)}):
+        uri = bucket.uri_for_key(
+            paths.live_fragment_verdict_key(netuid, run_id, validator_hotkey, request_id, learner_id)
+        )
+        grants[validator_hotkey] = broker.put_grant(uri, expires_in=expires_in).to_dict()
+    return grants
+
+
 def fragment_state_get_grant(
     broker: PresignedUrlBroker | None,
     *,
@@ -122,15 +145,20 @@ def append_mailbox_message(
     *,
     netuid: int,
     message: Any,
-    max_messages: int = 512,
+    max_messages: int = 64,
+    max_read_bytes: int = 1_048_576,
 ) -> str:
     learner_id = str(message.receiver)
     uri = learner_mailbox_uri(bucket, netuid=netuid, run_id=message.run_id, learner_id=learner_id)
-    payload: dict[str, Any]
-    if bucket.exists(uri):
-        payload = dict(bucket.get_json(uri))
-    else:
-        payload = {}
+    payload: dict[str, Any] = {}
+    head = bucket.head(uri)
+    if head is not None and int(head.get("size_bytes") or 0) <= int(max_read_bytes):
+        try:
+            payload = dict(bucket.get_json(uri))
+        except (TimeoutError, OSError):
+            raise
+        except (FileNotFoundError, json.JSONDecodeError):
+            payload = {}
     messages = [dict(item) for item in payload.get("messages") or []]
     current = message.to_dict()
     marker = (str(current.get("sender") or ""), int(current.get("sequence") or 0))
@@ -150,5 +178,8 @@ def append_mailbox_message(
         "messages": messages,
         "updated_unix": float(time.time()),
     }
+    while len(messages) > 1 and len(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")) > int(max_read_bytes):
+        messages = messages[1:]
+        payload["messages"] = messages
     bucket.put_json(uri, payload)
     return uri

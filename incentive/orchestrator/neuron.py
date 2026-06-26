@@ -13,9 +13,9 @@ from dataclasses import replace
 from datetime import datetime, timezone
 
 from incentive import cli
-from incentive.bucket import s3_bucket_from_env
+from incentive.bucket import paths, s3_bucket_from_env
 from incentive.config import ChainConfig, ModelConfig
-from incentive.coordination.current_run import publish_current_run
+from incentive.coordination.current_run import publish_current_run, read_current_run
 from incentive.core.location import detect_public_location
 from incentive.core.signatures import load_wallet_hotkey_signer
 from incentive.orchestrator.run_manager import RunConfig, RunManager
@@ -34,9 +34,54 @@ _COMMANDS = {
     "schedule-round",
     "reconcile-queue",
     "validation-jobs",
-    "merge-round",
     "release-checkpoint",
 }
+
+
+def _recover_checkpoint_manifest_uri_from_state(bucket, *, netuid: int, config: RunConfig) -> str:
+    state_uri = bucket.uri_for_key(paths.run_state_key(netuid, config.run_id))
+    try:
+        state = dict(bucket.get_json(state_uri)) if bucket.exists(state_uri) else {}
+    except Exception:
+        state = {}
+
+    candidates: list[str] = [config.checkpoint_manifest_uri] if config.checkpoint_manifest_uri else []
+    latest = str(state.get("latest_checkpoint_manifest_uri") or "")
+    if latest:
+        candidates.append(latest)
+    try:
+        current = read_current_run(bucket, netuid=netuid)
+        if current.run_id == config.run_id and current.checkpoint_manifest_uri:
+            candidates.append(str(current.checkpoint_manifest_uri))
+    except Exception:
+        pass
+
+    fallback_steps: list[int] = []
+    for value in (state.get("last_live_checkpoint_release_step"), state.get("latest_global_step")):
+        try:
+            step = int(value or 0)
+        except (TypeError, ValueError):
+            continue
+        if step > 0 and step not in fallback_steps:
+            fallback_steps.append(step)
+    for step in sorted(fallback_steps, reverse=True):
+        candidates.append(bucket.uri_for_key(paths.checkpoint_manifest_key(netuid, step)))
+
+    best_uri = config.checkpoint_manifest_uri
+    best_step = -1
+    for uri in candidates:
+        if not uri:
+            continue
+        try:
+            if not bucket.exists(uri):
+                continue
+            step = int(bucket.get_json(uri).get("global_step") or 0)
+        except Exception:
+            continue
+        if step > best_step:
+            best_uri = uri
+            best_step = step
+    return best_uri
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -135,7 +180,14 @@ def _cmd_run(argv: list[str]) -> int:
         hotkey_name=chain.hotkey_name,
     )
     bucket = s3_bucket_from_env()
+    recovered_checkpoint_uri = _recover_checkpoint_manifest_uri_from_state(bucket, netuid=chain.netuid, config=config)
+    if recovered_checkpoint_uri and recovered_checkpoint_uri != config.checkpoint_manifest_uri:
+        config = replace(config, checkpoint_manifest_uri=recovered_checkpoint_uri)
     run_metadata = {"role": "orchestrator"}
+    try:
+        run_metadata["global_step"] = int(bucket.get_json(config.checkpoint_manifest_uri).get("global_step") or 0)
+    except Exception:
+        pass
     location = detect_public_location()
     if location is not None:
         run_metadata["location"] = location

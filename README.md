@@ -52,6 +52,18 @@ Validators do not assign miner work, merge updates, or release checkpoints.
 Miners and validators use signed manifests plus scoped grants, not broad
 operator credentials.
 
+## Rewards And Weights
+
+Rewards are based on accepted live merge events, not miner self-reported speed,
+loss, or GPU names. The validator scores recent accepted live work with decay so
+old work cannot dominate the subnet forever. Invalid, stale, replayed, unsigned,
+or tensor-mismatched live claims receive zero merge weight.
+
+Fast hardware still matters because it can keep serving valid live fragments
+while training. The validator only counts work that was pulled by the syncer,
+verified against the frozen previous fragment state, independently evaluated,
+and accepted into the live merge ledger.
+
 ## Model And Checkpoints
 
 Quasar Training works on Quasar Preview checkpoints, not placeholder smoke
@@ -72,6 +84,11 @@ states. Delta artifacts are kept for merge/debug visibility, but released
 checkpoints are built from absolute fragment state plus the base checkpoint tree.
 The main release is not partial: it requires live accepted coverage for all 24
 fragments since the previous release.
+
+Checkpoint release is operational recovery infrastructure for late joiners and
+restarts. The paper-aligned hot path is live fragment sync: accepted fragment,
+merge now, broadcast updated fragment, repeat. Miners should not wait for every
+full checkpoint release before continuing live training.
 
 ## Mainnet Defaults
 
@@ -121,6 +138,8 @@ quasar-incentive miner run \
 ```
 
 Leave `QUASAR_RUN_ID` unset. The miner discovers the live run automatically.
+Keep the miner updated to the latest release before starting a new worker; the
+current protocol expects signed live fragment claims and live-control grants.
 
 ## Common Environment
 
@@ -182,6 +201,10 @@ validator hotkey so validator chain state stays live.
 
 Validators do not merge model updates. Other validators only validate assigned
 work, write verdicts, summarize accepted merge events, and set weights.
+
+Validator scoring uses accepted live merge events. End-of-job receipts are audit
+telemetry and should not reopen old merges or change already-accepted live
+fragment state.
 
 ## Access Model
 

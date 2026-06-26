@@ -11,7 +11,8 @@ from pathlib import Path
 
 from incentive.bucket import paths
 from incentive.bucket.storage import ObjectStore
-from incentive.coordination.mesh import BucketDilocoChannel
+from incentive.bucket.transport import GrantTransport, PresignedArtifactTransport
+from incentive.coordination.mesh import DilocoMessage
 from incentive.core.protocol import (
     ArtifactDigest,
     LiveFragmentClaim,
@@ -20,6 +21,7 @@ from incentive.core.protocol import (
     TrainingJobManifest,
     ValidatorVerdict,
     WorkerIdentity,
+    PresignedUrlGrant,
 )
 from incentive.core.signatures import Signer
 from incentive.fragments.artifacts import (
@@ -213,7 +215,13 @@ class ValidatorVerifier:
         self.bucket.put_json(verdict_uri, verdict.to_dict())
         return VerificationResult(receipt=receipt, verdict=verdict, verdict_uri=verdict_uri)
 
-    def verify_live_fragment_claim_uri(self, claim_uri: str) -> LiveFragmentVerificationResult:
+    def verify_live_fragment_claim_uri(
+        self,
+        claim_uri: str,
+        *,
+        verdict_put_grant: PresignedUrlGrant | None = None,
+        transport: GrantTransport | None = None,
+    ) -> LiveFragmentVerificationResult:
         claim = LiveFragmentClaim.from_dict(self.bucket.get_json(claim_uri))
         status = "pass"
         reasons: list[str] = []
@@ -403,7 +411,15 @@ class ValidatorVerifier:
                 claim.learner_id,
             )
         )
-        self.bucket.put_json(verdict_uri, verdict.to_dict())
+        verdict_payload = json.dumps(verdict.to_dict(), sort_keys=True, separators=(",", ":")).encode("utf-8")
+        if verdict_put_grant is not None:
+            (transport or PresignedArtifactTransport(self.bucket)).put(
+                verdict_put_grant,
+                verdict_payload,
+                expected_uri=verdict_uri,
+            )
+        else:
+            self.bucket.put(verdict_uri, verdict_payload)
         return LiveFragmentVerificationResult(claim=claim, verdict=verdict, verdict_uri=verdict_uri)
 
     @staticmethod
@@ -419,14 +435,37 @@ class ValidatorVerifier:
     def _live_pull_request_payload(self, claim: LiveFragmentClaim) -> dict[str, object] | None:
         if not claim.learner_id or not claim.request_id:
             return None
-        channel = BucketDilocoChannel(
-            self.bucket,
-            netuid=self.config.netuid,
-            run_id=claim.run_id,
-            sender="syncer",
-            receiver=claim.learner_id,
+        mailbox_uri = self.bucket.uri_for_key(
+            paths.learner_mailbox_key(self.config.netuid, claim.run_id, claim.learner_id)
         )
-        for message in channel.receive_after(0):
+        try:
+            mailbox = dict(self.bucket.get_json(mailbox_uri))
+        except Exception:
+            mailbox = {}
+        for item in reversed([dict(message) for message in mailbox.get("messages") or []]):
+            if str(item.get("sender") or "") != "syncer" or str(item.get("kind") or "") != "pull_fragment":
+                continue
+            payload = dict(item.get("payload") or {})
+            if str(payload.get("request_id") or "") == claim.request_id:
+                return payload
+
+        prefix = self.bucket.uri_for_key(
+            paths.mesh_channel_prefix(self.config.netuid, claim.run_id, "syncer", claim.learner_id)
+        )
+        candidates: list[tuple[int, str]] = []
+        for uri in self.bucket.list(prefix):
+            if "/seq=" not in uri or not uri.endswith(".json"):
+                continue
+            raw = uri.rsplit("/seq=", 1)[-1].removesuffix(".json")
+            try:
+                candidates.append((int(raw), uri))
+            except ValueError:
+                continue
+        for _sequence, uri in sorted(candidates, reverse=True)[:64]:
+            try:
+                message = DilocoMessage.from_dict(self.bucket.get_json(uri))
+            except Exception:
+                continue
             if message.kind != "pull_fragment":
                 continue
             payload = dict(message.payload or {})

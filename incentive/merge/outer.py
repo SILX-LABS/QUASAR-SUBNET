@@ -1,8 +1,7 @@
-"""Outer-loop merge for accepted fragment update updates."""
+"""Outer-loop merge for live Decoupled DiLoCo fragment states."""
 
 from __future__ import annotations
 
-import json
 import time
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -14,16 +13,11 @@ import numpy as np
 from incentive.bucket import paths
 from incentive.bucket.grants import PresignedUrlBroker
 from incentive.bucket.storage import ObjectStore
-from incentive.core.protocol import MinerReceipt, ValidatorVerdict
 from incentive.core.runtime import file_sha256
-from incentive.core.signatures import sha256_hex
 from incentive.fragments.artifacts import (
-    FRAGMENT_BASE_FORMAT,
     FRAGMENT_MERGE_ALGORITHM,
     FRAGMENT_SYNC_FORMAT,
-    FragmentUpdateArtifact,
     apply_nesterov_outer_update,
-    load_fragment_update_artifact,
     load_safetensors_file,
     merge_fragment_outer_deltas,
     parameter_component,
@@ -165,155 +159,12 @@ def apply_outer_update(
     return out
 
 
-def _update_digest(receipt: MinerReceipt):
-    for digest in receipt.output_digests:
-        if digest.name == "fragment_update":
-            return digest
-    raise ValueError(f"receipt {receipt.receipt_id} has no fragment_update digest")
-
-
-def _fragment_manifest_digest(receipt: MinerReceipt):
-    for digest in receipt.output_digests:
-        if digest.name == "fragment_manifest":
-            return digest
-    raise ValueError(f"receipt {receipt.receipt_id} has no fragment_manifest digest")
-
-
-def _load_round_verdicts(
-    bucket: ObjectStore,
-    *,
-    netuid: int,
-    run_id: str,
-    validator_hotkeys: list[str],
-    round_id: int,
-) -> list[ValidatorVerdict]:
-    validators = [str(item).strip() for item in validator_hotkeys if str(item).strip()]
-    if not validators:
-        raise ValueError("at least one validator hotkey is required for merge")
-    manifest_round_cache: dict[str, int] = {}
-    verdicts: list[ValidatorVerdict] = []
-    for validator_hotkey in validators:
-        prefix = bucket.uri_for_key(f"{paths.root_prefix(netuid)}/verdicts/{run_id}/validator={validator_hotkey}/")
-        for uri in bucket.list(prefix):
-            if not uri.endswith(".json"):
-                continue
-            verdict = ValidatorVerdict.from_dict(bucket.get_json(uri))
-            if verdict.run_id != run_id or verdict.validator_hotkey != validator_hotkey:
-                continue
-            if not verdict.verify_signature(validator_hotkey):
-                continue
-            if verdict.job_id not in manifest_round_cache:
-                manifest_uri = bucket.uri_for_key(paths.job_manifest_key(netuid, run_id, verdict.job_id))
-                manifest = bucket.get_json(manifest_uri)
-                manifest_round_cache[verdict.job_id] = int(manifest.get("round_id") or 0)
-            if manifest_round_cache[verdict.job_id] == int(round_id):
-                verdicts.append(verdict)
-    verdicts.sort(key=lambda item: (item.miner_hotkey, item.job_id, item.validator_hotkey))
-    return verdicts
-
-
-def _select_quorum_pass_verdicts(
-    verdicts: list[ValidatorVerdict],
-    *,
-    verdict_quorum: int,
-    fail_veto: bool,
-) -> list[tuple[ValidatorVerdict, float]]:
-    grouped: dict[str, list[ValidatorVerdict]] = defaultdict(list)
-    for verdict in verdicts:
-        grouped[verdict.receipt_id].append(verdict)
-    selected: list[tuple[ValidatorVerdict, float]] = []
-    quorum = max(1, int(verdict_quorum))
-    for receipt_id in sorted(grouped):
-        receipt_verdicts = grouped[receipt_id]
-        passing = [verdict for verdict in receipt_verdicts if verdict.status == "pass"]
-        failing = [verdict for verdict in receipt_verdicts if verdict.status == "fail"]
-        if fail_veto and failing:
-            continue
-        if len(passing) < quorum:
-            continue
-        passing.sort(key=lambda item: item.validator_hotkey)
-        quality = sum(float(verdict.accepted_update_weight or 1.0) for verdict in passing) / float(len(passing))
-        selected.append((passing[0], quality))
-    selected.sort(key=lambda item: (item[0].miner_hotkey, item[0].job_id))
-    return selected
-
-
-def _single_validator_passes(
-    bucket: ObjectStore,
-    *,
-    netuid: int,
-    run_id: str,
-    validator_hotkey: str,
-    round_id: int,
-) -> list[tuple[ValidatorVerdict, float]]:
-    return _select_quorum_pass_verdicts(
-        _load_round_verdicts(
-            bucket,
-            netuid=netuid,
-            run_id=run_id,
-            validator_hotkeys=[validator_hotkey],
-            round_id=round_id,
-        ),
-        verdict_quorum=1,
-        fail_veto=False,
-    )
-
-
-def _receipt_for_verdict(bucket: ObjectStore, *, netuid: int, verdict: ValidatorVerdict) -> MinerReceipt:
-    attempt = 0
-    marker = "attempt="
-    if marker in verdict.receipt_id:
-        try:
-            attempt = int(verdict.receipt_id.rsplit(marker, 1)[1])
-        except ValueError:
-            attempt = 0
-    uri = bucket.uri_for_key(paths.receipt_key(netuid, verdict.run_id, verdict.miner_hotkey, verdict.job_id, attempt))
-    return MinerReceipt.from_dict(bucket.get_json(uri))
-
-
 def _load_safetensors_uri(bucket: ObjectStore, uri: str, *, expected_sha256: str | None = None):
     import tempfile
 
     with tempfile.NamedTemporaryFile(suffix=".safetensors") as handle:
         bucket.get_to_path(uri, handle.name, expected_sha256=expected_sha256)
         return load_safetensors_file(handle.name)
-
-
-def _load_fragment_artifact(bucket: ObjectStore, receipt: MinerReceipt) -> tuple[FragmentUpdateArtifact, str, str]:
-    update_digest = _update_digest(receipt)
-    manifest_digest = _fragment_manifest_digest(receipt)
-    manifest_payload = bucket.get(manifest_digest.uri)
-    manifest_sha = sha256_hex(manifest_payload)
-    if manifest_sha != manifest_digest.sha256:
-        raise ValueError(f"fragment manifest digest mismatch for {manifest_digest.uri}")
-    import tempfile
-
-    with tempfile.NamedTemporaryFile(suffix=".safetensors") as handle:
-        update_sha, _size = bucket.get_to_path(update_digest.uri, handle.name, expected_sha256=update_digest.sha256)
-        artifact = load_fragment_update_artifact(handle.name, manifest_payload)
-    return artifact, update_sha, manifest_sha
-
-
-def _digest_by_name(receipt: MinerReceipt, name: str):
-    for digest in receipt.output_digests:
-        if digest.name == name:
-            return digest
-    return None
-
-
-def _load_fragment_base_tensors(bucket: ObjectStore, receipt: MinerReceipt, artifact: FragmentUpdateArtifact):
-    digest = _digest_by_name(receipt, "fragment_base")
-    if digest is None:
-        return None
-    tensors = _load_safetensors_uri(bucket, digest.uri, expected_sha256=digest.sha256)
-    expected_shapes = {spec.name: tuple(spec.shape) for spec in artifact.manifest.tensors}
-    validate_fragment_state_tensors(
-        expected_names=expected_shapes,
-        expected_shapes=expected_shapes,
-        tensors=tensors,
-        artifact_name=FRAGMENT_BASE_FORMAT,
-    )
-    return tensors
 
 
 def _component_l2(tensors: Mapping[str, Any]) -> dict[str, float]:
@@ -358,135 +209,6 @@ def _advance_fragment_state(previous_state: Mapping[str, Any], outer_update: Map
 
 def _optimizer_state_key(netuid: int, run_id: str, fragment_id: int) -> str:
     return f"{paths.root_prefix(netuid)}/fragments/{run_id}/optimizer/fragment={int(fragment_id)}/momentum.safetensors"
-
-
-def merge_round_fragment_updates(
-    bucket: ObjectStore,
-    *,
-    netuid: int,
-    run_id: str,
-    round_id: int,
-    global_step: int,
-    validator_hotkey: str,
-    outer_lr: float,
-    validator_hotkeys: list[str] | None = None,
-    verdict_quorum: int = 1,
-    fail_veto: bool = False,
-    outer_momentum: float = 0.9,
-    outer_nesterov: bool = True,
-    grant_broker: PresignedUrlBroker | None = None,
-    grant_ttl_sec: int = 900,
-    rebuild_current_round: bool = False,
-) -> RoundMergeManifest:
-    if validator_hotkeys is None:
-        accepted_verdicts = _single_validator_passes(
-            bucket,
-            netuid=netuid,
-            run_id=run_id,
-            validator_hotkey=validator_hotkey,
-            round_id=round_id,
-        )
-    else:
-        accepted_verdicts = _select_quorum_pass_verdicts(
-            _load_round_verdicts(
-                bucket,
-                netuid=netuid,
-                run_id=run_id,
-                validator_hotkeys=validator_hotkeys,
-                round_id=round_id,
-            ),
-            verdict_quorum=verdict_quorum,
-            fail_veto=fail_veto,
-        )
-    if not accepted_verdicts:
-        raise ValueError(f"no passing verdicts for run={run_id} round={round_id}")
-
-    artifacts: list[FragmentUpdateArtifact] = []
-    merge_weights: list[float] = []
-    base_tensors_for_state: Mapping[str, Any] | None = None
-    accepted: list[AcceptedUpdate] = []
-    fragment_id: int | None = None
-    fragment_count: int | None = None
-    for verdict, quality_weight in accepted_verdicts:
-        receipt = _receipt_for_verdict(bucket, netuid=netuid, verdict=verdict)
-        artifact, update_sha, _manifest_sha = _load_fragment_artifact(bucket, receipt)
-        base_tensors = _load_fragment_base_tensors(bucket, receipt, artifact)
-        if fragment_id is None:
-            fragment_id = artifact.manifest.fragment_id
-            fragment_count = artifact.manifest.fragment_count
-            base_tensors_for_state = base_tensors
-        elif artifact.manifest.fragment_id != fragment_id:
-            raise ValueError("cannot merge different fragment ids in one round")
-        elif base_tensors_for_state is None and base_tensors is not None:
-            base_tensors_for_state = base_tensors
-        work_weight = max(0.0, artifact.manifest.merge_weight()) * max(0.0, float(quality_weight))
-        artifacts.append(artifact)
-        merge_weights.append(work_weight)
-        accepted.append(
-            AcceptedUpdate(
-                hotkey=verdict.miner_hotkey,
-                worker_id=receipt.worker.worker_id,
-                learner_id=str(receipt.metrics.get("learner_id") or f"{receipt.worker.hotkey_ss58}:{receipt.worker.worker_id}"),
-                job_id=verdict.job_id,
-                receipt_id=verdict.receipt_id,
-                update_uri=_update_digest(receipt).uri,
-                update_sha256=update_sha,
-                weight=work_weight,
-                fragment_id=artifact.manifest.fragment_id,
-                trained_tokens=artifact.manifest.trained_tokens,
-                local_steps=artifact.manifest.local_steps,
-            )
-        )
-
-    merged_delta = merge_fragment_outer_deltas([artifact.dense_tensors() for artifact in artifacts], weights=merge_weights)
-    previous_momentum = None
-    momentum_key = _optimizer_state_key(netuid, run_id, fragment_id or 0)
-    momentum_uri = bucket.uri_for_key(momentum_key)
-    if bucket.exists(momentum_uri) and not rebuild_current_round:
-        previous_momentum = _load_safetensors_uri(bucket, momentum_uri)
-    outer_update, next_momentum = apply_nesterov_outer_update(
-        merged_delta,
-        previous_momentum,
-        momentum=float(outer_momentum),
-        nesterov=bool(outer_nesterov),
-    )
-    fragment_state = None
-    if fragment_id is not None:
-        previous_state = _previous_or_base_fragment_state(
-            bucket,
-            netuid=netuid,
-            run_id=run_id,
-            fragment_id=fragment_id,
-            base_tensors=base_tensors_for_state,
-            ignore_merge_manifest_uri=(
-                bucket.uri_for_key(paths.merge_manifest_key(netuid, run_id, round_id)) if rebuild_current_round else None
-            ),
-        )
-        if previous_state is not None:
-            fragment_state = _advance_fragment_state(previous_state, outer_update, outer_lr=outer_lr)
-    manifest = write_merge_artifacts(
-        bucket,
-        netuid=netuid,
-        run_id=run_id,
-        round_id=round_id,
-        global_step=global_step,
-        outer_lr=outer_lr,
-        merged_delta=outer_update,
-        fragment_state=fragment_state,
-        accepted_updates=accepted,
-        fragment_id=fragment_id,
-        fragment_count=fragment_count,
-        momentum_uri=momentum_uri,
-        momentum_tensors=next_momentum,
-    )
-    publish_fragment_sync_state(
-        bucket,
-        netuid=netuid,
-        merge_manifest=manifest,
-        grant_broker=grant_broker,
-        grant_ttl_sec=grant_ttl_sec,
-    )
-    return manifest
 
 
 def merge_live_learner_fragment_states(
@@ -656,12 +378,34 @@ def write_merge_artifacts(
     artifact_prefix_key: str | None = None,
     manifest_key: str | None = None,
     accepted_updates_key: str | None = None,
-    source: str = "merge_round_fragment_updates",
+    source: str = "write_merge_artifacts",
 ) -> RoundMergeManifest:
     import tempfile
     from safetensors.torch import save_file
 
     merge_base = artifact_prefix_key or paths.merge_prefix(netuid, run_id, round_id)
+    manifest_uri = bucket.uri_for_key(manifest_key or paths.merge_manifest_key(netuid, run_id, round_id))
+    if bucket.exists(manifest_uri):
+        try:
+            existing = RoundMergeManifest.from_dict(bucket.get_json(manifest_uri))
+            expected_fragment_state = fragment_state is None or (
+                bool(existing.fragment_state_uri) and bucket.exists(str(existing.fragment_state_uri))
+            )
+            expected_momentum = momentum_tensors is None or not momentum_uri or (
+                bool(existing.momentum_uri) and bucket.exists(str(existing.momentum_uri))
+            )
+            if (
+                existing.run_id == run_id
+                and int(existing.round_id) == int(round_id)
+                and int(existing.global_step) == int(global_step)
+                and existing.merged_delta_uri
+                and bucket.exists(str(existing.merged_delta_uri))
+                and expected_fragment_state
+                and expected_momentum
+            ):
+                return existing
+        except Exception:
+            pass
     merged_uri = bucket.uri_for_key(f"{merge_base}/merged_fragment_delta.safetensors")
     with tempfile.NamedTemporaryFile(suffix=".safetensors") as handle:
         save_file(dict(merged_delta), handle.name, metadata={"artifact": "merged_outer_gradient_fragment"})
@@ -697,7 +441,6 @@ def write_merge_artifacts(
             handle.flush()
             momentum_sha, _momentum_size = file_sha256(handle.name, chunk_bytes=1024 * 1024)
             bucket.put_file(momentum_uri, handle.name)
-    manifest_uri = bucket.uri_for_key(manifest_key or paths.merge_manifest_key(netuid, run_id, round_id))
     accepted_uri = bucket.uri_for_key(accepted_updates_key or paths.accepted_updates_key(netuid, run_id, round_id))
     manifest = RoundMergeManifest(
         run_id=run_id,

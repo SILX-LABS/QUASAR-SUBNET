@@ -177,15 +177,87 @@ def _collect_fragment_overrides(
     return overrides, missing_fragment_states, fragment_stats
 
 
-def _overwrite_checkpoint_safetensors(output_dir: Path, overrides: dict[str, tuple[Path, str]]) -> list[dict[str, Any]]:
+def _torch_dtype_from_name(dtype: str):
+    import torch
+
+    value = str(dtype or "").lower().replace("torch.", "")
+    if value in {"bf16", "bfloat16"}:
+        return torch.bfloat16
+    if value in {"fp16", "float16", "half"}:
+        return torch.float16
+    if value in {"fp32", "float32", "float"}:
+        return torch.float32
+    return None
+
+
+def _safetensors_dtype_from_name(dtype: str) -> str:
+    value = str(dtype or "").lower().replace("torch.", "")
+    if value in {"bf16", "bfloat16"}:
+        return "BF16"
+    if value in {"fp16", "float16", "half"}:
+        return "F16"
+    if value in {"fp32", "float32", "float"}:
+        return "F32"
+    return ""
+
+
+def _maybe_cast_release_tensor(tensor: Any, dtype: Any) -> Any:
+    if dtype is None:
+        return tensor
+    is_floating_point = getattr(tensor, "is_floating_point", None)
+    if callable(is_floating_point) and is_floating_point() and getattr(tensor, "dtype", None) != dtype:
+        return tensor.to(dtype=dtype)
+    return tensor
+
+
+def _verify_release_safetensors_dtype(output_dir: Path, dtype: str) -> dict[str, Any]:
+    from safetensors import safe_open
+
+    expected = _safetensors_dtype_from_name(dtype)
+    floating_dtypes = {"BF16", "F16", "F32", "F64"}
+    summary: dict[str, Any] = {
+        "expected_dtype": expected,
+        "total_safetensors_size_bytes": 0,
+        "files": [],
+        "mismatched_float_tensors": [],
+    }
+    if not expected:
+        return summary
+    for path in _safetensor_files(output_dir):
+        file_dtypes: dict[str, int] = {}
+        with safe_open(str(path), framework="pt", device="cpu") as handle:
+            for raw_name in handle.keys():
+                tensor_dtype = str(handle.get_slice(raw_name).get_dtype())
+                file_dtypes[tensor_dtype] = file_dtypes.get(tensor_dtype, 0) + 1
+                if tensor_dtype in floating_dtypes and tensor_dtype != expected:
+                    summary["mismatched_float_tensors"].append(
+                        {"file": path.name, "tensor": raw_name, "dtype": tensor_dtype}
+                    )
+        size_bytes = int(path.stat().st_size)
+        summary["total_safetensors_size_bytes"] += size_bytes
+        summary["files"].append({"file": path.name, "size_bytes": size_bytes, "dtypes": file_dtypes})
+    if summary["mismatched_float_tensors"]:
+        sample = summary["mismatched_float_tensors"][:10]
+        raise ValueError(f"release dtype validation failed: expected {expected}, mismatches={sample}")
+    return summary
+
+
+def _overwrite_checkpoint_safetensors(
+    output_dir: Path,
+    overrides: dict[str, tuple[Path, str]],
+    *,
+    dtype: str = "",
+) -> list[dict[str, Any]]:
     from safetensors import safe_open
     from safetensors.torch import save_file
 
+    target_dtype = _torch_dtype_from_name(dtype)
     stats: list[dict[str, Any]] = []
     for path in _safetensor_files(output_dir):
         tensors: dict[str, Any] = {}
         metadata: dict[str, str] | None = None
         applied = 0
+        casted = 0
         with safe_open(str(path), framework="pt", device="cpu") as handle:
             raw_names = list(handle.keys())
             metadata = handle.metadata()
@@ -193,14 +265,32 @@ def _overwrite_checkpoint_safetensors(output_dir: Path, overrides: dict[str, tup
                 canonical = canonical_parameter_name(raw_name)
                 override = overrides.get(canonical)
                 if override is None:
-                    tensors[raw_name] = handle.get_tensor(raw_name)
+                    tensor = handle.get_tensor(raw_name)
+                    source_dtype = getattr(tensor, "dtype", None)
+                    casted_tensor = _maybe_cast_release_tensor(tensor, target_dtype)
+                    if target_dtype is not None and source_dtype != getattr(casted_tensor, "dtype", None):
+                        casted += 1
+                    tensors[raw_name] = casted_tensor
                     continue
                 fragment_path, fragment_raw_name = override
                 with safe_open(str(fragment_path), framework="pt", device="cpu") as fragment_handle:
-                    tensors[raw_name] = fragment_handle.get_tensor(fragment_raw_name)
+                    tensor = fragment_handle.get_tensor(fragment_raw_name)
+                    source_dtype = getattr(tensor, "dtype", None)
+                    casted_tensor = _maybe_cast_release_tensor(tensor, target_dtype)
+                    if target_dtype is not None and source_dtype != getattr(casted_tensor, "dtype", None):
+                        casted += 1
+                    tensors[raw_name] = casted_tensor
                 applied += 1
         save_file(tensors, str(path), metadata=metadata)
-        stats.append({"file": str(path.name), "tensor_count": len(tensors), "overwritten_parameter_count": applied})
+        stats.append(
+            {
+                "file": str(path.name),
+                "tensor_count": len(tensors),
+                "overwritten_parameter_count": applied,
+                "cast_parameter_count": casted,
+                "release_dtype": str(dtype or ""),
+            }
+        )
     return stats
 
 
@@ -248,7 +338,8 @@ def release_merged_checkpoint(
                 "absolute fragment sync states do not cover model parameters exactly: "
                 f"missing={missing_model_parameters[:5]} extra={extra_fragment_parameters[:5]}"
             )
-        file_apply_stats = _overwrite_checkpoint_safetensors(output, overrides)
+        file_apply_stats = _overwrite_checkpoint_safetensors(output, overrides, dtype=dtype)
+        dtype_validation = _verify_release_safetensors_dtype(output, dtype)
 
     stats = {
         "mode": "absolute_fragment_states",
@@ -258,6 +349,7 @@ def release_merged_checkpoint(
         "covered_parameter_count": len(parameter_names),
         "fragment_apply_stats": fragment_stats,
         "file_apply_stats": file_apply_stats,
+        "dtype_validation": dtype_validation,
         "missing_parameter_count": 0,
     }
 
